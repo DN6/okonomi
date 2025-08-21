@@ -1,0 +1,22 @@
+# Python-generated files
+__pycache__/
+*.py[oc]
+build/
+dist/
+wheels/
+*.egg-info
+
+# Ruff
+.ruff_cache
+
+# Gradio
+.gradio
+
+# Virtual environments
+.venv
+
+# Personal configuration files
+config.*.json
+
+# Environment files
+.env

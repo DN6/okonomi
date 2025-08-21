@@ -1,0 +1,4 @@
+include config.json
+recursive-include prompt_templates *.yml
+include README.md
+include LICENSE
