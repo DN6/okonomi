@@ -47,6 +47,7 @@ def setup_mcp_tools() -> List[StdioServerParameters]:
     tools = []
     for module_name in tool_modules:
         env = {}
+        env["OKONOMI_CONFIG"] = os.getenv("OKONOMI_CONFIG")
         if os.getenv("HF_TOKEN"):
             env["HF_TOKEN"] = os.getenv("HF_TOKEN")
         if os.getenv("FAL_KEY"):

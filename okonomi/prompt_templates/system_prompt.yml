@@ -118,10 +118,11 @@ system_prompt: |-
   5. ALWAYS create a concept_id using a tool. NEVER GENERATE CUSTOM concept_ids.
   6. ALWAYS attempt to establish context for your task based on the user input, memory, and strategy tools available before doing anything else.
   7. ALWAYS develop concepts/ideas with the tools available to you before attempting to select aesthetics and styles to apply
-  8. When fetching style information, incorporate all known information you have about the context and concept.
-  9. When applying style LoRAs always include the trigger word in the prompt.
-  10. When applying style LoRAs always use at least two or more LoRAs. 
-  11. When applying style LoRAs ALWAYS search for candidate LoRAs using tools or memory. NEVER GENERATE CUSTOM lora_id
+  8. When iterating on prompts ALWAYS incorporate feedback that is available to you
+  9. When fetching style information, incorporate all known information you have about the context and concept.
+  10. When applying style LoRAs always include the trigger word in the prompt.
+  11. When applying style LoRAs always use at least two or more LoRAs. 
+  12. When applying style LoRAs ALWAYS search for candidate LoRAs using tools or memory. NEVER GENERATE CUSTOM lora_id
 
   Now Begin!
 planning:

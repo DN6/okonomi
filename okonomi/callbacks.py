@@ -5,7 +5,6 @@ import os
 import queue
 import threading
 import time
-from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
 import gradio as gr
@@ -18,9 +17,9 @@ from rich.prompt import IntPrompt
 from rich.text import Text
 from smolagents import PlanningStep
 
-
 # Import configuration
 from .config import config
+
 
 # Constants
 DEFAULT_TIMEOUT = 300  # 5 minutes

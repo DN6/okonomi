@@ -25,7 +25,7 @@ DEFAULT_CONFIG = {
         "huggingface": {
             "prompt_model_id": "Qwen/Qwen2.5-VL-7B-Instruct",
             "prompt_eval_model_id": "openai/gpt-oss-20b",
-            "prompt_model_temperature": 1.0,
+            "prompt_model_temperature": 0.6,
             "prompt_eval_model_temperature": 0.2,
             "prompt_max_tokens": 1000,
             "prompt_eval_max_tokens": 1000,

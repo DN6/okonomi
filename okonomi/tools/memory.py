@@ -18,7 +18,7 @@ hf_api = HfApi()
 
 
 @mcp.tool()
-def retrieve_from_memory(query: str) -> str:
+def retrieve_from_memory(query: str, min_score: float = 0.0, max_score: float = 10.0) -> str:
     """Retrieve semantically similar documents from ChromaDB memory.
 
     Args:
@@ -35,6 +35,7 @@ def retrieve_from_memory(query: str) -> str:
         result = collection.query(
             query_texts=[query],
             include=["documents", "metadatas"],
+            where={"$and": [{"score": {"$gte": min_score}}, {"score": {"$lte": max_score}}]},
         )
     except Exception as e:
         raise e
@@ -104,6 +105,8 @@ def find_candidate_loras(query: str) -> str:
         lora["description"] = description
 
         output.append(lora)
+
+    output = output or {"status": "No LoRAs available"}
 
     return json.dumps(output)
 
