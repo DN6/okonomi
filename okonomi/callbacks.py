@@ -1,6 +1,5 @@
 import asyncio
 import json
-import math
 import os
 import queue
 import threading
@@ -28,8 +27,7 @@ DEFAULT_SCORE = 5
 EDITED_PROMPT_SCORE = 10
 
 # Model configuration
-PROMPT_EVAL_MODEL_ID = config["inference_providers"]["huggingface"]["prompt_eval_model_id"]
-concept_eval_client = InferenceClient(api_key=os.environ["HF_TOKEN"])
+hf_client = InferenceClient(api_key=os.environ["HF_TOKEN"])
 theme = gr.themes.Base(
     primary_hue="amber",
     radius_size="xxl",
@@ -122,7 +120,6 @@ def interrupt_after_plan(memory_step, agent, autoplan=False):
 
     elif choice == 2:  # Modify plan - Open Gradio UI
         console.print("\n[dim]Opening Gradio interface to modify plan...[/dim]\n")
-
         results_queue = _create_evaluation_queue()
 
         def run_gradio_interface():
@@ -190,7 +187,6 @@ def interrupt_after_plan(memory_step, agent, autoplan=False):
                     apply_btn.click(fn=apply_modified_plan, inputs=[plan_field, original_plan], outputs=output).then(
                         lambda: gr.update(visible=True), outputs=output
                     )
-
                     cancel_btn.click(fn=cancel_modifications, outputs=output).then(
                         lambda: gr.update(visible=True), outputs=output
                     )
@@ -264,73 +260,64 @@ def interrupt_after_plan(memory_step, agent, autoplan=False):
         return
 
 
-async def autoeval_prompt(input_prompt: str, candidate_prompt: str, creative_strategy: str) -> Dict[str, Any]:
+async def autoeval_prompt(candidate_prompt: str) -> Dict[str, Any]:
     """
-    Evaluate how well a candidate prompt generated using a creative strategy
-    matches the intent and requirements of the original input prompt.
+    Evaluate the quality and effectiveness of a generated prompt.
 
     Args:
-        input_prompt: The original creative brief or problem statement
-        candidate_prompt: The generated prompt using the creative strategy
-        creative_strategy: The name of the creative strategy that was applied
+        candidate_prompt: The generated prompt to evaluate
 
     Returns:
         Dict containing evaluation score, reasoning, and recommendations
     """
 
-    system_prompt = f"""You are an expert creative strategy evaluator. Your task is to assess how well a
-    candidate prompt generated using a specific creative strategy aligns with and enhances the original input prompt.
+    system_prompt = """You are an expert prompt evaluator. Your task is to assess the quality and effectiveness
+    of a text-to-image generation prompt.
 
         EVALUATION CRITERIA:
 
-        1. INTENT PRESERVATION (25%):
-        - Does the candidate maintain the core intent and goals of the input prompt?
-        - Are the essential requirements and constraints preserved?
-        - Is the fundamental creative challenge still addressed?
+        1. VISUAL CLARITY (25%):
+        - Does the prompt clearly describe what should be in the image?
+        - Are the visual elements well-defined and specific?
+        - Can an AI model understand what to generate from this prompt?
 
-        2. STRATEGIC APPLICATION (25%):
-        - Is the creative strategy ({creative_strategy}) applied correctly and effectively?
-        - Does the strategy genuinely enhance the original prompt rather than distract from it?
-        - Are the key principles of {creative_strategy} evident in the candidate?
+        2. CREATIVE QUALITY (25%):
+        - Is the prompt creative and engaging?
+        - Does it apply any mentioned strategies or approaches effectively?
+        - Are there fresh perspectives, insights, or approaches?
 
-        3. CREATIVE ENHANCEMENT (25%):
-        - Does the candidate prompt open new creative possibilities?
-        - Are fresh perspectives, insights, or approaches introduced?
-        - Is there evidence of breakthrough thinking or novel connections?
+        3. TECHNICAL PRECISION (25%):
+        - Is the prompt detailed and specific enough for image generation?
+        - Does it include appropriate visual elements (composition, lighting, style, etc.)?
+        - Is it technically coherent and achievable?
 
-        4. PRACTICAL UTILITY (25%):
-        - Is the candidate prompt actionable and usable for creative work?
-        - Does it provide clear direction while maintaining creative freedom?
-        - Would this prompt inspire and guide effective creative exploration?
+        4. COMPLETENESS (25%):
+        - Does the prompt cover all necessary aspects (subject, style, mood, etc.)?
+        - Is there enough detail to generate a high-quality image?
+        - Are important visual aspects specified?
 
         SCORING SCALE (1-10):
-        - 1-2: Poor - Misses intent, incorrect strategy application, no creative value
-        - 3-4: Weak - Some intent preserved but strategy poorly applied or minimal enhancement
-        - 5-6: Adequate - Basic intent maintained, strategy applied but limited creative impact
-        - 7-8: Good - Intent preserved, strategy well-applied, clear creative enhancement
-        - 9-10: Excellent - Intent elevated, masterful strategy use, significant creative breakthrough
+        - 1-2: Poor - Vague, unclear, lacking detail
+        - 3-4: Weak - Some clarity but missing important elements
+        - 5-6: Adequate - Basic prompt with moderate detail
+        - 7-8: Good - Clear, detailed, and creative
+        - 9-10: Excellent - Exceptional clarity, creativity, and technical precision
 
         Be objective, constructive, and focus on both what works and what could be improved.
     """
 
-    user_message = f"""Please evaluate this creative strategy application:
+    user_message = f"""Please evaluate this text-to-image generation prompt:
 
-        ORIGINAL INPUT PROMPT:
-        {input_prompt}
-
-        CREATIVE STRATEGY USED:
-        {creative_strategy}
-
-        CANDIDATE PROMPT (generated using the strategy):
+        PROMPT:
         {candidate_prompt}
 
-        Provide your evaluation following the specified criteria and JSON format.
+        Analyze the prompt quality based on the evaluation criteria and provide your evaluation in JSON format.
     """
 
     class ConceptEval(BaseModel):
-        prompt_concept_score: int = Field(description="overall score for the provided candidate_prompt")
+        prompt_concept_score: int = Field(description="overall score for the generated prompt (1-10)")
         recommendations: str = Field(
-            description="1-2 suggestions on how to improve the candidate_prompt so that the core intent from the input_prompt is maintained"
+            description="1-2 suggestions on how to improve the prompt based on the context provided"
         )
 
     response_format = {
@@ -342,8 +329,8 @@ async def autoeval_prompt(input_prompt: str, candidate_prompt: str, creative_str
     }
 
     try:
-        completion = concept_eval_client.chat.completions.create(
-            model=PROMPT_EVAL_MODEL_ID,
+        completion = hf_client.chat.completions.create(
+            model=config["inference_providers"]["huggingface"]["prompt_eval_model_id"],
             messages=[
                 {"role": "system", "content": system_prompt},
                 {"role": "user", "content": user_message},
@@ -367,20 +354,19 @@ async def autoeval_prompt(input_prompt: str, candidate_prompt: str, creative_str
 
     except Exception as e:
         return {
-            "prompt_concept_score": None,
+            "prompt_concept_score": 5,  # Default to moderate score instead of None
+            "recommendations": "Unable to complete evaluation. Using default score.",
             "error": f"Evaluation failed: {str(e)}",
-            "input_prompt": input_prompt,
             "candidate_prompt": candidate_prompt,
-            "creative_strategy": creative_strategy,
         }
 
 
-async def autoeval_image(candidate_prompt: str, image_url: str, loras: Optional[List] = None) -> Dict[str, Any]:
+async def autoeval_image(prompt: str, image_url: str, loras: Optional[List] = None) -> Dict[str, Any]:
     """
     Auto-evaluate a generated image using AI vision model.
 
     Args:
-        candidate_prompt: The prompt used for image generation
+        prompt: The prompt used for image generation
         image_url: URL or path to the generated image
         loras: List of LoRAs applied to the image
 
@@ -410,13 +396,14 @@ async def autoeval_image(candidate_prompt: str, image_url: str, loras: Optional[
     if loras:
         lora_info = "\n\nLORAs APPLIED:\n"
         for i, lora in enumerate(loras, 1):
-            lora_info += f"{i}. LoRA ID: {lora.get('lora_id', 'Unknown')}\n"
-            lora_info += f"   Expected visual effect: {lora.get('description', 'No description provided')}\n"
+            # lora is a tuple (url, scale)
+            lora_url, lora_scale = lora if isinstance(lora, tuple) else (lora, 1.0)
+            lora_info += f"{i}. LoRA: {lora_url} (scale: {lora_scale})\n"
 
     user_message = f"""Please evaluate this AI-generated image:
 
-    CANDIDATE PROMPT USED:
-    {candidate_prompt}{lora_info}
+    PROMPT USED:
+    {prompt}{lora_info}
 
     Analyze the image according to the specified criteria and provide your evaluation in the requested JSON format.
     """
@@ -451,12 +438,10 @@ async def autoeval_image(candidate_prompt: str, image_url: str, loras: Optional[
 
     try:
         # Use the image evaluation model
-        IMAGE_EVAL_MODEL_ID = config["inference_providers"]["huggingface"].get(
-            "image_eval_model_id", "Qwen/Qwen2.5-VL-32B-Instruct"
-        )
-
-        completion = concept_eval_client.chat.completions.create(
-            model=IMAGE_EVAL_MODEL_ID,
+        completion = hf_client.chat.completions.create(
+            model=config["inference_providers"]["huggingface"].get(
+                "image_eval_model_id", "Qwen/Qwen2.5-VL-32B-Instruct"
+            ),
             messages=[
                 {"role": "system", "content": system_prompt},
                 {
@@ -468,7 +453,7 @@ async def autoeval_image(candidate_prompt: str, image_url: str, loras: Optional[
                 },
             ],
             temperature=0.2,
-            max_tokens=1500,
+            max_tokens=config["inference_providers"]["huggingface"]["prompt_eval_max_tokens"],
             response_format=response_format,
         )
         response_content = completion.choices[0].message.content
@@ -479,7 +464,7 @@ async def autoeval_image(candidate_prompt: str, image_url: str, loras: Optional[
     except Exception as e:
         return {
             "error": f"Auto-evaluation failed: {str(e)}",
-            "candidate_prompt": candidate_prompt,
+            "prompt": prompt,
             "image_url": image_url,
         }
 
@@ -532,23 +517,29 @@ def _launch_gradio_interface(demo, results_queue, timeout=DEFAULT_TIMEOUT):
 
 
 def eval_image(
-    images: str, prompt: str = "", lora_ids: Optional[List[Tuple[str, float]]] = None, autoeval: bool = False, **kwargs
+    prompt: str,
+    concept_id: str,
+    image: str,
+    lora_id: Optional[List[Tuple[str, float]]] = None,
+    autoeval: bool = False,
+    **kwargs,
 ) -> Dict:
     """
-    Evaluate generated images with both manual user evaluation and optional AI auto-evaluation.
-    Similar to eval_prompt but for images.
+    Evaluate a generated image with both manual user evaluation and optional AI auto-evaluation.
+    Similar to eval_prompt but for a single image.
 
     Args:
-        images: List of image URLs or file paths to evaluate
-        prompt: The prompt used for image generation (for auto-eval)
-        lora_ids: List of LoRAs applied (for auto-eval)
+        prompt: The prompt used for image generation
+        concept_id: The unique identifier for this prompt concept
+        image: Image URL or file path to evaluate
+        lora_id: List of LoRAs applied as (url, scale) tuples (for auto-eval)
         autoeval: If True, skip Gradio interface and run auto-evaluation directly
 
     Returns:
-        Dict containing evaluation results for all images
+        Dict containing evaluation results for the image
     """
-    if not images or len(images) == 0:
-        return json.dumps({"error": "No images provided"})
+    if not image:
+        return json.dumps({"error": "No image provided"})
 
     # If autoeval is True, skip Gradio and run auto-evaluation directly
     if autoeval:
@@ -557,16 +548,15 @@ def eval_image(
         asyncio.set_event_loop(loop)
 
         try:
-            evaluation_results = {}
-            for idx, image_url in enumerate(images):
-                # Run auto-evaluation for each image
-                eval_result = loop.run_until_complete(
-                    autoeval_image(candidate_prompt=prompt, image_url=image_url, loras=lora_ids or [])
-                )
+            # Run auto-evaluation for the single image
+            eval_result = loop.run_until_complete(autoeval_image(prompt=prompt, image_url=image, loras=lora_id or []))
 
-                evaluation_results["image_url"] = image_url
-                evaluation_results["visual_critique_score"] = eval_result.get("visual_critique_score", 0)
-                evaluation_results["recommendations"] = eval_result.get("recommendations", "")
+            # Store the three required fields
+            evaluation_results = {
+                "image_url": image,
+                "visual_critique_score": eval_result.get("visual_critique_score"),
+                "recommendations": eval_result.get("recommendations"),
+            }
 
             # Return as JSON string
             return json.dumps(evaluation_results)
@@ -599,7 +589,7 @@ def eval_image(
                 gr.Info("Running AI image evaluation...")
 
                 # Call the auto-evaluation function
-                eval_result = await autoeval_image(candidate_prompt=prompt, image_url=image_url, loras=lora_ids or [])
+                eval_result = await autoeval_image(prompt=prompt, image_url=image_url, loras=lora_id or [])
 
                 if "error" in eval_result:
                     gr.Warning(f"Auto-evaluation error: {eval_result['error']}")
@@ -624,111 +614,79 @@ def eval_image(
         def create_interface():
             with gr.Blocks(title="Image Evaluation", theme=theme) as demo:
                 gr.Markdown(
-                    f"# Image Evaluation\nEvaluate {len(images)} generated image(s). You can score manually or use AI auto-evaluation."
+                    "# Image Evaluation\nEvaluate the generated image. You can score manually or use AI auto-evaluation."
                 )
 
                 # Show context if available
                 if prompt:
                     with gr.Accordion("Generation Context", open=False):
                         gr.Markdown(f"**Prompt Used:** {prompt}")
-                        if lora_ids:
-                            lora_text = "\n".join(
-                                [
-                                    f"- {lora.get('lora_id', 'Unknown')}: {lora.get('description', '')}"
-                                    for lora in lora_ids
-                                ]
-                            )
+                        if lora_id:
+                            lora_text = "\n".join([f"- {lora[0]}: scale {lora[1]}" for lora in lora_id])
                             gr.Markdown(f"**LoRAs Applied:**\n{lora_text}")
 
-                # Store evaluation data
-                score_components = []
-                feedback_components = []
+                # Create image evaluation section for single image
+                with gr.Row():
+                    with gr.Column():
+                        # Display image
+                        gr.ImageEditor(
+                            value=image,
+                            label="Generated Image",
+                            type="filepath",
+                            interactive=False,
+                        )
 
-                # Create image evaluation sections
-                cols = min(MAX_IMAGE_COLUMNS, len(images))
-                rows = math.ceil(len(images) / cols)
+                        # Score slider
+                        score = gr.Slider(
+                            minimum=1,
+                            maximum=10,
+                            step=1,
+                            value=DEFAULT_SCORE,
+                            label="Score",
+                            info="Rate the overall quality",
+                        )
 
-                idx = 0
-                for _ in range(rows):
-                    with gr.Row():
-                        for _ in range(cols):
-                            if idx < len(images):
-                                with gr.Column():
-                                    # Display image
-                                    gr.ImageEditor(
-                                        value=images[idx],
-                                        label=f"Image {idx + 1}",
-                                        type="filepath",
-                                        interactive=False,
-                                    )
+                        # Feedback textbox
+                        feedback = gr.Textbox(
+                            label="Feedback",
+                            placeholder="What works well? What could be improved?",
+                            lines=3,
+                        )
 
-                                    # Score slider
-                                    score = gr.Slider(
-                                        minimum=1,
-                                        maximum=10,
-                                        step=1,
-                                        value=DEFAULT_SCORE,
-                                        label=f"Score for Image {idx + 1}",
-                                        info="Rate the overall quality",
-                                    )
+                        # Auto-eval button for the image
+                        if prompt:
+                            auto_eval_btn = gr.Button(
+                                "🤖 Auto-Evaluate Image",
+                                variant="secondary",
+                            )
+                            status = gr.Markdown("", visible=True)
 
-                                    # Feedback textbox
-                                    feedback = gr.Textbox(
-                                        label=f"Feedback for Image {idx + 1}",
-                                        placeholder="What works well? What could be improved?",
-                                        lines=3,
-                                    )
+                            # Wrapper for async auto_evaluate
+                            def auto_eval_wrapper(score_val, feedback_val):
+                                return loop.run_until_complete(auto_evaluate_image(image, score_val, feedback_val))
 
-                                    # Auto-eval button for this image
-                                    if prompt:
-                                        auto_eval_btn = gr.Button(
-                                            f"🤖 Auto-Evaluate Image {idx + 1}",
-                                            variant="secondary",
-                                        )
-                                        status = gr.Markdown("", visible=True)
-
-                                        # Wrapper for async auto_evaluate
-                                        def make_auto_eval_wrapper(img_idx):
-                                            def wrapper(score_val, feedback_val):
-                                                return loop.run_until_complete(
-                                                    auto_evaluate_image(images[img_idx], score_val, feedback_val)
-                                                )
-
-                                            return wrapper
-
-                                        auto_eval_btn.click(
-                                            fn=make_auto_eval_wrapper(idx),
-                                            inputs=[score, feedback],
-                                            outputs=[score, feedback, status],
-                                        )
-
-                                    score_components.append(score)
-                                    feedback_components.append(feedback)
-                                    idx += 1
+                            auto_eval_btn.click(
+                                fn=auto_eval_wrapper,
+                                inputs=[score, feedback],
+                                outputs=[score, feedback, status],
+                            )
 
                 # Submit button
-                submit_btn = gr.Button("✅ Submit All Evaluations", variant="primary")
+                submit_btn = gr.Button("✅ Submit Evaluation", variant="primary")
                 output = gr.JSON(label="Evaluation Results", visible=False)
 
                 # Create submission handler
-                def handle_submission(*args):
-                    results = {}
-                    for i in range(len(images)):
-                        results[f"image_{i + 1}"] = {
-                            "image_path": images[i],
-                            "score": int(args[i * 2]),
-                            "feedback": args[i * 2 + 1],
-                        }
+                def handle_submission(score_val, feedback_val):
+                    results = {
+                        "image_path": image,
+                        "score": int(score_val),
+                        "feedback": feedback_val,
+                    }
                     return submit_evaluation(results)
-
-                # Prepare inputs for submit button
-                all_inputs = []
-                for i in range(len(images)):
-                    all_inputs.extend([score_components[i], feedback_components[i]])
 
                 submit_btn.click(
                     fn=handle_submission,
-                    inputs=all_inputs,
+                    inputs=[score, feedback],
                     outputs=output,
                 ).then(lambda: gr.update(visible=True), outputs=output)
 
@@ -763,30 +721,29 @@ def eval_image(
         return json.dumps({"error": f"Error retrieving evaluation results: {str(e)}"})
 
 
-def eval_prompt(
-    candidate_prompt: str, user_input: str = "", creative_strategy: str = "", autoeval: bool = False, **kwargs
-) -> str:
+def eval_prompt(context: str, prompt: str, autoeval: bool = False, **kwargs) -> str:
     """
-    Evaluate how well a candidate prompt generated using a creative strategy
-    matches the intent and requirements of the original input prompt.
+    Evaluate a generated prompt based on the provided context.
 
     Args:
-        candidate_prompt: The candidate prompt to evaluate
-        user_input: The original input prompt (optional, for auto-eval)
-        creative_strategy: The creative strategy used (optional, for auto-eval)
+        context: Context containing the generated prompt and relevant information
+                (user request, strategies applied, previous prompts, etc.)
         autoeval: If True, skip Gradio interface and run auto-evaluation directly
 
     Returns:
         str: JSON string containing the prompt, was_edited, score, and feedback
     """
-    if not candidate_prompt or candidate_prompt.strip() == "":
-        return json.dumps({"error": "No prompt provided"})
+    # Extract the candidate prompt from context - it should be the main output
+    # The context should contain the generated prompt as the primary content
+    if not context or context.strip() == "":
+        return json.dumps({"error": "No context provided"})
+
+    # For now, treat the entire context as containing the prompt
+    # In practice, the prompt should be clearly identified within the context
+    candidate_prompt = context
 
     # If autoeval is True, skip Gradio and run auto-evaluation directly
     if autoeval:
-        if not user_input or not creative_strategy:
-            return json.dumps({"error": "Auto-eval requires user_input and creative_strategy parameters"})
-
         # Create an async event loop for auto-evaluation
         loop = asyncio.new_event_loop()
         asyncio.set_event_loop(loop)
@@ -795,9 +752,7 @@ def eval_prompt(
             # Run auto-evaluation
             eval_result = loop.run_until_complete(
                 autoeval_prompt(
-                    input_prompt=user_input,
                     candidate_prompt=candidate_prompt.strip(),
-                    creative_strategy=creative_strategy,
                 )
             )
 
@@ -808,7 +763,7 @@ def eval_prompt(
             result = {
                 "candidate_prompt": candidate_prompt.strip(),
                 "was_edited": False,  # Not edited in auto-eval
-                "prompt_concept_score": eval_result.get("prompt_concept_score", 0),
+                "prompt_concept_score": eval_result.get("prompt_concept_score", 5),  # Default to 5 instead of 0
                 "feedback": eval_result.get("recommendations", "No recommendations provided."),
             }
 
@@ -850,24 +805,13 @@ def eval_prompt(
         loop = _create_async_event_loop()
 
         async def auto_evaluate(edited_prompt, current_score, current_feedback):
-            """Handle auto-evaluation using eval_concept"""
-            if not user_input or not creative_strategy:
-                gr.Warning("Auto-eval requires input_prompt and creative_strategy parameters")
-                return (
-                    current_score,
-                    "Auto-evaluation requires the original input prompt and creative strategy to be provided.",
-                    "❌ Missing required parameters for auto-evaluation",
-                )
-
             try:
                 # Show loading status
                 gr.Info("Running AI evaluation...")
 
                 # Call the eval_concept function
                 eval_result = await autoeval_prompt(
-                    input_prompt=user_input,
                     candidate_prompt=edited_prompt.strip(),
-                    creative_strategy=creative_strategy,
                 )
 
                 if "error" in eval_result:
@@ -904,17 +848,11 @@ def eval_prompt(
                     "# Prompt Evaluation\nYou can edit the prompt to improve it, score it manually, or use AI auto-evaluation."
                 )
 
-                # Show context if available
-                if user_input and creative_strategy:
-                    with gr.Accordion("Context", open=False):
-                        gr.Markdown(f"**Original Input:** {user_input}")
-                        gr.Markdown(f"**Creative Strategy:** {creative_strategy}")
-
                 # Editable prompt field
                 with gr.Row():
                     prompt_field = gr.Textbox(
-                        value=candidate_prompt,
-                        label="Candidate Prompt (Editable)",
+                        value=prompt,
+                        label="Prompt (Editable)",
                         lines=4,
                         interactive=True,
                         info="✏️ Feel free to edit and improve the prompt",
@@ -946,11 +884,7 @@ def eval_prompt(
 
                 # Buttons row
                 with gr.Row():
-                    auto_eval_btn = gr.Button(
-                        "🤖 Auto-Evaluate with AI",
-                        variant="secondary",
-                        visible=bool(user_input and creative_strategy),
-                    )
+                    auto_eval_btn = gr.Button("🤖 Auto-Evaluate with AI", variant="secondary", visible=True)
                     submit_btn = gr.Button("✅ Submit Evaluation", variant="primary")
 
                 output = gr.Textbox(label="Evaluation Results", visible=False)

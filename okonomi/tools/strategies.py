@@ -171,7 +171,7 @@ STRATEGIES = {
 
 @mcp.tool()
 def fetch_creative_strategy(strategy_name: str) -> str:
-    """Fetch instructions for a creative strategy.
+    """Fetch instructions for a creative strategy that is essential to prompt creation.
 
     Args:
         strategy_name: Name of the strategy to fetch.
@@ -189,7 +189,7 @@ def fetch_creative_strategy(strategy_name: str) -> str:
 
 @mcp.tool()
 def list_creative_strategies() -> str:
-    """List all available creative strategies with descriptions and examples.
+    """List all available creative strategies for prompt creation with descriptions and examples.
 
     Returns:
         Formatted text with strategy names, descriptions, use cases, and examples.

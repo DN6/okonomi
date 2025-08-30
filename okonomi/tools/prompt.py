@@ -1,13 +1,13 @@
 import json
 import os
 import uuid
-from typing import Optional
 
 from huggingface_hub import InferenceClient
 from mcp.server.fastmcp import FastMCP
 
-# Import shared config using relative import
+# Import shared config and utils using relative import
 from ..config import config
+from ..utils import image_to_uri
 
 
 os.environ["MCP_TIMEOUT"] = str(config["tools"]["mcp"]["timeout"])
@@ -18,32 +18,24 @@ create_prompt_client = InferenceClient(api_key=os.environ["HF_TOKEN"])
 
 @mcp.tool()
 def create_prompt(
-    user_input: str,
-    creative_strategy: str,
-    candidate_prompt: Optional[str] = "",
-    feedback: Optional[str] = "",
+    context: str,
 ) -> str:
-    """Generate an optimized text-to-image prompt using a creative strategy.
+    """Generate an optimized text-to-image prompt.
 
-    This tool transforms user input into highly effective image generation prompts
-    by applying creative strategies obtained from the fetch_creative_strategies tool.
+    This tool transforms context information into highly effective image generation prompts
+    based on learned information from the session.
 
     Args:
-        user_input: The original user request or creative brief describing what image they want.
-                   Example: "a sunset over mountains"
-
-        creative_strategy: The detailed insturctions on how to apply a selected creative strategy.instructions.
-                          DO NOT use summarized or modified strategies
-
-        candidate_prompt: (Optional) A previous prompt that needs refinement. If provided,
-                         the tool will improve upon this existing prompt rather than
-                         creating a new one from scratch. Pass empty string "" if not refining.
-
-        feedback: (Optional) Specific feedback about what to improve or change in the prompt.
-                 Can be based on information obtained from past approaches or from current session
-                 This helps guide refinements when a candidate_prompt is provided.
-                 Example: "Add more detail about the lighting and atmosphere"
-                 Pass empty string "" if no feedback.
+        context: Context information to guide prompt generation. This can include:
+                - The user's request or creative brief describing what image they want
+                - instructions to execute specific creative strategies or approaches to apply
+                - Specific feedback about what to improve or change
+                - User preferences discovered through conversation
+                - Successful patterns from previous prompts
+                - Style insights from analyzed images
+                - Technical requirements or constraints
+                - What worked or didn't work in previous attempts
+                - Any previous prompts that need refinement
 
     Returns:
         A JSON string containing:
@@ -51,59 +43,11 @@ def create_prompt(
         - concept_id: A unique identifier for this prompt concept
 
     Usage:
-        1. First call fetch_creative_strategies to obtain strategy instructions
-        2. Pass the complete strategy to this tool's creative_strategy parameter
-        3. The tool will apply that strategy to transform the user_input into an optimized prompt
+        1. Provide comprehensive context including the user's request and any relevant information
+        2. The tool will generate an optimized prompt based on all provided information
     """
-    system_prompt = f"""You are a prompt engineer who transforms conceptual ideas into visual prompts.
-
-    YOUR TASK: Apply this creative strategy to generate a visual interpretation:
-    {creative_strategy}
-
-    PROCESS:
-    1. First, apply the creative strategy to the user's input conceptually
-    2. Then, translate your conceptual insights into visual elements
-    3. Create a prompt that embodies the strategy's outcome visually
-
-    PROMPT REQUIREMENTS:
-    - Must visually represent the creative strategy's approach
-    - Include: subject, style, composition, lighting, mood
-    - Keep concise: 2-4 sentences
-    - Make the strategy's influence obvious in the visual
-
-    {
-        f'''IMPROVE THIS PROMPT:
-    {candidate_prompt}
-    Ensure it better reflects the creative strategy's approach.
-    '''
-        if candidate_prompt
-        else ""
-    }
-
-    {
-        f'''ADDRESS FEEDBACK:
-    {feedback}
-    '''
-        if feedback
-        else ""
-    }
-
-    Output ONLY the final prompt."""
-
-    user_message = f"""Apply the creative strategy to this input:
-    {user_input}
-
-    {f"Current prompt: {candidate_prompt}" if candidate_prompt else ""}
-    {f"Feedback: {feedback}" if feedback else ""}
-
-    Generate a prompt that visually embodies the creative strategy's approach."""
-
-    system_prompt = f"""You are an expert prompt engineer for text-to-image models.
-    Your task is to transform user input into highly effective image generation prompts using the specified creative strategy.
-
-    CREATIVE STRATEGY TO APPLY:
-    Apply the instructions outlined here to the user input when generating the prompt
-    {creative_strategy}
+    system_prompt = """You are an expert prompt engineer for text-to-image models.
+    Your task is to transform context information into highly effective image generation prompts.
 
     PROMPT GUIDELINES:
 
@@ -114,7 +58,7 @@ def create_prompt(
     - Lighting: Type, direction, quality, mood
     - Color: Palette, dominant colors, color harmony
     - Mood: Emotional tone and atmosphere
-    - Technical: Camera specs, lens type, DOF, ISO, etc.
+    - Technical (if photographic): Camera specs, lens type, DOF, ISO, etc.
 
     2. WRITING TECHNIQUES:
     - Be specific: "Close-up portrait of middle-aged woman with curly red hair, green eyes, freckles, blue silk blouse"
@@ -130,47 +74,23 @@ def create_prompt(
     - Ignoring lighting and style specifications
     - Contradictory instructions
 
-    {
-        '''4. WORKING WITH EXISTING PROMPT:
-    You have a previously generated prompt to work from. Analyze its strengths and weaknesses.
-    Consider what elements to keep, enhance, or replace while applying the creative strategy more effectively.
-    The goal is to create an improved version that better captures the user's intent.
-    '''
-        if candidate_prompt
-        else ""
-    }
-    {
-        f'''5. FEEDBACK INCORPORATION:
-    Previous feedback indicates: {feedback}
-    Adjust the prompt to address these concerns while maintaining creative vision.
-    '''
-        if feedback
-        else ""
-    }
-    Apply the creative strategy thoughtfully to enhance the user's request while maintaining their core intent.
+    4. CONTEXT ANALYSIS:
+    - Extract the user's request from the provided context
+    - Identify any previous prompts mentioned and analyze their strengths/weaknesses
+    - Incorporate all strategies, patterns, preferences, and feedback mentioned
+    - Apply any technical requirements or constraints specified
+
+    Apply any strategies or guidance thoughtfully to enhance the user's request while maintaining their core intent.
     Generate a single, cohesive prompt that maximizes visual impact and technical precision.
     """
 
-    user_message = f"""Create an optimized prompt based on:
+    user_message = f"""Create an optimized image generation prompt based on the following context:
 
-    USER INPUT:
-    {user_input}
+    CONTEXT:
+    {context}
 
-    {
-        f'''PREVIOUSLY GENERATED PROMPT:
-    {candidate_prompt}
-
-    Analyze this existing prompt and create an improved version that better applies the creative strategy and addresses any shortcomings.
-    '''
-        if candidate_prompt
-        else ""
-    }{
-        f'''FEEDBACK TO INCORPORATE:
-    {feedback}
-    '''
-        if feedback
-        else ""
-    }Transform this into a detailed, technically precise prompt that will generate stunning images using the creative strategy provided.
+    Analyze all the information provided - including the user's request, any previous prompts, feedback, preferences, and strategies.
+    Transform this into a detailed, technically precise prompt that will generate stunning images.
     Output ONLY the prompt text itself, no explanations or additional formatting."""
 
     try:
@@ -184,7 +104,7 @@ def create_prompt(
             max_tokens=config["inference_providers"]["huggingface"]["prompt_max_tokens"],
         )
         generated_prompt = completion.choices[0].message.content
-        return json.dumps({"candidate_prompt": str(generated_prompt), "concept_id": str(uuid.uuid4())})
+        return json.dumps({"prompt": str(generated_prompt), "concept_id": str(uuid.uuid4())})
 
     except Exception as e:
         return f"Error generating prompt: {str(e)}"
@@ -192,14 +112,14 @@ def create_prompt(
 
 @mcp.tool()
 def describe_image(image_url: str) -> str:
-    """Generate a detailed description of an image from its URL.
+    """Generate a detailed description of an image from its URI.
 
     This tool analyzes an image and provides a comprehensive description that can be used
     for image-to-image generation, style transfer, or as reference for creating similar images.
 
     Args:
-        image_url: The URL of the image to describe. Must be a publicly accessible image URL.
-                  Example: "https://example.com/image.jpg"
+        image_url: URI to the image (URL or data URI from local file).
+                  Example: "https://example.com/image.jpg" or local file path
 
     Returns:
         A detailed description of the image including subject, style, composition,
@@ -262,7 +182,7 @@ def describe_image(image_url: str) -> str:
         user_message = {
             "role": "user",
             "content": [
-                {"type": "image_url", "image_url": {"url": image_url}},
+                {"type": "image_url", "image_url": {"url": image_to_uri(image_url)}},
                 {
                     "type": "text",
                     "text": "Describe this image in comprehensive detail following the guidelines provided.",

@@ -6,90 +6,8 @@ system_prompt: |-
   This Action/Observation can repeat N times, you should take several steps when needed.
 
   You can use the result of any of your previous actions as input for the next action.
-  The observation will always be a string: it can represent a file, like "image_1.jpg".
-  Then you can use it as input for the next action. You can do it for instance as follows:
 
-  Observation: "image_1.jpg"
-
-  Action:
-  {
-    "name": "image_transformer",
-    "arguments": {"image": "image_1.jpg"}
-  }
-
-  To provide the final answer to the task, use an action blob with "name": "final_answer" tool. It is the only way to complete the task, else you will be stuck on a loop. So your final output should look like this:
-  Action:
-  {
-    "name": "final_answer",
-    "arguments": {"answer": "insert your final answer here"}
-  }
-
-
-  Here are a few examples using notional tools:
-  ---
-  Task: "Generate an image of the oldest person in this document."
-
-  Action:
-  {
-    "name": "document_qa",
-    "arguments": {"document": "document.pdf", "question": "Who is the oldest person mentioned?"}
-  }
-  Observation: "The oldest person in the document is John Doe, a 55 year old lumberjack living in Newfoundland."
-
-  Action:
-  {
-    "name": "image_generator",
-    "arguments": {"prompt": "A portrait of John Doe, a 55-year-old man living in Canada."}
-  }
-  Observation: "image.png"
-
-  Action:
-  {
-    "name": "final_answer",
-    "arguments": "image.png"
-  }
-
-  ---
-  Task: "What is the result of the following operation: 5 + 3 + 1294.678?"
-
-  Action:
-  {
-      "name": "python_interpreter",
-      "arguments": {"code": "5 + 3 + 1294.678"}
-  }
-  Observation: 1302.678
-
-  Action:
-  {
-    "name": "final_answer",
-    "arguments": "1302.678"
-  }
-
-  ---
-  Task: "Which city has the highest population , Guangzhou or Shanghai?"
-
-  Action:
-  {
-      "name": "web_search",
-      "arguments": "Population Guangzhou"
-  }
-  Observation: ['Guangzhou has a population of 15 million inhabitants as of 2021.']
-
-
-  Action:
-  {
-      "name": "web_search",
-      "arguments": "Population Shanghai"
-  }
-  Observation: '26 million (2019)'
-
-  Action:
-  {
-    "name": "final_answer",
-    "arguments": "Shanghai"
-  }
-
-  Above example were using notional tools that might not exist for you. You only have access to these tools:
+  You only have access to these tools:
   {%- for tool in tools.values() %}
   - {{ tool.to_tool_calling_prompt() }}
   {%- endfor %}
@@ -121,7 +39,7 @@ system_prompt: |-
   8. When iterating on prompts ALWAYS incorporate feedback that is available to you
   9. When fetching style information, incorporate all known information you have about the context and concept.
   10. When applying style LoRAs always include the trigger word in the prompt.
-  11. When applying style LoRAs always use at least two or more LoRAs. 
+  11. When applying style LoRAs always use at least three or more LoRAs. 
   12. When applying style LoRAs ALWAYS search for candidate LoRAs using tools or memory. NEVER GENERATE CUSTOM lora_id
 
   Now Begin!
@@ -151,7 +69,7 @@ planning:
     steps listed in your plan should be: {{planning_interval}}
 
     This plan should involve individual tasks based on the available tools, that if executed correctly will yield the correct answer.
-    - ALWAYS follow the steps outlined 
+    - ONLY FOLLOW THE STEPS OUTLINED IN THE PLAN. NEVER DEVIATE FROM THE INSTRUCTIONS IN THE PLAN 
     - Do not skip steps 
     - Do not add any superfluous steps. 
     - Only write the high-level plan.
@@ -213,11 +131,11 @@ planning:
     Beware that you have {remaining_steps} steps remaining.
 
     This plan should involve individual tasks based on the available tools, that if executed correctly will yield the correct answer.
-    - ALWAYS follow the steps outlined 
+    - ONLY FOLLOW THE STEPS OUTLINED IN THE PLAN. NEVER DEVIATE FROM THE INSTRUCTIONS IN THE PLAN 
     - Do not skip steps 
     - Do not add any superfluous steps. 
-    - Only write the high-level plan. 
-    - DO NOT INCLUDE REASONING PROCESS IN THE PLAN. 
+    - Only write the high-level plan.
+    - DO NOT INCLUDE YOUR REASONING PROCESS IN THE PLAN STEPS. 
     - DO NOT DETAIL INDIVIDUAL TOOL CALLS.
 
     After writing the final step of the plan, write the '<end_plan>' tag and stop there.

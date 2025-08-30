@@ -6,8 +6,9 @@ from typing import List, Tuple
 import fal_client
 from mcp.server.fastmcp import FastMCP
 
-# Import shared config using relative import
+# Import shared config and utils using relative import
 from ..config import config
+from ..utils import image_to_uri
 
 
 def validate_concept_id(concept_id: str) -> str:
@@ -47,7 +48,7 @@ async def text_to_image(
         seed: Random seed for reproducibility.
 
     Returns:
-        JSON with image URLs and concept_id.
+        JSON with image URL and concept_id.
     """
     # Validate concept_id
     concept_id = validate_concept_id(concept_id)
@@ -70,7 +71,7 @@ async def text_to_image(
     handler = await fal_client.submit_async(model_id, arguments=kwargs)
     request_id = handler.request_id
     output = await fal_client.result_async(model_id, request_id)
-    result = json.dumps({"images": [o["url"] for o in output["images"]], "concept_id": concept_id})
+    result = json.dumps({"image": output["images"][0]["url"], "concept_id": concept_id})
 
     return result
 
@@ -89,7 +90,7 @@ async def image_to_image(
 
     Args:
         prompt: Text description of desired modifications.
-        image: URI to source image.
+        image: URI to source image (URL or data URI from local file).
         concept_id: Unique identifier generated from the create_prompt tool.
                    This ID links the image generation to its original prompt concept.
         image_size: Output dimensions.
@@ -97,7 +98,7 @@ async def image_to_image(
         seed: Random seed.
 
     Returns:
-        JSON with refined image URLs and concept_id.
+        JSON with refined image URL and concept_id.
     """
     # Validate concept_id
     concept_id = validate_concept_id(concept_id)
@@ -110,7 +111,7 @@ async def image_to_image(
         "num_inference_steps": 28,
         "image_size": image_size,
         "num_images": 1,
-        "image_url": image,
+        "image_url": image_to_uri(image),
     }
 
     handler = await fal_client.submit_async(
@@ -119,7 +120,7 @@ async def image_to_image(
     )
     request_id = handler.request_id
     output = await fal_client.result_async(config["inference_providers"]["fal"]["image_to_image_model_id"], request_id)
-    result = json.dumps({"images": [o["url"] for o in output["images"]], "concept_id": concept_id})
+    result = json.dumps({"image": output["images"][0]["url"], "concept_id": concept_id})
 
     return result
 
@@ -143,13 +144,13 @@ async def edit_image(
 
     Args:
         prompt: Edit instruction specifying changes and what to preserve.
-        image: URI to source image.
+        image: URI to source image (URL or data URI from local file).
         concept_id: Unique identifier generated from the create_prompt tool.
         image_size: Output dimensions.
         seed: Random seed.
 
     Returns:
-        JSON with edited image URLs and concept_id.
+        JSON with edited image URL and concept_id.
     """
     # Validate concept_id
     concept_id = validate_concept_id(concept_id)
@@ -161,7 +162,7 @@ async def edit_image(
         "num_inference_steps": 28,
         "image_size": image_size,
         "num_images": 1,
-        "image_url": image,
+        "image_url": image_to_uri(image),
     }
 
     handler = await fal_client.submit_async(
@@ -169,7 +170,7 @@ async def edit_image(
     )
     request_id = handler.request_id
     output = await fal_client.result_async(config["inference_providers"]["fal"]["edit_image_model_id"], request_id)
-    result = json.dumps({"images": [o["url"] for o in output["images"]], "concept_id": concept_id})
+    result = json.dumps({"image": output["images"][0]["url"], "concept_id": concept_id})
 
     return result
 
@@ -182,7 +183,7 @@ async def reference_image(
     image_size: str = "portrait_16_9",
     seed: int = 42,
 ) -> str:
-    """Generate images using reference for style transfer or character consistency.
+    """Generate images using reference image for composition, style transfer or character consistency.
 
     Two main modes:
     1. Style Transfer: Reference provides artistic style for new content
@@ -193,16 +194,18 @@ async def reference_image(
        - Use "This person..." to establish, then specify changes
        - Preserves facial features while changing scene/pose
 
+    3. Preserving Composition: Maintain image composition while changing specific details
+
     Args:
         prompt: New content description or character transformation.
-        image: URI to style/character reference.
+        image: URI to style/character reference (URL or data URI from local file).
         concept_id: Unique identifier generated from the create_prompt tool.
                    This ID links the image generation to its original prompt concept.
         image_size: Output dimensions.
         seed: Random seed.
 
     Returns:
-        JSON with generated image URLs and concept_id.
+        JSON with generated image URL and concept_id.
     """
     # Validate concept_id
     concept_id = validate_concept_id(concept_id)
@@ -214,7 +217,7 @@ async def reference_image(
         "num_inference_steps": 28,
         "image_size": image_size,
         "num_images": 1,
-        "image_url": image,
+        "image_url": image_to_uri(image),
     }
 
     handler = await fal_client.submit_async(
@@ -222,7 +225,7 @@ async def reference_image(
     )
     request_id = handler.request_id
     output = await fal_client.result_async(config["inference_providers"]["fal"]["edit_image_model_id"], request_id)
-    result = json.dumps({"images": [o["url"] for o in output["images"]], "concept_id": concept_id})
+    result = json.dumps({"image": output["images"][0]["url"], "concept_id": concept_id})
 
     return result
 

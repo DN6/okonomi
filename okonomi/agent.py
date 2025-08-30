@@ -409,12 +409,12 @@ class CreateAgent(ToolCallingAgent):
             log_content = str(
                 chat_message.raw if chat_message.content is None and chat_message.raw else chat_message.content or ""
             )
+
             self.logger.log_markdown(
                 content=log_content,
                 title="Output message of the LLM:",
                 level=LogLevel.DEBUG,
             )
-
             memory_step.model_output_message = chat_message
             memory_step.model_output = chat_message.content
             memory_step.token_usage = chat_message.token_usage
@@ -514,7 +514,6 @@ class CreateAgent(ToolCallingAgent):
         memory_step.model_input_messages = input_messages
 
         chat_message = self._generate_model_response(input_messages, memory_step)
-
         chat_message = self._parse_tool_calls(chat_message)
 
         result = self._postprocess_response(chat_message, memory_step)

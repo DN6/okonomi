@@ -35,7 +35,10 @@ dependencies = [
 okonomi = "okonomi.cli:main"
 
 [dependency-groups]
-debug = ["ipdb>=0.13.13"]
+debug = [
+    "ipdb>=0.13.13",
+    "phoenix>=0.9.1",
+]
 dev = ["ipdb>=0.13.13", "pyright>=1.1.403", "ruff>=0.12.5"]
 
 [tool.ruff]
