@@ -39,6 +39,7 @@ from smolagents import (
 )
 
 from .utils import write_to_permanent_memory
+from .session import Session, SessionManager, SessionMetadata
 
 
 def _format_json_item(obj, level=0, separator=": ", indent="  "):
@@ -104,17 +105,25 @@ def json_to_simple_text(data, separator=": ", indent="  "):
         return _format_json_item(data, 0, separator, indent)
 
 
-class CreateAgent(ToolCallingAgent):
+class OkonomiAgent(ToolCallingAgent):
     stop_sequences = ["Observation:", "Calling tools:"]
     eval_keys = ["prompt_concept_score", "visual_critique_score"]
 
     def __init__(
-        self, structured_output: bool = False, tool_callbacks: dict = None, eval_keys: List[str] = None, **kwargs
+        self,
+        structured_output: bool = False,
+        tool_callbacks: dict = None,
+        eval_keys: List[str] = None,
+        session_id: str = None,
+        **kwargs
     ) -> None:
         self.tool_callbacks = tool_callbacks or {}
         self.structured_output = structured_output
         self.eval_keys = eval_keys or self.eval_keys
         self.generated_outputs = []
+        self.session_manager = SessionManager()
+        self.session_id = session_id or self.session_manager.create_session_id()
+        self.run_start_time = None
         super().__init__(**kwargs)
 
     def write_memory_to_messages(
@@ -247,21 +256,11 @@ class CreateAgent(ToolCallingAgent):
         Returns:
             str: Formatted observation string.
         """
-        result_type = type(tool_call_result)
+        observation = str(tool_call_result).strip()
+        if not self.structured_output:
+            observation = json_to_simple_text(observation)
 
-        if result_type == AgentImage:
-            observation_name = "image.png"
-            self.state[observation_name] = tool_call_result
-            return f"Stored '{observation_name}' in memory."
-        elif result_type == AgentAudio:
-            observation_name = "audio.mp3"
-            self.state[observation_name] = tool_call_result
-            return f"Stored '{observation_name}' in memory."
-        else:
-            observation = str(tool_call_result).strip()
-            if not self.structured_output:
-                observation = json_to_simple_text(observation)
-            return observation
+        return observation
 
     def _process_single_tool_call(self, tool_call: ToolCall) -> ToolOutput:
         """Process a single tool call and return its output.
@@ -299,7 +298,9 @@ class CreateAgent(ToolCallingAgent):
             if any(key in tool_call_result for key in self.eval_keys):
                 concept_id = tool_call_result["concept_id"]
                 generated_output = {}
-                generated_output.update({"concept_id": concept_id, "tool_name": tool_name}, **tool_arguments)
+                generated_output.update(
+                    {"user_input": self.task, "concept_id": concept_id, "tool_name": tool_name}, **tool_arguments
+                )
                 generated_output.update(**tool_call_result)
                 self.generated_outputs.append(generated_output)
 
@@ -500,6 +501,65 @@ class CreateAgent(ToolCallingAgent):
                 merged_outputs.append(image_generation)
 
         write_to_permanent_memory(merged_outputs)
+        return merged_outputs
+
+    def _save_session(self, status: str, merged_outputs: list) -> None:
+        """Save the current session state to disk.
+
+        Args:
+            status: Status of the run ("completed", "interrupted", "max_steps_error")
+            merged_outputs: List of merged output data
+        """
+        from datetime import datetime
+
+        # Get model ID if available
+        model_id = ""
+        if hasattr(self, "model") and hasattr(self.model, "model_id"):
+            model_id = self.model.model_id
+
+        # Create session metadata
+        metadata = SessionMetadata(
+            session_id=self.session_id,
+            task=self.task if hasattr(self, "task") else "",
+            timestamp=datetime.now().isoformat(),
+            status=status,
+            num_outputs=len(merged_outputs),
+            model_id=model_id,
+            total_steps=len(self.memory.steps),
+        )
+
+        # Create session object
+        session = Session(
+            metadata=metadata,
+            generated_outputs=merged_outputs,
+            agent_memory_state=None,  # Could serialize memory if needed for resumption
+        )
+
+        # Save session
+        self.session_manager.save_session(session)
+
+    def load_from_session(self, session_id: str) -> bool:
+        """Load state from a previous session.
+
+        Args:
+            session_id: ID of the session to load
+
+        Returns:
+            True if loaded successfully, False otherwise
+        """
+        session = self.session_manager.load_session(session_id)
+
+        if not session:
+            return False
+
+        # Restore generated outputs
+        self.generated_outputs = session.generated_outputs
+        self.session_id = session_id
+
+        # Note: We don't restore memory state by default to allow continuing with new tasks
+        # If full resumption is needed, we could restore memory state here
+
+        return True
 
     def _step_stream(
         self, memory_step: ActionStep
@@ -605,15 +665,25 @@ You have been provided with these additional arguments, that you can access dire
         self.memory.steps.append(TaskStep(task=self.task, task_images=images))
 
         run_start_time = time.time()
+        self.run_start_time = run_start_time
         steps = list(self._run_stream(task=self.task, max_steps=max_steps, images=images))
         assert isinstance(steps[-1], FinalAnswerStep)
         output = steps[-1].output
 
         self.logger.log("Saving session and generated outputs to permanent memory", level=LogLevel.INFO)
+        merged_outputs = []
         try:
-            self._write_to_permanent_memory()
+            merged_outputs = self._write_to_permanent_memory()
         except Exception as e:
             self.logger.log(f"Error saving to memory: {e}")
+
+        # Save session to disk
+        run_state = self._determine_run_state()
+        try:
+            self._save_session(status=run_state, merged_outputs=merged_outputs)
+            self.logger.log(f"Session saved: {self.session_id}", level=LogLevel.INFO)
+        except Exception as e:
+            self.logger.log(f"Error saving session: {e}", level=LogLevel.WARNING)
 
         if self.return_full_result:
             return RunResult(
@@ -621,7 +691,7 @@ You have been provided with these additional arguments, that you can access dire
                 token_usage=self._calculate_token_usage(),
                 messages=self.memory.get_full_steps(),
                 timing=Timing(start_time=run_start_time, end_time=time.time()),
-                state=self._determine_run_state(),
+                state=run_state,
             )
 
         return output

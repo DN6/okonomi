@@ -1,3 +1,4 @@
+import logging
 import json
 import os
 import uuid
@@ -22,7 +23,7 @@ def validate_concept_id(concept_id: str) -> str:
         return str(uuid.uuid4())
 
 
-os.environ["MCP_TIMEOUT"] = str(config["tools"]["mcp"]["timeout"])
+os.environ["MCP_TIMEOUT"] = str(config.tools.mcp.timeout)
 
 # Initialize FastMCP server
 mcp = FastMCP("image_tools")
@@ -63,10 +64,10 @@ async def text_to_image(
     }
 
     if lora_id:
-        model_id = config["inference_providers"]["fal"]["text_to_image_lora_model_id"]
+        model_id = config.inference_providers.fal.text_to_image_lora_model_id
         kwargs.update({"loras": [{"path": id, "scale": scale} for id, scale in lora_id]})
     else:
-        model_id = config["inference_providers"]["fal"]["text_to_image_model_id"]
+        model_id = config.inference_providers.fal.text_to_image_model_id
 
     handler = await fal_client.submit_async(model_id, arguments=kwargs)
     request_id = handler.request_id
@@ -115,11 +116,11 @@ async def image_to_image(
     }
 
     handler = await fal_client.submit_async(
-        config["inference_providers"]["fal"]["image_to_image_model_id"],
+        config.inference_providers.fal.image_to_image_model_id,
         arguments=kwargs,
     )
     request_id = handler.request_id
-    output = await fal_client.result_async(config["inference_providers"]["fal"]["image_to_image_model_id"], request_id)
+    output = await fal_client.result_async(config.inference_providers.fal.image_to_image_model_id, request_id)
     result = json.dumps({"image": output["images"][0]["url"], "concept_id": concept_id})
 
     return result
@@ -165,11 +166,9 @@ async def edit_image(
         "image_url": image_to_uri(image),
     }
 
-    handler = await fal_client.submit_async(
-        config["inference_providers"]["fal"]["edit_image_model_id"], arguments=kwargs
-    )
+    handler = await fal_client.submit_async(config.inference_providers.fal.edit_image_model_id, arguments=kwargs)
     request_id = handler.request_id
-    output = await fal_client.result_async(config["inference_providers"]["fal"]["edit_image_model_id"], request_id)
+    output = await fal_client.result_async(config.inference_providers.fal.edit_image_model_id, request_id)
     result = json.dumps({"image": output["images"][0]["url"], "concept_id": concept_id})
 
     return result
@@ -220,11 +219,9 @@ async def reference_image(
         "image_url": image_to_uri(image),
     }
 
-    handler = await fal_client.submit_async(
-        config["inference_providers"]["fal"]["edit_image_model_id"], arguments=kwargs
-    )
+    handler = await fal_client.submit_async(config.inference_providers.fal.edit_image_model_id, arguments=kwargs)
     request_id = handler.request_id
-    output = await fal_client.result_async(config["inference_providers"]["fal"]["edit_image_model_id"], request_id)
+    output = await fal_client.result_async(config.inference_providers.fal.edit_image_model_id, request_id)
     result = json.dumps({"image": output["images"][0]["url"], "concept_id": concept_id})
 
     return result

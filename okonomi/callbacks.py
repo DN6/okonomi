@@ -330,13 +330,13 @@ async def autoeval_prompt(candidate_prompt: str) -> Dict[str, Any]:
 
     try:
         completion = hf_client.chat.completions.create(
-            model=config["inference_providers"]["huggingface"]["prompt_eval_model_id"],
+            model=config.inference_providers.huggingface.prompt_eval_model_id,
             messages=[
                 {"role": "system", "content": system_prompt},
                 {"role": "user", "content": user_message},
             ],
-            temperature=config["inference_providers"]["huggingface"]["prompt_eval_model_temperature"],
-            max_tokens=config["inference_providers"]["huggingface"]["prompt_eval_max_tokens"],
+            temperature=config.inference_providers.huggingface.prompt_eval_model_temperature,
+            max_tokens=config.inference_providers.huggingface.prompt_eval_max_tokens,
             response_format=response_format,
         )
         response_content = completion.choices[0].message.content
@@ -439,9 +439,8 @@ async def autoeval_image(prompt: str, image_url: str, loras: Optional[List] = No
     try:
         # Use the image evaluation model
         completion = hf_client.chat.completions.create(
-            model=config["inference_providers"]["huggingface"].get(
-                "image_eval_model_id", "Qwen/Qwen2.5-VL-32B-Instruct"
-            ),
+            model=getattr(config.inference_providers.huggingface,
+                "image_eval_model_id", "Qwen/Qwen2.5-VL-32B-Instruct"),
             messages=[
                 {"role": "system", "content": system_prompt},
                 {
@@ -453,7 +452,7 @@ async def autoeval_image(prompt: str, image_url: str, loras: Optional[List] = No
                 },
             ],
             temperature=0.2,
-            max_tokens=config["inference_providers"]["huggingface"]["prompt_eval_max_tokens"],
+            max_tokens=config.inference_providers.huggingface.prompt_eval_max_tokens,
             response_format=response_format,
         )
         response_content = completion.choices[0].message.content

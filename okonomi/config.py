@@ -1,197 +1,229 @@
 """Configuration management for Okonomi."""
 
-import json
 import os
-from pathlib import Path
+from dataclasses import dataclass, field, asdict
+from typing import List, Dict, Any
 
 from dotenv import load_dotenv
 
 
-# Default configuration fallback
-DEFAULT_CONFIG = {
-    "agent": {
-        "model_type": "inference_client",
-        "model_id": "zai-org/GLM-4.5",
-        "model_provider": "fireworks-ai",
-        "temperature": 0.2,
-        "top_p": 1.0,
-        "planning_interval": 2,
-        "max_steps": 50,
-        "max_tokens": 512,
-        "verbosity_level": "2",
-        "autoplan": True,
-    },
-    "inference_providers": {
-        "huggingface": {
-            "prompt_model_id": "Qwen/Qwen2.5-VL-7B-Instruct",
-            "prompt_eval_model_id": "openai/gpt-oss-20b",
-            "prompt_model_temperature": 0.6,
-            "prompt_eval_model_temperature": 0.2,
-            "prompt_max_tokens": 512,
-            "prompt_eval_max_tokens": 512,
-            "image_eval_model_id": "Qwen/Qwen2.5-VL-72B-Instruct",
-            "image_prompt_model_id": "Qwen/Qwen2.5-VL-7B-Instruct",
-        },
-        "fal": {
-            "text_to_image_model_id": "fal-ai/flux-krea-lora",
-            "text_to_image_lora_model_id": "fal-ai/flux-lora",
-            "image_to_image_model_id": "fal-ai/flux-krea-lora/image-to-image",
-            "edit_image_model_id": "fal-ai/flux-pro/kontext",
-        },
-    },
-    "tools": {"mcp": {"timeout": 600}, "callbacks": {"autoeval": True}},
-    "memory": {
-        "chroma": {
-            "tenant": "",
-            "database": "",
-            "image_eval_collection_id": "image-evaluations",
-            "lora_collection_id": "lora-collection",
-            "max_lora_results": 3,
-            "max_image_eval_results": 3,
-        },
-        "huggingface": {"lora_collection_id": "", "image_repo_id": ""},
-    },
-    "environment_variables": {"required": ["HF_TOKEN", "FAL_KEY"], "optional": ["CHROMA_API_KEY"]},
-}
+@dataclass
+class AgentConfig:
+    model_type: str = "inference_client"
+    model_id: str = "zai-org/GLM-4.5"
+    model_provider: str = "fireworks-ai"
+    temperature: float = 0.2
+    top_p: float = 1.0
+    planning_interval: int = 2
+    max_steps: int = 50
+    max_tokens: int = 1000
+    verbosity_level: int = 1
+    autoplan: bool = True
 
 
-class Config:
-    """Centralized configuration management."""
+@dataclass
+class HuggingfaceConfig:
+    prompt_model_id: str = "Qwen/Qwen2.5-VL-7B-Instruct"
+    prompt_eval_model_id: str = "openai/gpt-oss-20b"
+    prompt_model_temperature: float = 0.6
+    prompt_eval_model_temperature: float = 0.2
+    prompt_max_tokens: int = 512
+    prompt_eval_max_tokens: int = 512
+    image_eval_model_id: str = "Qwen/Qwen2.5-VL-72B-Instruct"
+    image_prompt_model_id: str = "Qwen/Qwen2.5-VL-7B-Instruct"
 
-    _instance = None
-    _config = None
-    _initialized = False
 
-    def __new__(cls):
-        if cls._instance is None:
-            cls._instance = super().__new__(cls)
-        return cls._instance
+@dataclass
+class FalConfig:
+    text_to_image_model_id: str = "fal-ai/flux-krea-lora"
+    text_to_image_lora_model_id: str = "fal-ai/flux-lora"
+    image_to_image_model_id: str = "fal-ai/flux-krea-lora/image-to-image"
+    edit_image_model_id: str = "fal-ai/flux-pro/kontext"
+
+
+@dataclass
+class InferenceProvidersConfig:
+    huggingface: HuggingfaceConfig = field(default_factory=HuggingfaceConfig)
+    fal: FalConfig = field(default_factory=FalConfig)
+
+
+@dataclass
+class McpConfig:
+    timeout: int = 600
+
+
+@dataclass
+class CallbacksConfig:
+    autoeval: bool = True
+
+
+@dataclass
+class ToolsConfig:
+    mcp: McpConfig = field(default_factory=McpConfig)
+    callbacks: CallbacksConfig = field(default_factory=CallbacksConfig)
+
+
+@dataclass
+class ChromaConfig:
+    tenant: str = ""
+    database: str = ""
+    image_eval_collection_id: str = "image-evaluations"
+    lora_collection_id: str = "lora-collection"
+    max_lora_results: int = 3
+    max_image_eval_results: int = 3
+
+
+@dataclass
+class HuggingfaceMemoryConfig:
+    lora_collection_id: str = ""
+    image_repo_id: str = ""
+
+
+@dataclass
+class SessionConfig:
+    storage_dir: str = ""  # Empty string means use default ~/.okonomi/sessions
+    auto_save: bool = True
+
+
+@dataclass
+class MemoryConfig:
+    chroma: ChromaConfig = field(default_factory=ChromaConfig)
+    huggingface: HuggingfaceMemoryConfig = field(default_factory=HuggingfaceMemoryConfig)
+    sessions: SessionConfig = field(default_factory=SessionConfig)
+
+
+@dataclass
+class EnvironmentVariablesConfig:
+    required: List[str] = field(default_factory=lambda: ["HF_TOKEN", "FAL_KEY"])
+    optional: List[str] = field(default_factory=lambda: ["CHROMA_API_KEY"])
+
+
+@dataclass
+class DefaultConfig:
+    """Main configuration class for Okonomi."""
+
+    agent: AgentConfig = field(default_factory=AgentConfig)
+    inference_providers: InferenceProvidersConfig = field(default_factory=InferenceProvidersConfig)
+    tools: ToolsConfig = field(default_factory=ToolsConfig)
+    memory: MemoryConfig = field(default_factory=MemoryConfig)
+    environment_variables: EnvironmentVariablesConfig = field(default_factory=EnvironmentVariablesConfig)
+
+    def to_dict(self) -> Dict[str, Any]:
+        """Convert the config to a dictionary."""
+        return asdict(self)
+
+
+class OkonomiConfig:
+    """Configuration management for Okonomi.
+
+    Uses Python dataclasses for configuration with environment variable validation.
+    Provides both dictionary-style and attribute-style access.
+    """
 
     def __init__(self):
-        # Don't auto-load config on initialization - make it lazy
-        pass
-
-    def _ensure_loaded(self):
-        """Ensure config is loaded before access."""
-        if not self._initialized:
-            self._load_config()
-            self._initialized = True
-
-    def _load_config(self) -> None:
-        """Load configuration from file and validate environment variables."""
-        # Load environment variables from .env file
+        """Initialize configuration with default values."""
+        # Load environment variables
         load_dotenv()
 
-        # Get config file path
-        config_filename = os.getenv("OKONOMI_CONFIG", "config.json")
-        config_path = self._resolve_config_path(config_filename)
+        # Create the default configuration directly from dataclasses
+        self._config = DefaultConfig()
 
-        # Load config file or use default
-        try:
-            with open(config_path, "r") as f:
-                self._config = json.load(f)
-        except FileNotFoundError:
-            self._config = DEFAULT_CONFIG.copy()
+        # Keep a dict representation for backward compatibility with dict access
+        self._data = asdict(self._config)
 
-        # Validate required environment variables
+        # Validate environment variables
         self._validate_env_vars()
 
-    def _resolve_config_path(self, config_filename: str) -> Path:
-        """Resolve config file path based on filename."""
-        if os.path.isabs(config_filename):
-            # Absolute path - use as-is
-            return Path(config_filename)
-        else:
-            # All relative paths (including simple filenames) - relative to current working directory
-            # Try current working directory first
-            cwd_path = Path.cwd() / config_filename
-            if cwd_path.exists():
-                return cwd_path
-
-            # Fallback to package directory (installed location)
-            package_path = Path(__file__).parent.parent / config_filename
-            if package_path.exists():
-                return package_path
-
-            # Last resort: check if default config.json exists in package
-            default_config = Path(__file__).parent.parent / "config.json"
-            if default_config.exists():
-                return default_config
-
-            # If nothing exists, return cwd path (will be handled as FileNotFoundError in _load_config)
-            return cwd_path
-
     def _validate_env_vars(self) -> None:
-        """Validate required environment variables."""
-        required_vars = self._config.get("environment_variables", {}).get("required", [])
+        """Validate required environment variables.
 
-        for env_variable in required_vars:
-            # Make CHROMA_API_KEY optional - use local DB if not set
-            if env_variable == "CHROMA_API_KEY":
-                if not os.getenv(env_variable):
-                    print(f"Note: {env_variable} not set, using local ChromaDB storage")
-                continue
+        Raises:
+            EnvironmentError: If a required environment variable is not set
+        """
+        # Check required variables
+        missing_vars = []
+        for var in self._config.environment_variables.required:
+            if not os.getenv(var):
+                missing_vars.append(var)
 
-            if os.getenv(env_variable) is None:
-                raise EnvironmentError(f"Required environment variable: {env_variable} is not set")
+        if missing_vars:
+            raise EnvironmentError(f"Required environment variables not set: {', '.join(missing_vars)}")
 
-    def __getitem__(self, key):
-        """Allow dictionary-style access to config."""
-        self._ensure_loaded()
-        return self._config[key]
+        # Log optional variables that are not set
+        for var in self._config.environment_variables.optional:
+            if not os.getenv(var):
+                if var == "CHROMA_API_KEY":
+                    print(f"Note: {var} not set, using local ChromaDB storage")
 
-    def __setitem__(self, key, value):
-        """Allow dictionary-style setting (for runtime modifications)."""
-        self._ensure_loaded()
-        self._config[key] = value
+    def __getitem__(self, key: str) -> Any:
+        """Get configuration value by key."""
+        return self._data[key]
 
-    def __contains__(self, key):
-        """Allow 'key in config' checks."""
-        self._ensure_loaded()
-        return key in self._config
+    def __setitem__(self, key: str, value: Any) -> None:
+        """Set configuration value for runtime modifications."""
+        self._data[key] = value
+        # Note: This doesn't update the dataclass structure,
+        # only the dict representation
 
-    def get(self, key, default=None):
-        """Get configuration value with optional default."""
-        self._ensure_loaded()
-        return self._config.get(key, default)
+    def __contains__(self, key: str) -> bool:
+        """Check if key exists in configuration."""
+        return key in self._data
+
+    def get(self, key: str, default: Any = None) -> Any:
+        """Get configuration value with optional default.
+
+        Args:
+            key: Configuration key
+            default: Default value if key not found
+
+        Returns:
+            Configuration value or default
+        """
+        return self._data.get(key, default)
 
     def keys(self):
         """Return configuration keys."""
-        self._ensure_loaded()
-        return self._config.keys()
+        return self._data.keys()
 
     def values(self):
         """Return configuration values."""
-        self._ensure_loaded()
-        return self._config.values()
+        return self._data.values()
 
     def items(self):
         """Return configuration items."""
-        self._ensure_loaded()
-        return self._config.items()
+        return self._data.items()
 
-    def set_config_path(self, config_path: str) -> None:
-        """Set a new config path and reload configuration.
+    # Attribute-style access properties
+    @property
+    def agent(self) -> AgentConfig:
+        """Get agent configuration."""
+        return self._config.agent
 
-        Args:
-            config_path: Path to new config file
-        """
-        os.environ["OKONOMI_CONFIG"] = config_path
-        self._config = None
-        self._initialized = False
-        self._ensure_loaded()
+    @property
+    def inference_providers(self) -> InferenceProvidersConfig:
+        """Get inference providers configuration."""
+        return self._config.inference_providers
 
-    def reload(self) -> None:
-        """Reload configuration from file."""
-        self._config = None
-        self._initialized = False
-        self._ensure_loaded()
+    @property
+    def tools(self) -> ToolsConfig:
+        """Get tools configuration."""
+        return self._config.tools
+
+    @property
+    def memory(self) -> MemoryConfig:
+        """Get memory configuration."""
+        return self._config.memory
+
+    @property
+    def sessions(self) -> SessionConfig:
+        """Get session configuration."""
+        return self._config.memory.sessions
+
+    @property
+    def environment_variables(self) -> EnvironmentVariablesConfig:
+        """Get environment variables configuration."""
+        return self._config.environment_variables
 
 
 # Global configuration instance
-config = Config()
-
-
-def get_config() -> Config:
-    """Get the global configuration instance."""
-    return config
+config = OkonomiConfig()

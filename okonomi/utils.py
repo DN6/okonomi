@@ -30,8 +30,8 @@ def get_chroma_client() -> Union[chromadb.CloudClient, chromadb.PersistentClient
     if os.getenv("CHROMA_API_KEY"):
         return chromadb.CloudClient(
             api_key=os.getenv("CHROMA_API_KEY"),
-            tenant=config["memory"]["chroma"]["tenant"],
-            database=config["memory"]["chroma"]["database"],
+            tenant=config.memory.chroma.tenant,
+            database=config.memory.chroma.database,
         )
     else:
         # Use local persistent client
@@ -125,7 +125,7 @@ def upload_image_to_dataset(filepath: str, session_id: str) -> str:
         image_id = Path(filepath).stem
         url = hf_api.upload_file(
             path_or_fileobj=filepath,
-            repo_id=config["memory"]["huggingface"]["image_repo_id"],
+            repo_id=config.memory.huggingface.image_repo_id,
             repo_type="dataset",
             path_in_repo=f"{session_id}/{image_id}.png",
         )
@@ -188,7 +188,7 @@ def write_to_permanent_memory(data: List[dict]) -> dict:
     session_id = create_session_id()
 
     client = get_chroma_client()
-    collection = client.get_or_create_collection(name=config["memory"]["chroma"]["image_eval_collection_id"])
+    collection = client.get_or_create_collection(name=config.memory.chroma.image_eval_collection_id)
 
     try:
         ids = []
@@ -251,7 +251,7 @@ def update_available_loras() -> None:
 
     try:
         client = get_chroma_client()
-        collection = client.get_or_create_collection(name=config["memory"]["chroma"]["lora_collection_id"])
+        collection = client.get_or_create_collection(name=config.memory.chroma.lora_collection_id)
         lora_collection = hf_api.get_collection(lora_collection_id)
 
         ids = []

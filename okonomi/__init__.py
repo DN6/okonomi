@@ -2,7 +2,7 @@
 
 __version__ = "0.1.0"
 
-from .agent import CreateAgent
+from .agent import OkonomiAgent
 
 
-__all__ = ["CreateAgent", "__version__"]
+__all__ = ["OkonomiAgent", "__version__"]

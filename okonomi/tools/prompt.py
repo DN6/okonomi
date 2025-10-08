@@ -1,4 +1,5 @@
 import json
+import logging
 import os
 import uuid
 
@@ -9,8 +10,7 @@ from mcp.server.fastmcp import FastMCP
 from ..config import config
 from ..utils import image_to_uri
 
-
-os.environ["MCP_TIMEOUT"] = str(config["tools"]["mcp"]["timeout"])
+os.environ["MCP_TIMEOUT"] = str(config.tools.mcp.timeout)
 
 mcp = FastMCP("prompt_tools")
 create_prompt_client = InferenceClient(api_key=os.environ["HF_TOKEN"])
@@ -95,13 +95,13 @@ def create_prompt(
 
     try:
         completion = create_prompt_client.chat.completions.create(
-            model=config["inference_providers"]["huggingface"]["prompt_model_id"],
+            model=config.inference_providers.huggingface.prompt_model_id,
             messages=[
                 {"role": "system", "content": system_prompt},
                 {"role": "user", "content": user_message},
             ],
-            temperature=config["inference_providers"]["huggingface"]["prompt_model_temperature"],
-            max_tokens=config["inference_providers"]["huggingface"]["prompt_max_tokens"],
+            temperature=config.inference_providers.huggingface.prompt_model_temperature,
+            max_tokens=config.inference_providers.huggingface.prompt_max_tokens,
         )
         generated_prompt = completion.choices[0].message.content
         return json.dumps({"prompt": str(generated_prompt), "concept_id": str(uuid.uuid4())})
@@ -175,7 +175,7 @@ def describe_image(image_url: str) -> str:
 
     try:
         # Use the image prompt model from config
-        model_id = config["inference_providers"]["huggingface"]["image_prompt_model_id"]
+        model_id = config.inference_providers.huggingface.image_prompt_model_id
         # Create a new client for image description (vision model)
         vision_client = InferenceClient(model=model_id, api_key=os.environ["HF_TOKEN"])
 
@@ -194,7 +194,7 @@ def describe_image(image_url: str) -> str:
             model=model_id,
             messages=[{"role": "system", "content": system_prompt}, user_message],
             temperature=0.3,  # Lower temperature for more consistent descriptions
-            max_tokens=config["inference_providers"]["huggingface"]["prompt_max_tokens"],
+            max_tokens=config.inference_providers.huggingface.prompt_max_tokens,
         )
 
         description = completion.choices[0].message.content

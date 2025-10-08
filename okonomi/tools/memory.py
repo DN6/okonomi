@@ -1,6 +1,7 @@
 import json
 import os
 import re
+import logging
 from textwrap import dedent
 
 from huggingface_hub import HfApi
@@ -10,8 +11,13 @@ from mcp.server.fastmcp import FastMCP
 from ..config import config
 from ..utils import get_chroma_client
 
+httpx_logger = logging.getLogger("httpx")
+httpx_logger.setLevel(logging.WARNING)
 
-os.environ["MCP_TIMEOUT"] = str(config["tools"]["mcp"]["timeout"])
+mcp_logger = logging.getLogger("mcp")
+mcp_logger.setLevel(logging.WARNING)
+
+os.environ["MCP_TIMEOUT"] = str(config.tools.mcp.timeout)
 
 mcp = FastMCP("memory_tools")
 hf_api = HfApi()
@@ -28,8 +34,8 @@ def retrieve_from_memory(query: str, min_score: float = 0.0, max_score: float = 
         JSON list with score, evaluation, and image_url for each result.
     """
     client = get_chroma_client()
-    collection = client.get_or_create_collection(name=config["memory"]["chroma"]["image_eval_collection_id"])
-    max_results = config["memory"]["chroma"]["max_image_eval_results"]
+    collection = client.get_or_create_collection(name=config.memory.chroma.image_eval_collection_id)
+    max_results = config.memory.chroma.max_image_eval_results
 
     try:
         result = collection.query(
@@ -44,7 +50,7 @@ def retrieve_from_memory(query: str, min_score: float = 0.0, max_score: float = 
     metadatas = result["metadatas"][0]
 
     outputs = []
-    for i, (document, metadata) in enumerate(zip(documents[:max_results], metadatas[:max_results])):
+    for _, (document, metadata) in enumerate(zip(documents[:max_results], metadatas[:max_results])):
         # Get the overall_score from metadata, default to 'N/A' if not present
         score = metadata.get("score", "N/A")
         outputs.append(
@@ -70,10 +76,10 @@ def find_candidate_loras(query: str) -> str:
 
     Note: Include trigger words in prompts when using found LoRAs.
     """
-    max_results = config["memory"]["chroma"]["max_lora_results"]
+    max_results = config.memory.chroma.max_lora_results
     client = get_chroma_client()
 
-    collection = client.get_or_create_collection(name=config["memory"]["chroma"]["lora_collection_id"])
+    collection = client.get_or_create_collection(name=config.memory.chroma.lora_collection_id)
 
     try:
         result = collection.query(
