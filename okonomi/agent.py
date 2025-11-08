@@ -115,7 +115,7 @@ class OkonomiAgent(ToolCallingAgent):
         tool_callbacks: dict = None,
         eval_keys: List[str] = None,
         session_id: str = None,
-        **kwargs
+        **kwargs,
     ) -> None:
         self.tool_callbacks = tool_callbacks or {}
         self.structured_output = structured_output

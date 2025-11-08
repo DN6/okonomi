@@ -304,8 +304,8 @@ def image_to_uri(image: str, max_size_mb: float = 3.5) -> str:
             img_resized = img.resize((new_width, new_height), Image.Resampling.LANCZOS)
 
             # Convert to RGB if necessary
-            if img_resized.mode != 'RGB':
-                img_resized = img_resized.convert('RGB')
+            if img_resized.mode != "RGB":
+                img_resized = img_resized.convert("RGB")
 
             # Save to buffer with compression
             buffered = BytesIO()

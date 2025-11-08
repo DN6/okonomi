@@ -50,8 +50,7 @@ def initialize_model() -> InferenceClientModel:
 
 def setup_mcp_tools() -> List[StdioServerParameters]:
     # Define tool module names
-    tool_modules = ["prompt", "image", "memory", "strategies", "sessions"]
-
+    tool_modules = ["prompt", "image", "memory", "strategies", "sessions", "research"]
     tools = []
 
     env = {}
@@ -61,6 +60,8 @@ def setup_mcp_tools() -> List[StdioServerParameters]:
         env["FAL_KEY"] = os.getenv("FAL_KEY")
     if os.getenv("CHROMA_API_KEY"):
         env["CHROMA_API_KEY"] = os.getenv("CHROMA_API_KEY")
+    if os.getenv("TAVILY_API_KEY"):
+        env["TAVILY_API_KEY"] = os.getenv("TAVILY_API_KEY")
 
     for module_name in tool_modules:
         params = StdioServerParameters(

@@ -439,8 +439,9 @@ async def autoeval_image(prompt: str, image_url: str, loras: Optional[List] = No
     try:
         # Use the image evaluation model
         completion = hf_client.chat.completions.create(
-            model=getattr(config.inference_providers.huggingface,
-                "image_eval_model_id", "Qwen/Qwen2.5-VL-32B-Instruct"),
+            model=getattr(
+                config.inference_providers.huggingface, "image_eval_model_id", "Qwen/Qwen2.5-VL-32B-Instruct"
+            ),
             messages=[
                 {"role": "system", "content": system_prompt},
                 {
