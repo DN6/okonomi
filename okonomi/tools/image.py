@@ -1,231 +1,245 @@
-import logging
-import json
-import os
-import uuid
 from typing import List, Tuple
-
+import json
 import fal_client
-from mcp.server.fastmcp import FastMCP
-
-# Import shared config and utils using relative import
-from ..config import config
-from ..utils import image_to_uri
 
 
-def validate_concept_id(concept_id: str) -> str:
-    """Validate that concept_id is a valid UUID, generate new one if not."""
-    try:
-        # Try to parse as UUID
-        uuid.UUID(concept_id)
+class ImageGenerationTools:
+    """A unified class for image generation operations using FLUX models."""
+
+    def __init__(self, config):
+        """Initialize the ImageGenerationTools with configuration.
+
+        Args:
+            config: Configuration object containing model IDs and settings
+        """
+        self.fal_client = fal_client
+        self.config = config
+
+    def validate_concept_id(self, concept_id: str) -> str:
+        """Validate and return the concept_id.
+
+        Args:
+            concept_id: The concept identifier to validate
+
+        Returns:
+            The validated concept_id
+        """
+        # Add your validation logic here
         return concept_id
-    except (ValueError, AttributeError):
-        # If not a valid UUID, generate a new one
-        return str(uuid.uuid4())
 
+    def image_to_uri(self, image: str) -> str:
+        """Convert image path/URL to URI format.
 
-os.environ["MCP_TIMEOUT"] = str(config.tools.mcp.timeout)
+        Args:
+            image: Image path or URL
 
-# Initialize FastMCP server
-mcp = FastMCP("image_tools")
+        Returns:
+            Formatted URI string
+        """
+        # Add your URI conversion logic here
+        return image
 
+    async def text_to_image(
+        self,
+        prompt: str,
+        concept_id: str,
+        lora_id: List[Tuple[str, float]] = [],
+        image_size: str = "portrait_16_9",
+        seed: int = 42,
+    ) -> str:
+        """Generate images using FLUX Dev text-to-image model.
 
-@mcp.tool()
-async def text_to_image(
-    prompt: str,
-    concept_id: str,
-    lora_id: List[Tuple[str, float]] = [],
-    image_size: str = "portrait_16_9",
-    seed: int = 42,
-) -> str:
-    """Generate images using FLUX Dev text-to-image model.
+        Args:
+            prompt: Text description with subject, style, composition, lighting details.
+            concept_id: Unique identifier generated from the create_prompt tool.
+                       This ID links the image generation to its original prompt concept.
+            lora_id: List of (url, scale) tuples for LoRA models. Scale: 0.6-1.0.
+                When combining multiple LoRAs ensure the sum of scales stays under 1.5
+            image_size: Dimensions (square_hd, square, portrait/landscape_4_3/16_9).
+            seed: Random seed for reproducibility.
 
-    Args:
-        prompt: Text description with subject, style, composition, lighting details.
-        concept_id: Unique identifier generated from the create_prompt tool.
-                   This ID links the image generation to its original prompt concept.
-        lora_id: List of (url, scale) tuples for LoRA models. Scale: 0.6-1.0.
-            When combining multiple LoRAs ensure the sum of scales stays under 1.5
-        image_size: Dimensions (square_hd, square, portrait/landscape_4_3/16_9).
-        seed: Random seed for reproducibility.
+        Returns:
+            JSON with image URL and concept_id.
+        """
+        # Validate concept_id
+        concept_id = self.validate_concept_id(concept_id)
 
-    Returns:
-        JSON with image URL and concept_id.
-    """
-    # Validate concept_id
-    concept_id = validate_concept_id(concept_id)
+        kwargs = {
+            "prompt": prompt,
+            "seed": seed,
+            "guidance_scale": 3.5,
+            "num_inference_steps": 28,
+            "image_size": image_size,
+            "num_images": 1,
+        }
 
-    kwargs = {
-        "prompt": prompt,
-        "seed": seed,
-        "guidance_scale": 3.5,
-        "num_inference_steps": 28,
-        "image_size": image_size,
-        "num_images": 1,
-    }
+        if lora_id:
+            model_id = self.config.inference_providers.fal.text_to_image_lora_model_id
+            kwargs.update({"loras": [{"path": id, "scale": scale} for id, scale in lora_id]})
+        else:
+            model_id = self.config.inference_providers.fal.text_to_image_model_id
 
-    if lora_id:
-        model_id = config.inference_providers.fal.text_to_image_lora_model_id
-        kwargs.update({"loras": [{"path": id, "scale": scale} for id, scale in lora_id]})
-    else:
-        model_id = config.inference_providers.fal.text_to_image_model_id
+        handler = await self.fal_client.submit_async(model_id, arguments=kwargs)
+        request_id = handler.request_id
+        output = await self.fal_client.result_async(model_id, request_id)
+        result = json.dumps({"image": output["images"][0]["url"], "concept_id": concept_id})
 
-    handler = await fal_client.submit_async(model_id, arguments=kwargs)
-    request_id = handler.request_id
-    output = await fal_client.result_async(model_id, request_id)
-    result = json.dumps({"image": output["images"][0]["url"], "concept_id": concept_id})
+        return result
 
-    return result
+    async def image_to_image(
+        self,
+        prompt: str,
+        image: str,
+        concept_id: str,
+        image_size: str = "portrait_16_9",
+        strength: float = 0.5,
+        seed: int = 42,
+    ) -> str:
+        """Refine existing image while preserving composition, color, and style. This does not
+        handle instruction based prompting. You must use a descriptive prompt similar to text to image.
 
+        Args:
+            prompt: Text description of desired modifications.
+            image: URI to source image (URL or data URI from local file).
+            concept_id: Unique identifier generated from the create_prompt tool.
+                       This ID links the image generation to its original prompt concept.
+            image_size: Output dimensions.
+            strength: Controls how much the input image is changed. Range is between 0.5-0.75
+            seed: Random seed.
 
-@mcp.tool()
-async def image_to_image(
-    prompt: str,
-    image: str,
-    concept_id: str,
-    image_size: str = "portrait_16_9",
-    strength: float = 0.5,
-    seed: int = 42,
-) -> str:
-    """Refine existing image while preserving composition, color, and style. This does not
-    handle instruction based prompting. You must use a descriptive prompt similar to text to image.
+        Returns:
+            JSON with refined image URL and concept_id.
+        """
+        # Validate concept_id
+        concept_id = self.validate_concept_id(concept_id)
 
-    Args:
-        prompt: Text description of desired modifications.
-        image: URI to source image (URL or data URI from local file).
-        concept_id: Unique identifier generated from the create_prompt tool.
-                   This ID links the image generation to its original prompt concept.
-        image_size: Output dimensions.
-        strength: Controls how much the input image is changed. Range is between 0.5-0.75
-        seed: Random seed.
+        kwargs = {
+            "prompt": prompt,
+            "seed": seed,
+            "guidance_scale": 3.5,
+            "strength": strength,
+            "num_inference_steps": 28,
+            "image_size": image_size,
+            "num_images": 1,
+            "image_url": self.image_to_uri(image),
+        }
 
-    Returns:
-        JSON with refined image URL and concept_id.
-    """
-    # Validate concept_id
-    concept_id = validate_concept_id(concept_id)
+        handler = await self.fal_client.submit_async(
+            self.config.inference_providers.fal.image_to_image_model_id,
+            arguments=kwargs,
+        )
+        request_id = handler.request_id
+        output = await self.fal_client.result_async(
+            self.config.inference_providers.fal.image_to_image_model_id, request_id
+        )
+        result = json.dumps({"image": output["images"][0]["url"], "concept_id": concept_id})
 
-    kwargs = {
-        "prompt": prompt,
-        "seed": seed,
-        "guidance_scale": 3.5,
-        "strength": strength,
-        "num_inference_steps": 28,
-        "image_size": image_size,
-        "num_images": 1,
-        "image_url": image_to_uri(image),
-    }
+        return result
 
-    handler = await fal_client.submit_async(
-        config.inference_providers.fal.image_to_image_model_id,
-        arguments=kwargs,
-    )
-    request_id = handler.request_id
-    output = await fal_client.result_async(config.inference_providers.fal.image_to_image_model_id, request_id)
-    result = json.dumps({"image": output["images"][0]["url"], "concept_id": concept_id})
+    async def edit_image(
+        self,
+        prompt: str,
+        image: str,
+        concept_id: str,
+        image_size: str = "portrait_16_9",
+        seed: int = 42,
+    ) -> str:
+        """Tool to edit the contents of an image. Supports object changes, style transfer, and text edits.
 
-    return result
+        Key techniques:
+        - Object mods: "Change car to red", "Replace hat with cap"
+        - Style transfer: "Convert to watercolor", "Bauhaus art style"
+        - Character consistency: "This person... now in beach setting"
+        - Text edits: "Replace 'old' with 'new'"
+        - Composition control: "Change background, keep person's position"
 
+        Args:
+            prompt: Edit instruction specifying changes and what to preserve.
+            image: URI to source image (URL or data URI from local file).
+            concept_id: Unique identifier generated from the create_prompt tool.
+            image_size: Output dimensions.
+            seed: Random seed.
 
-@mcp.tool()
-async def edit_image(
-    prompt: str,
-    image: str,
-    concept_id: str,
-    image_size: str = "portrait_16_9",
-    seed: int = 42,
-) -> str:
-    """Tool to edit the contents of an image. Supports object changes, style transfer, and text edits.
+        Returns:
+            JSON with edited image URL and concept_id.
+        """
+        # Validate concept_id
+        concept_id = self.validate_concept_id(concept_id)
 
-    Key techniques:
-    - Object mods: "Change car to red", "Replace hat with cap"
-    - Style transfer: "Convert to watercolor", "Bauhaus art style"
-    - Character consistency: "This person... now in beach setting"
-    - Text edits: "Replace 'old' with 'new'"
-    - Composition control: "Change background, keep person's position"
+        kwargs = {
+            "prompt": prompt,
+            "seed": seed,
+            "guidance_scale": 2.0,
+            "num_inference_steps": 28,
+            "image_size": image_size,
+            "num_images": 1,
+            "image_url": self.image_to_uri(image),
+        }
 
-    Args:
-        prompt: Edit instruction specifying changes and what to preserve.
-        image: URI to source image (URL or data URI from local file).
-        concept_id: Unique identifier generated from the create_prompt tool.
-        image_size: Output dimensions.
-        seed: Random seed.
+        handler = await self.fal_client.submit_async(
+            self.config.inference_providers.fal.edit_image_model_id, arguments=kwargs
+        )
+        request_id = handler.request_id
+        output = await self.fal_client.result_async(
+            self.config.inference_providers.fal.edit_image_model_id, request_id
+        )
+        result = json.dumps({"image": output["images"][0]["url"], "concept_id": concept_id})
 
-    Returns:
-        JSON with edited image URL and concept_id.
-    """
-    # Validate concept_id
-    concept_id = validate_concept_id(concept_id)
+        return result
 
-    kwargs = {
-        "prompt": prompt,
-        "seed": seed,
-        "guidance_scale": 2.0,
-        "num_inference_steps": 28,
-        "image_size": image_size,
-        "num_images": 1,
-        "image_url": image_to_uri(image),
-    }
+    async def reference_image(
+        self,
+        prompt: str,
+        image: str,
+        concept_id: str,
+        image_size: str = "portrait_16_9",
+        seed: int = 42,
+    ) -> str:
+        """Generate images using reference image for composition, style transfer or character consistency.
 
-    handler = await fal_client.submit_async(config.inference_providers.fal.edit_image_model_id, arguments=kwargs)
-    request_id = handler.request_id
-    output = await fal_client.result_async(config.inference_providers.fal.edit_image_model_id, request_id)
-    result = json.dumps({"image": output["images"][0]["url"], "concept_id": concept_id})
+        Two main modes:
+        1. Style Transfer: Reference provides artistic style for new content
+           - Start with "Using this style," then describe new scene
+           - Adopts colors, technique, composition from reference
 
-    return result
+        2. Character Consistency: Maintain identity across transformations
+           - Use "This person..." to establish, then specify changes
+           - Preserves facial features while changing scene/pose
 
+        3. Preserving Composition: Maintain image composition while changing specific details
 
-@mcp.tool()
-async def reference_image(
-    prompt: str,
-    image: str,
-    concept_id: str,
-    image_size: str = "portrait_16_9",
-    seed: int = 42,
-) -> str:
-    """Generate images using reference image for composition, style transfer or character consistency.
+        Args:
+            prompt: New content description or character transformation.
+            image: URI to style/character reference (URL or data URI from local file).
+            concept_id: Unique identifier generated from the create_prompt tool.
+                       This ID links the image generation to its original prompt concept.
+            image_size: Output dimensions.
+            seed: Random seed.
 
-    Two main modes:
-    1. Style Transfer: Reference provides artistic style for new content
-       - Start with "Using this style," then describe new scene
-       - Adopts colors, technique, composition from reference
+        Returns:
+            JSON with generated image URL and concept_id.
+        """
+        # Validate concept_id
+        concept_id = self.validate_concept_id(concept_id)
 
-    2. Character Consistency: Maintain identity across transformations
-       - Use "This person..." to establish, then specify changes
-       - Preserves facial features while changing scene/pose
+        kwargs = {
+            "prompt": prompt,
+            "seed": seed,
+            "guidance_scale": 2.5,
+            "num_inference_steps": 28,
+            "image_size": image_size,
+            "num_images": 1,
+            "image_url": self.image_to_uri(image),
+        }
 
-    3. Preserving Composition: Maintain image composition while changing specific details
+        handler = await self.fal_client.submit_async(
+            self.config.inference_providers.fal.edit_image_model_id, arguments=kwargs
+        )
+        request_id = handler.request_id
+        output = await self.fal_client.result_async(
+            self.config.inference_providers.fal.edit_image_model_id, request_id
+        )
+        result = json.dumps({"image": output["images"][0]["url"], "concept_id": concept_id})
 
-    Args:
-        prompt: New content description or character transformation.
-        image: URI to style/character reference (URL or data URI from local file).
-        concept_id: Unique identifier generated from the create_prompt tool.
-                   This ID links the image generation to its original prompt concept.
-        image_size: Output dimensions.
-        seed: Random seed.
+        return result
 
-    Returns:
-        JSON with generated image URL and concept_id.
-    """
-    # Validate concept_id
-    concept_id = validate_concept_id(concept_id)
-
-    kwargs = {
-        "prompt": prompt,
-        "seed": seed,
-        "guidance_scale": 2.5,
-        "num_inference_steps": 28,
-        "image_size": image_size,
-        "num_images": 1,
-        "image_url": image_to_uri(image),
-    }
-
-    handler = await fal_client.submit_async(config.inference_providers.fal.edit_image_model_id, arguments=kwargs)
-    request_id = handler.request_id
-    output = await fal_client.result_async(config.inference_providers.fal.edit_image_model_id, request_id)
-    result = json.dumps({"image": output["images"][0]["url"], "concept_id": concept_id})
-
-    return result
-
-
-if __name__ == "__main__":
-    mcp.run()

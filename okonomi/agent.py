@@ -22,6 +22,7 @@ from smolagents import (
     AgentToolExecutionError,
     ChatMessage,
     ChatMessageStreamDelta,
+    CodeAgent,
     FinalAnswerStep,
     LogLevel,
     MessageRole,
@@ -81,11 +82,11 @@ def _format_json_item(obj, level=0, separator=": ", indent="  "):
 def json_to_simple_text(data, separator=": ", indent="  "):
     """
     Simple JSON to text converter with basic formatting.
-
     Args:
         data: JSON object or list of JSON objects
         separator: String between key and value
         indent: String for nested indentation
+
 
     Returns:
         str: Simple text representation
@@ -103,6 +104,16 @@ def json_to_simple_text(data, separator=": ", indent="  "):
         return "\n\n".join(blocks)
     else:
         return _format_json_item(data, 0, separator, indent)
+
+
+@dataclass
+class TaskStep(MemoryStep):
+    task: str
+
+    def to_messages(self, summary_mode: bool = False) -> list[ChatMessage]:
+        content = [{"type": "text", "text": f"New task:\n{self.task}"}]
+
+        return [ChatMessage(role=MessageRole.USER, content=content)]
 
 
 class OkonomiAgent(ToolCallingAgent):
@@ -693,5 +704,93 @@ You have been provided with these additional arguments, that you can access dire
                 timing=Timing(start_time=run_start_time, end_time=time.time()),
                 state=run_state,
             )
+
+        return output
+
+
+class OkonomiGeneratorAgent(CodeAgent):
+    def __init__(
+        self,
+        session_id: str = None,
+        **kwargs,
+    ) -> None:
+        self.session_manager = SessionManager()
+        self.session_id = session_id or self.session_manager.create_session_id()
+        self.run_start_time = None
+        super().__init__(**kwargs)
+
+    def _step_stream(
+        self, memory_step: ActionStep
+    ) -> Generator[ChatMessageStreamDelta | ToolCall | ToolOutput | ActionOutput]:
+        memory_messages = self.write_memory_to_messages()
+        input_messages = memory_messages.copy()
+        memory_step.model_input_messages = input_messages
+
+        chat_message = self._generate_model_response(input_messages, memory_step)
+
+        result = self._postprocess_response(chat_message, memory_step)
+        for output in result["outputs"]:
+            yield output
+
+        yield ActionOutput(
+            output=result["answer"],
+            is_final_answer=result["got_answer"],
+        )
+
+    def run(
+        self,
+        task: str,
+        reset: bool = True,
+        additional_args: dict | None = None,
+        max_steps: int | None = None,
+    ):
+        """
+        Run the agent for the given task.
+
+        Args:
+            task (`str`): Task to perform.
+            stream (`bool`): Whether to run in streaming mode.
+                If `True`, returns a generator that yields each step as it is executed. You must iterate over this generator to process the individual steps (e.g., using a for loop or `next()`).
+                If `False`, executes all steps internally and returns only the final answer after completion.
+            reset (`bool`): Whether to reset the conversation or keep it going from previous run.
+            images (`list[PIL.Image.Image]`, *optional*): Image(s) objects.
+            additional_args (`dict`, *optional*): Any other variables that you want to pass to the agent run, for instance images or dataframes. Give them clear names!
+            max_steps (`int`, *optional*): Maximum number of steps the agent can take to solve the task. if not provided, will use the agent's default value.
+
+        Example:
+        ```py
+        from smolagents import CodeAgent
+        agent = CodeAgent(tools=[])
+        agent.run("What is the result of 2 power 3.7384?")
+        ```
+        """
+        max_steps = max_steps or self.max_steps
+        self.task = task
+        self.interrupt_switch = False
+
+        if additional_args:
+            self.state.update(additional_args)
+            self.task += f"""
+You have been provided with these additional arguments, that you can access directly using the keys as variables:
+{str(additional_args)}."""
+
+        self.memory.system_prompt = SystemPromptStep(system_prompt=self.system_prompt)
+        if reset:
+            self.memory.reset()
+            self.monitor.reset()
+
+        self.logger.log_task(
+            content=self.task.strip(),
+            subtitle=f"{type(self.model).__name__} - {(self.model.model_id if hasattr(self.model, 'model_id') else '')}",
+            level=LogLevel.INFO,
+            title=self.name if hasattr(self, "name") else None,
+        )
+        self.memory.steps.append(TaskStep(task=self.task, task_images=images))
+
+        run_start_time = time.time()
+        self.run_start_time = run_start_time
+        steps = list(self._run_stream(task=self.task, max_steps=max_steps, images=images))
+        assert isinstance(steps[-1], FinalAnswerStep)
+        output = steps[-1].output
 
         return output
