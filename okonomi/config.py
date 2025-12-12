@@ -35,7 +35,7 @@ class HuggingfaceConfig:
 
 @dataclass
 class FalConfig:
-    text_to_image_model_id: str = "fal-ai/flux-2-pro"
+    text_to_image_model_id: str = "fal-ai/flux-lora"
     image_to_image_model_id: str = "fal-ai/flux-2-pro/edit"
     edit_image_model_id: str = "fal-ai/flux-2-pro/edit"
     multi_angle_model_id: str = "fal-ai/qwen-image-edit-plus-lora-gallery/multiple-angles"

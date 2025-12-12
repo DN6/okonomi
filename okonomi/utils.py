@@ -10,7 +10,6 @@ from typing import List, Optional, Tuple, Union
 from urllib.parse import urlparse
 
 import chromadb
-import chromadb.utils.embedding_functions as embedding_functions
 import httpx
 from huggingface_hub import HfApi
 from PIL import Image
@@ -20,7 +19,143 @@ from .config import config
 
 REQUEST_TIMEOUT = 600
 hf_api = HfApi()
-hf_embedding_fn = embedding_functions.HuggingFaceEmbeddingFunction(api_key=os.getenv("HF_TOKEN"), model_name="")
+
+# Default LoRA collection on Hugging Face
+LORA_COLLECTION_ID = "dn6/flux-loras-66ec0a8b322dcfe976d4e152"
+LORAS_FILE_PATH = Path.home() / ".okonomi" / "loras.md"
+
+
+def _parse_lora_note(note: str) -> dict:
+    """Parse a LoRA note to extract trigger words and description.
+
+    Args:
+        note: Raw note text from the collection item
+
+    Returns:
+        Dict with 'trigger' and 'description' keys
+    """
+    if not note:
+        return {"trigger": None, "description": None}
+
+    note = note.strip()
+    trigger = None
+    description = None
+
+    # Common patterns for trigger words
+    import re
+
+    # Look for trigger word patterns
+    trigger_patterns = [
+        r"Trigger [Ww]ord[s]?:?\s*[Ii]nclude\s+(?:the\s+)?(?:word[s]?)?\s*[`\"']([^`\"']+)[`\"']",
+        r"Trigger [Ww]ord[s]?:?\s*[`\"']([^`\"']+)[`\"']",
+        r"[Yy]ou should use\s+[`\"']([^`\"']+)[`\"']",
+        r"[Ii]nclude\s+(?:the\s+)?(?:word[s]?)?\s*[`\"']([^`\"']+)[`\"']\s+(?:in the prompt\s+)?to trigger",
+    ]
+
+    for pattern in trigger_patterns:
+        match = re.search(pattern, note)
+        if match:
+            trigger = match.group(1).strip()
+            break
+
+    # Extract description - remove trigger word instructions and get the main description
+    lines = note.split("\n")
+    desc_lines = []
+
+    for line in lines:
+        line = line.strip()
+        # Skip lines that are primarily about trigger words
+        if re.match(r"^Trigger [Ww]ord", line, re.IGNORECASE):
+            continue
+        if re.match(r"^[Yy]ou should use", line):
+            continue
+        if line.startswith("Include") and "trigger" in line.lower():
+            continue
+        if line:
+            desc_lines.append(line)
+
+    if desc_lines:
+        description = " ".join(desc_lines)
+        # Clean up description
+        description = re.sub(r"\s+", " ", description).strip()
+
+    return {"trigger": trigger, "description": description}
+
+
+def update_loras_catalog(collection_id: str = LORA_COLLECTION_ID) -> Path:
+    """Fetch LoRAs from a Hugging Face collection and generate a markdown catalog.
+
+    Args:
+        collection_id: Hugging Face collection ID (default: dn6/flux-loras)
+
+    Returns:
+        Path to the generated loras.md file
+    """
+    collection = hf_api.get_collection(collection_id)
+
+    # Build markdown content
+    lines = [
+        "# Available FLUX LoRA Models",
+        "",
+        f"Collection: [{collection.title}](https://huggingface.co/collections/{collection_id})",
+        f"Total LoRAs: {len(collection.items)}",
+        "",
+        "## How to Use LoRAs",
+        "",
+        "Pass LoRAs as a list of tuples `[(lora_url, scale), ...]` to image generation:",
+        "- **lora_url**: The full URL to the .safetensors file",
+        "- **scale**: Weight of the LoRA effect (typically 0.8-1.2, sum should stay under 1.5)",
+        "",
+        "---",
+        "",
+    ]
+
+    for item in collection.items:
+        # Get safetensors file URL
+        try:
+            files = hf_api.list_repo_files(item.item_id)
+            safetensors = [f for f in files if f.endswith(".safetensors")]
+            if not safetensors:
+                continue
+            lora_url = f"https://huggingface.co/{item.item_id}/resolve/main/{safetensors[0]}"
+        except Exception:
+            continue
+
+        # Extract model name from ID
+        model_name = item.item_id.split("/")[-1]
+
+        # Parse the note
+        parsed = _parse_lora_note(item.note)
+
+        lines.append(f"### {model_name}")
+        lines.append(f"- **ID**: `{item.item_id}`")
+        lines.append(f"- **URL**: `{lora_url}`")
+
+        if parsed["trigger"]:
+            lines.append(f"- **Trigger**: `{parsed['trigger']}`")
+
+        if parsed["description"]:
+            lines.append(f"- **Description**: {parsed['description']}")
+
+        lines.append("")
+
+    # Write to file
+    LORAS_FILE_PATH.parent.mkdir(parents=True, exist_ok=True)
+    LORAS_FILE_PATH.write_text("\n".join(lines))
+
+    return LORAS_FILE_PATH
+
+
+def get_loras_catalog() -> str:
+    """Get the LoRA catalog content, generating it if it doesn't exist.
+
+    Returns:
+        Content of the loras.md file
+    """
+    if not LORAS_FILE_PATH.exists():
+        update_loras_catalog()
+
+    return LORAS_FILE_PATH.read_text()
 
 
 def get_chroma_client() -> chromadb.PersistentClient:

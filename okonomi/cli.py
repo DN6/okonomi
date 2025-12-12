@@ -192,6 +192,9 @@ Examples:
     parser.add_argument("--list-sessions", action="store_true", help="List all past sessions")
     parser.add_argument("--search-images", type=str, metavar="QUERY", help="Search images across sessions")
 
+    # LoRA management
+    parser.add_argument("--update-loras", action="store_true", help="Update LoRA catalog from Hugging Face")
+
     # Meta
     parser.add_argument("--version", "-v", action="version", version="okonomi 0.1.0")
 
@@ -299,6 +302,19 @@ def run_agent(console: Console, args: argparse.Namespace) -> None:
             console.print(f"[red]Error saving session: {e}[/red]")
 
 
+def handle_update_loras(console: Console) -> None:
+    """Update the LoRA catalog from Hugging Face."""
+    from .utils import update_loras_catalog
+
+    console.print("[yellow]Updating LoRA catalog from Hugging Face...[/yellow]")
+    try:
+        path = update_loras_catalog()
+        console.print(f"[green]LoRA catalog updated successfully![/green]")
+        console.print(f"[dim]Saved to: {path}[/dim]")
+    except Exception as e:
+        console.print(f"[red]Error updating LoRA catalog: {e}[/red]")
+
+
 def main() -> None:
     """Main entry point for okonomi CLI."""
     args = parse_arguments()
@@ -312,6 +328,10 @@ def main() -> None:
 
     if args.search_images:
         handle_search_images(console, args.search_images)
+        return
+
+    if args.update_loras:
+        handle_update_loras(console)
         return
 
     # Run the agent

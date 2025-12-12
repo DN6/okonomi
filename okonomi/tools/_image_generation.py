@@ -46,15 +46,21 @@ class ImageGenerationTools(ToolMetadataMixin):
         self,
         prompt: str,
         concept_id: str,
+        lora_id: list[tuple[str, float]] = [],
         image_size: str = "portrait_16_9",
         seed: int = 42,
     ) -> dict:
-        """Generate images using FLUX text-to-image model.
+        """Generate images using FLUX text-to-image model with optional LoRA support.
 
         Args:
             prompt: Text description with subject, style, composition, lighting details.
+                   Include LoRA trigger words in the prompt for best results.
             concept_id: Unique identifier generated from the create_prompt tool.
                        This ID links the image generation to its original prompt concept.
+            lora_id: List of (url, scale) tuples for LoRA models. Scale: 0.6-1.0.
+                    When combining multiple LoRAs ensure the sum of scales stays under 1.5.
+                    Use research.find_loras() to discover available LoRAs.
+                    Example: [("https://huggingface.co/.../lora.safetensors", 0.9)]
             image_size: Dimensions (square_hd, square, portrait/landscape_4_3/16_9).
             seed: Random seed for reproducibility.
 
@@ -72,6 +78,10 @@ class ImageGenerationTools(ToolMetadataMixin):
                 "image_size": image_size,
                 "num_images": 1,
             }
+
+            # Add LoRAs if provided
+            if lora_id:
+                kwargs["loras"] = [{"path": url, "scale": scale} for url, scale in lora_id]
 
             console = Console()
             with Live(
