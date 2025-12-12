@@ -1,30 +1,35 @@
+"""Command-line interface for Okonomi."""
+
 import argparse
-import os
-from functools import partial
-from pathlib import Path
 import logging
-from typing import List
+import os
+from pathlib import Path
 
 import yaml
 from mcp import StdioServerParameters
 from rich.console import Console
-from smolagents import InferenceClientModel, LiteLLMModel, MCPClient, PlanningStep
+from smolagents import InferenceClientModel, LiteLLMModel, MCPClient
 
-from .agent import OkonomiAgent
-from .callbacks import eval_image, eval_prompt, interrupt_after_plan
+from .code_agent import OkonomiCodeAgent
 from .config import config
 from .interface import get_task_input
-from .utils import update_available_loras
+from .tools.server import okonomi_server
 
-
-# Load prompt templates from package
+# Constants
 TEMPLATE_FILE = "prompt_templates/system_prompt.yml"
+ENV_KEYS = ["HF_TOKEN", "FAL_KEY", "TAVILY_API_KEY"]
 
-httpx_logger = logging.getLogger("httpx")
-httpx_logger.setLevel(logging.WARNING)
+# Suppress noisy loggers
+logging.getLogger("httpx").setLevel(logging.WARNING)
+
+
+# =============================================================================
+# Setup Functions
+# =============================================================================
 
 
 def setup_observability() -> None:
+    """Initialize observability instrumentation if enabled."""
     if os.getenv("LOG_CREATE_AGENT_TRACES", "false").lower() not in ["true", "1"]:
         return
 
@@ -36,7 +41,11 @@ def setup_observability() -> None:
 
 
 def initialize_model() -> InferenceClientModel:
-    model_cls_map = {"inference_client": InferenceClientModel, "litellm": LiteLLMModel}
+    """Create and configure the language model."""
+    model_cls_map = {
+        "inference_client": InferenceClientModel,
+        "litellm": LiteLLMModel,
+    }
     model_cls = model_cls_map.get(config.agent.model_type, InferenceClientModel)
 
     return model_cls(
@@ -48,45 +57,106 @@ def initialize_model() -> InferenceClientModel:
     )
 
 
-def setup_mcp_tools() -> List[StdioServerParameters]:
-    # Define tool module names
-    tool_modules = ["prompt", "image", "memory", "strategies", "sessions", "research"]
-    tools = []
+def load_prompt_templates() -> dict:
+    """Load prompt templates from package or project root."""
+    package_path = Path(__file__).parent / TEMPLATE_FILE
+    project_path = Path(__file__).parent.parent / TEMPLATE_FILE
 
-    env = {}
-    if os.getenv("HF_TOKEN"):
-        env["HF_TOKEN"] = os.getenv("HF_TOKEN")
-    if os.getenv("FAL_KEY"):
-        env["FAL_KEY"] = os.getenv("FAL_KEY")
-    if os.getenv("CHROMA_API_KEY"):
-        env["CHROMA_API_KEY"] = os.getenv("CHROMA_API_KEY")
-    if os.getenv("TAVILY_API_KEY"):
-        env["TAVILY_API_KEY"] = os.getenv("TAVILY_API_KEY")
+    templates_path = package_path if package_path.exists() else project_path
 
-    for module_name in tool_modules:
-        params = StdioServerParameters(
-            command="python",
-            args=[
-                "-m",
-                f"okonomi.tools.{module_name}",
-            ],
-            env=env,
-        )
-        tools.append(params)
-
-    return tools
+    with open(templates_path) as f:
+        return yaml.safe_load(f)
 
 
-def setup_tool_callbacks() -> dict:
-    autoeval = config.tools.callbacks.autoeval
+def setup_mcp_server() -> StdioServerParameters:
+    """Configure MCP server parameters with environment variables."""
+    env = {key: os.getenv(key) for key in ENV_KEYS if os.getenv(key)}
 
-    return {
-        "create_prompt": partial(eval_prompt, autoeval=autoeval),
-        "text_to_image": partial(eval_image, autoeval=autoeval),
-        "image_to_image": partial(eval_image, autoeval=autoeval),
-        "edit_image": partial(eval_image, autoeval=autoeval),
-        "reference_image": partial(eval_image, autoeval=autoeval),
-    }
+    return StdioServerParameters(
+        command="python",
+        args=["-m", "okonomi.tools.server"],
+        env=env,
+    )
+
+
+# =============================================================================
+# Session Management
+# =============================================================================
+
+
+def handle_list_sessions(console: Console) -> None:
+    """Display list of past sessions."""
+    from .session import SessionManager
+
+    manager = SessionManager()
+    sessions = manager.list_sessions(limit=20)
+
+    if not sessions:
+        console.print("[yellow]No sessions found.[/yellow]")
+        return
+
+    console.print("\n[bold cyan]Past Sessions:[/bold cyan]\n")
+    for session in sessions:
+        console.print(f"[bold]{session.session_id}[/bold]")
+        console.print(f"  Task: {session.task}")
+        console.print(f"  Time: {session.timestamp}")
+        console.print(f"  Status: {session.status}")
+        console.print(f"  Outputs: {session.num_outputs}")
+        console.print()
+
+
+def handle_search_images(console: Console, query: str) -> None:
+    """Search and display images matching query."""
+    from .session import SessionManager
+
+    manager = SessionManager()
+    images = manager.search_images(query=query, limit=20)
+
+    if not images:
+        console.print(f"[yellow]No images found matching '{query}'.[/yellow]")
+        return
+
+    console.print(f"\n[bold cyan]Images matching '{query}':[/bold cyan]\n")
+    for img in images:
+        console.print(f"[bold]Session:[/bold] {img['session_id'][:8]}...")
+        console.print(f"  Task: {img['session_task']}")
+        console.print(f"  URL: {img['image_url']}")
+        console.print(f"  Score: {img.get('visual_critique_score', 'N/A')}")
+        console.print()
+
+
+def resolve_session(console: Console, args: argparse.Namespace) -> str | None:
+    """Resolve session ID from resume or session arguments."""
+    if not (args.resume or args.session):
+        return None
+
+    from .session import SessionManager
+
+    manager = SessionManager()
+
+    if args.resume:
+        latest = manager.get_latest_session()
+        if latest:
+            console.print(f"[bold green]Resuming from session: {latest.metadata.session_id}[/bold green]")
+            console.print(f"Previous task: {latest.metadata.task}\n")
+            return latest.metadata.session_id
+        console.print("[yellow]No previous sessions found. Starting new session.[/yellow]\n")
+        return None
+
+    # args.session specified
+    session = manager.load_session(args.session)
+    if session:
+        console.print(f"[bold green]Loaded session: {args.session}[/bold green]")
+        console.print(f"Task: {session.metadata.task}\n")
+        return args.session
+
+    console.print(f"[red]Session {args.session} not found. Starting new session.[/red]\n")
+    return None
+
+
+# =============================================================================
+# Argument Parsing
+# =============================================================================
 
 
 def parse_arguments() -> argparse.Namespace:
@@ -99,190 +169,153 @@ Examples:
   okonomi                                    # Interactive mode
   okonomi "Create a cyberpunk city scene"    # Direct task
   okonomi --task "Design a futuristic logo"  # Using --task flag
-  okonomi --eval "Generate artwork"          # Disable automatic evaluation (manual review)
-  okonomi --plan "Create a logo"             # Disable automatic planning (plan approval)
-  okonomi --eval --plan "Create artwork"     # Disable both auto features
-  okonomi --update-loras                     # Update LoRA collections and exit
+  okonomi --eval "Generate artwork"          # Disable automatic evaluation
+  okonomi --plan "Create a logo"             # Disable automatic planning
   okonomi --resume                           # Resume from latest session
   okonomi --session <id>                     # Load specific session
   okonomi --list-sessions                    # List all past sessions
-  okonomi --search-images "portrait"         # Search for images across sessions
+  okonomi --search-images "portrait"         # Search for images
         """,
     )
 
-    parser.add_argument("task", nargs="?", help="Task description for the agent to process")
-    parser.add_argument("--task", "-t", dest="task_flag", help="Task description (alternative to positional argument)")
+    # Task input
+    parser.add_argument("task", nargs="?", help="Task description for the agent")
+    parser.add_argument("--task", "-t", dest="task_flag", help="Task description (alternative)")
+
+    # Agent behavior
+    parser.add_argument("--eval", "-e", action="store_false", help="Disable automatic evaluation")
+    parser.add_argument("--plan", "-p", action="store_false", help="Disable automatic planning")
+
+    # Session management
+    parser.add_argument("--resume", "-r", action="store_true", help="Resume from latest session")
+    parser.add_argument("--session", "-s", type=str, help="Load specific session by ID")
+    parser.add_argument("--list-sessions", action="store_true", help="List all past sessions")
+    parser.add_argument("--search-images", type=str, metavar="QUERY", help="Search images across sessions")
+
+    # Meta
     parser.add_argument("--version", "-v", action="version", version="okonomi 0.1.0")
-    parser.add_argument(
-        "--eval", "-e", action="store_false", help="Disable automatic evaluation (enable manual review)"
-    )
-    parser.add_argument(
-        "--plan", "-p", action="store_false", help="Disable automatic planning (enable plan approval prompts)"
-    )
-    parser.add_argument("--update-loras", action="store_true", help="Update available LoRA collections and exit")
-    parser.add_argument("--resume", "-r", action="store_true", help="Resume from the latest session")
-    parser.add_argument("--session", "-s", type=str, help="Load a specific session by ID")
-    parser.add_argument("--list-sessions", action="store_true", help="List all past sessions and exit")
-    parser.add_argument(
-        "--search-images", type=str, metavar="QUERY", help="Search for images across all sessions and exit"
-    )
 
     return parser.parse_args()
 
 
-def main():
-    """Main entry point for okonomi CLI."""
+# =============================================================================
+# Main Entry Point
+# =============================================================================
+
+
+def get_chat_input(console: Console) -> str | None:
+    """Get chat input from user. Returns None to exit."""
     try:
-        # Parse command line arguments
-        args = parse_arguments()
+        user_input = console.input("[green]>>> [/green]").strip()
+        if user_input.lower() in ["/exit", "/quit", "exit", "quit"]:
+            return None
+        return user_input
+    except (EOFError, KeyboardInterrupt):
+        return None
 
-        # Setup observability
-        setup_observability()
 
-        console = Console()
+def run_agent(console: Console, args: argparse.Namespace) -> None:
+    """Initialize and run the agent in interactive chat mode."""
+    model = initialize_model()
+    templates = load_prompt_templates()
+    server_params = setup_mcp_server()
+    session_id = resolve_session(console, args)
 
-        # Handle session management commands
-        if args.list_sessions:
-            from .session import SessionManager
+    # Get initial task from args or prompt
+    user_request = get_task_input(args)
+    if not user_request.strip():
+        console.print("[yellow]No task provided. Exiting.[/yellow]")
+        return
 
-            manager = SessionManager()
-            sessions = manager.list_sessions(limit=20)
+    with MCPClient([server_params]) as mcp_tools:
+        agent = OkonomiCodeAgent(
+            model=model,
+            tools=mcp_tools,
+            server_tools=okonomi_server.tools,
+            planning_interval=config.agent.planning_interval,
+            prompt_templates=templates,
+            return_full_result=True,
+            max_steps=config.agent.max_steps,
+            verbosity_level=config.agent.verbosity_level,
+            session_id=session_id,
+        )
 
-            if not sessions:
-                console.print("[yellow]No sessions found.[/yellow]")
-                return
+        if session_id:
+            agent.load_from_session(session_id)
 
-            console.print("\n[bold cyan]Past Sessions:[/bold cyan]\n")
-            for session in sessions:
-                console.print(f"[bold]{session.session_id}[/bold]")
-                console.print(f"  Task: {session.task}")
-                console.print(f"  Time: {session.timestamp}")
-                console.print(f"  Status: {session.status}")
-                console.print(f"  Outputs: {session.num_outputs}")
-                console.print()
-            return
+        is_first_run = True
 
-        if args.search_images:
-            from .session import SessionManager
-
-            manager = SessionManager()
-            images = manager.search_images(query=args.search_images, limit=20)
-
-            if not images:
-                console.print(f"[yellow]No images found matching '{args.search_images}'.[/yellow]")
-                return
-
-            console.print(f"\n[bold cyan]Images matching '{args.search_images}':[/bold cyan]\n")
-            for img in images:
-                console.print(f"[bold]Session:[/bold] {img['session_id'][:8]}...")
-                console.print(f"  Task: {img['session_task']}")
-                console.print(f"  URL: {img['image_url']}")
-                console.print(f"  Score: {img.get('visual_critique_score', 'N/A')}")
-                console.print()
-            return
-
-        # Handle update-loras command
-        if args.update_loras:
-            console.print("[bold yellow]Updating available LoRA collections...[/bold yellow]")
+        # Interactive chat loop
+        while True:
             try:
-                update_available_loras()
-                console.print("[bold green]✅ LoRA collections updated successfully![/bold green]")
-            except Exception as e:
-                console.print(f"[bold red]❌ Failed to update LoRA collections: {str(e)}[/bold red]")
-                exit(1)
-            return
+                console.print("\n[bold yellow]Processing your request...[/bold yellow]\n")
+                agent.run(user_request, reset=is_first_run)
+                is_first_run = False
 
-        # Initialize model
-        model = initialize_model()
+                # Prompt for next message
+                console.print("\n[dim]Type your follow-up or /exit to quit[/dim]")
+                user_request = get_chat_input(console)
 
-        # Try to load from package location first (for installed packages)
-        package_template_path = Path(__file__).parent / TEMPLATE_FILE
-        if package_template_path.exists():
-            templates_path = package_template_path
-        else:
-            # Fallback to project root (for development)
-            project_root = Path(__file__).parent.parent
-            templates_path = project_root / TEMPLATE_FILE
+                if user_request is None:
+                    console.print("\n[cyan]Ending chat session...[/cyan]")
+                    break
 
-        templates = yaml.safe_load(open(templates_path, "r").read())
+                if not user_request.strip():
+                    continue
 
-        # Setup MCP tools
-        tools = setup_mcp_tools()
+                # Handle commands
+                if user_request.startswith("/"):
+                    if user_request.lower() in ["/clear", "/reset"]:
+                        is_first_run = True
+                        console.print("[yellow]Conversation cleared.[/yellow]")
+                        user_request = get_chat_input(console)
+                        if user_request is None:
+                            break
+                        continue
+                    elif user_request.lower() == "/save":
+                        agent._save_session(status="saved", merged_outputs=agent.generated_outputs)
+                        console.print(f"[green]Session saved: {agent.session_id}[/green]")
+                        continue
+                    elif user_request.lower() == "/help":
+                        console.print("\n[bold cyan]Commands:[/bold cyan]")
+                        console.print("  /exit, /quit - End chat session")
+                        console.print("  /clear, /reset - Clear conversation history")
+                        console.print("  /save - Save current session")
+                        console.print("  /help - Show this help\n")
+                        continue
 
-        # Override config with CLI arguments
-        # Note: args.eval and args.plan are store_false, so they start as True and become False when flags are used
-        autoeval = args.eval and config.tools.callbacks.autoeval
-        autoplan = args.plan and config.agent.autoplan
+            except KeyboardInterrupt:
+                console.print("\n[yellow]Interrupted. Type /exit to quit or continue chatting.[/yellow]")
+                user_request = get_chat_input(console)
+                if user_request is None:
+                    break
+                continue
 
-        # Setup callbacks with potentially overridden autoeval
-        config["tools"]["callbacks"]["autoeval"] = autoeval
-        tool_callback_map = setup_tool_callbacks()
-
-        # Handle session loading
-        session_id = None
-        if args.resume or args.session:
-            from .session import SessionManager
-
-            manager = SessionManager()
-
-            if args.resume:
-                latest = manager.get_latest_session()
-                if latest:
-                    session_id = latest.metadata.session_id
-                    console.print(f"[bold green]Resuming from session: {session_id}[/bold green]")
-                    console.print(f"Previous task: {latest.metadata.task}\n")
-                else:
-                    console.print("[yellow]No previous sessions found. Starting new session.[/yellow]\n")
-            elif args.session:
-                session = manager.load_session(args.session)
-                if session:
-                    session_id = args.session
-                    console.print(f"[bold green]Loaded session: {session_id}[/bold green]")
-                    console.print(f"Task: {session.metadata.task}\n")
-                else:
-                    console.print(f"[red]Session {args.session} not found. Starting new session.[/red]\n")
-
-        # Get task input (from CLI args or interactive)
-        user_request = get_task_input(args)
-
-        if not user_request.strip():
-            console.print("[yellow]No task provided. Exiting.[/yellow]")
-            return
-
-        console.print("\n[bold yellow]Processing your request...[/bold yellow]\n")
-
-        with MCPClient(tools) as tools:
-            agent = OkonomiAgent(
-                tools=tools,
-                model=model,
-                planning_interval=config.agent.planning_interval,
-                prompt_templates=templates,
-                step_callbacks={
-                    PlanningStep: partial(interrupt_after_plan, autoplan=autoplan),
-                },
-                tool_callbacks=tool_callback_map,
-                return_full_result=True,
-                max_steps=config.agent.max_steps,
-                verbosity_level=config.agent.verbosity_level,
-                session_id=session_id,
-            )
-
-            # Load from session if specified
-            if session_id:
-                agent.load_from_session(session_id)
-
-            agent.run(user_request, reset=True)
-
-    except KeyboardInterrupt:
-        console = Console()
-        console.print("\n[red]Operation cancelled by user[/red]")
+        # Save session on exit
         try:
-            merged_outputs = agent._write_to_permanent_memory()
-            agent._save_session(status="interrupted", merged_outputs=merged_outputs)
-            console.print(f"[yellow]Session saved: {agent.session_id}[/yellow]")
+            agent._save_session(status="completed", merged_outputs=agent.generated_outputs)
+            console.print(f"[green]Session saved: {agent.session_id}[/green]")
         except Exception as e:
             console.print(f"[red]Error saving session: {e}[/red]")
-        exit(0)
+
+
+def main() -> None:
+    """Main entry point for okonomi CLI."""
+    args = parse_arguments()
+    setup_observability()
+    console = Console()
+
+    # Handle standalone commands
+    if args.list_sessions:
+        handle_list_sessions(console)
+        return
+
+    if args.search_images:
+        handle_search_images(console, args.search_images)
+        return
+
+    # Run the agent
+    run_agent(console, args)
 
 
 if __name__ == "__main__":

@@ -40,10 +40,6 @@ HF_TOKEN=your_huggingface_token
 # Fal.ai API Key (Required for Image Generation)
 # Get from: https://fal.ai/dashboard/keys
 FAL_KEY=your_fal_api_key
-
-# ChromaDB API Key (Optional)
-# Only required for cloud-hosted ChromaDB. Leave unset for local storage
-CHROMA_API_KEY=your_chroma_api_key
 ```
 
 ### Optional Environment Variables

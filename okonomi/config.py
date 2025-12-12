@@ -10,8 +10,8 @@ from dotenv import load_dotenv
 @dataclass
 class AgentConfig:
     model_type: str = "inference_client"
-    model_id: str = "zai-org/GLM-4.5"
-    model_provider: str = "fireworks-ai"
+    model_id: str = "moonshotai/Kimi-K2-Instruct-0905"
+    model_provider: str = "together"
     temperature: float = 0.2
     top_p: float = 1.0
     planning_interval: int = 2
@@ -23,22 +23,24 @@ class AgentConfig:
 
 @dataclass
 class HuggingfaceConfig:
-    prompt_model_id: str = "Qwen/Qwen2.5-VL-7B-Instruct"
+    prompt_model_id: str = "Qwen/Qwen3-VL-30B-A3B-Instruct"
     prompt_eval_model_id: str = "openai/gpt-oss-20b"
     prompt_model_temperature: float = 0.6
     prompt_eval_model_temperature: float = 0.2
     prompt_max_tokens: int = 512
     prompt_eval_max_tokens: int = 512
-    image_eval_model_id: str = "Qwen/Qwen2.5-VL-72B-Instruct"
-    image_prompt_model_id: str = "Qwen/Qwen2.5-VL-7B-Instruct"
+    image_eval_model_id: str = "Qwen/Qwen3-VL-30B-A3B-Instruct"
+    image_prompt_model_id: str = "Qwen/Qwen3-VL-30B-A3B-Instruct"
 
 
 @dataclass
 class FalConfig:
-    text_to_image_model_id: str = "fal-ai/flux-krea-lora"
-    text_to_image_lora_model_id: str = "fal-ai/flux-lora"
-    image_to_image_model_id: str = "fal-ai/flux-krea-lora/image-to-image"
-    edit_image_model_id: str = "fal-ai/flux-pro/kontext"
+    text_to_image_model_id: str = "fal-ai/flux-2-pro"
+    image_to_image_model_id: str = "fal-ai/flux-2-pro/edit"
+    edit_image_model_id: str = "fal-ai/flux-2-pro/edit"
+    multi_angle_model_id: str = "fal-ai/qwen-image-edit-plus-lora-gallery/multiple-angles"
+    image_to_video_model_id: str = "fal-ai/wan/v2.2-a14b/image-to-video"
+    first_last_frame_to_video_model_id: str = "fal-ai/veo3.1/fast/first-last-frame-to-video"
 
 
 @dataclass
@@ -65,17 +67,13 @@ class ToolsConfig:
 
 @dataclass
 class ChromaConfig:
-    tenant: str = ""
-    database: str = ""
+    storage_path: str = "~/.okonomi/chroma_db"
     image_eval_collection_id: str = "image-evaluations"
-    lora_collection_id: str = "lora-collection"
-    max_lora_results: int = 3
     max_image_eval_results: int = 3
 
 
 @dataclass
 class HuggingfaceMemoryConfig:
-    lora_collection_id: str = ""
     image_repo_id: str = ""
 
 
@@ -95,7 +93,6 @@ class MemoryConfig:
 @dataclass
 class EnvironmentVariablesConfig:
     required: List[str] = field(default_factory=lambda: ["HF_TOKEN", "FAL_KEY"])
-    optional: List[str] = field(default_factory=lambda: ["CHROMA_API_KEY"])
 
 
 @dataclass
@@ -148,12 +145,6 @@ class OkonomiConfig:
 
         if missing_vars:
             raise EnvironmentError(f"Required environment variables not set: {', '.join(missing_vars)}")
-
-        # Log optional variables that are not set
-        for var in self._config.environment_variables.optional:
-            if not os.getenv(var):
-                if var == "CHROMA_API_KEY":
-                    print(f"Note: {var} not set, using local ChromaDB storage")
 
     def __getitem__(self, key: str) -> Any:
         """Get configuration value by key."""

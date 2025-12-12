@@ -1,11 +1,9 @@
-import json
-import os
+"""Creative strategy tools for Okonomi.
 
-from mcp.server.fastmcp import FastMCP
+Provides tools for accessing and applying creative strategies to prompt generation.
+"""
 
-
-os.environ["MCP_TIMEOUT"] = "1000000"
-mcp = FastMCP("creative_strategies_tool")
+from okonomi.tools._metadata import ToolMetadataMixin
 
 
 def blend_conceptual_spaces() -> str:
@@ -158,85 +156,101 @@ def perspective_shifting() -> str:
     """
 
 
-# Strategy registry
-STRATEGIES = {
-    "blend_conceptual_spaces": blend_conceptual_spaces,
-    "replacement_template": replacement_template,
-    "forced_connections": forced_connections,
-    "assumption_reversal": assumption_reversal,
-    "distance_associations": distance_associations,
-    "perspective_shifting": perspective_shifting,
-}
+class StrategiesTools(ToolMetadataMixin):
+    __namespace__ = "strategies"
+    __description__ = "Tools for accessing creative strategies to enhance prompt generation and image creation"
 
+    def __init__(self, config):
+        """
+        Args:
+            config: Configuration object
+        """
+        self.config = config
+        # Strategy registry
+        self.strategies = {
+            "blend_conceptual_spaces": blend_conceptual_spaces,
+            "replacement_template": replacement_template,
+            "forced_connections": forced_connections,
+            "assumption_reversal": assumption_reversal,
+            "distance_associations": distance_associations,
+            "perspective_shifting": perspective_shifting,
+        }
 
-@mcp.tool()
-def fetch_creative_strategy(strategy_name: str) -> str:
-    """Fetch instructions for a creative strategy that is essential to prompt creation.
+    async def fetch_creative_strategy(self, strategy_name: str) -> dict:
+        """Fetch instructions for a creative strategy that is essential to prompt creation.
 
-    Args:
-        strategy_name: Name of the strategy to fetch.
+        Args:
+            strategy_name: Name of the strategy to fetch.
 
-    Returns:
-        JSON with strategy_name and instructions.
-    """
-    if strategy_name not in STRATEGIES:
-        available = ", ".join(STRATEGIES.keys())
-        return f"Unknown strategy '{strategy_name}'. Available strategies: {available}"
+        Returns:
+            Dict with strategy_name and instructions, or error if strategy not found.
+        """
+        try:
+            if strategy_name not in self.strategies:
+                available = ", ".join(self.strategies.keys())
+                return {
+                    "error": f"Unknown strategy '{strategy_name}'",
+                    "available_strategies": list(self.strategies.keys()),
+                }
 
-    instructions = STRATEGIES[strategy_name]()
-    return json.dumps({"instructions": instructions})
+            instructions = self.strategies[strategy_name]()
+            return {"strategy_name": strategy_name, "instructions": instructions}
 
+        except Exception as e:
+            return {"error": str(e)}
 
-@mcp.tool()
-def list_creative_strategies() -> str:
-    """List all available creative strategies for prompt creation with descriptions and examples.
+    async def list_creative_strategies(self) -> dict:
+        """List all available creative strategies for prompt creation with descriptions and examples.
 
-    Returns:
-        Formatted text with strategy names, descriptions, use cases, and examples.
-    """
-    strategy_info = {
-        "blend_conceptual_spaces": {
-            "description": "Merge disparate conceptual domains for breakthrough innovations",
-            "best_for": "Breakthrough innovations, cross-domain insights, metaphorical thinking",
-            "examples": "Digital + Physical spaces, Music + Architecture, Cooking + Software",
-        },
-        "replacement_template": {
-            "description": "Use symbolic substitution to reveal hidden assumptions",
-            "best_for": "Reframing problems, highlighting hidden qualities, challenging assumptions",
-            "examples": "If a library were a restaurant, If teamwork were cooking, If data were water",
-        },
-        "forced_connections": {
-            "description": "Bridge unrelated domains to find unexpected insights",
-            "best_for": "Breaking creative blocks, finding fresh angles, systematic innovation",
-            "examples": "What can urban planning learn from ant colonies? How is marketing like gardening?",
-        },
-        "assumption_reversal": {
-            "description": "Challenge fundamental premises for paradigm shifts",
-            "best_for": "Paradigm shifts, disruptive innovation, challenging status quo",
-            "examples": "What if customers designed the product? What if failure was celebrated?",
-        },
-        "distance_associations": {
-            "description": "Explore semantic networks from close to far connections",
-            "best_for": "Systematic exploration, uncovering hidden connections, expanding perspective",
-            "examples": "From 'smartphone' → communication → relationships → intimacy → vulnerability",
-        },
-        "perspective_shifting": {
-            "description": "View challenges through different lenses and viewpoints",
-            "best_for": "Understanding complexity, finding blind spots, building empathy",
-            "examples": "How would a child/expert/alien view this? What about in 100 years?",
-        },
-    }
+        Returns:
+            Dict with list of strategies including name, description, best_for, and examples.
+        """
+        try:
+            strategy_info = {
+                "blend_conceptual_spaces": {
+                    "description": "Merge disparate conceptual domains for breakthrough innovations",
+                    "best_for": "Breakthrough innovations, cross-domain insights, metaphorical thinking",
+                    "examples": "Digital + Physical spaces, Music + Architecture, Cooking + Software",
+                },
+                "replacement_template": {
+                    "description": "Use symbolic substitution to reveal hidden assumptions",
+                    "best_for": "Reframing problems, highlighting hidden qualities, challenging assumptions",
+                    "examples": "If a library were a restaurant, If teamwork were cooking, If data were water",
+                },
+                "forced_connections": {
+                    "description": "Bridge unrelated domains to find unexpected insights",
+                    "best_for": "Breaking creative blocks, finding fresh angles, systematic innovation",
+                    "examples": "What can urban planning learn from ant colonies? How is marketing like gardening?",
+                },
+                "assumption_reversal": {
+                    "description": "Challenge fundamental premises for paradigm shifts",
+                    "best_for": "Paradigm shifts, disruptive innovation, challenging status quo",
+                    "examples": "What if customers designed the product? What if failure was celebrated?",
+                },
+                "distance_associations": {
+                    "description": "Explore semantic networks from close to far connections",
+                    "best_for": "Systematic exploration, uncovering hidden connections, expanding perspective",
+                    "examples": "From 'smartphone' → communication → relationships → intimacy → vulnerability",
+                },
+                "perspective_shifting": {
+                    "description": "View challenges through different lenses and viewpoints",
+                    "best_for": "Understanding complexity, finding blind spots, building empathy",
+                    "examples": "How would a child/expert/alien view this? What about in 100 years?",
+                },
+            }
 
-    result = "Available Creative Strategies:\n\n"
-    for strategy, info in strategy_info.items():
-        result += f"• Name: {strategy}\n"
-        result += f"  Description: {info['description']}\n"
-        result += f"  Best for: {info['best_for']}\n"
-        result += f"  Examples: {info['examples']}\n\n"
+            strategies = []
+            for strategy, info in strategy_info.items():
+                strategies.append(
+                    {
+                        "name": strategy,
+                        "description": info["description"],
+                        "best_for": info["best_for"],
+                        "examples": info["examples"],
+                    }
+                )
 
-    result += "Use fetch_creative_strategy(strategy_name) to get detailed guidance for any strategy."
-    return result
+            return {"strategies": strategies}
 
-
-if __name__ == "__main__":
-    mcp.run()
+        except Exception as e:
+            return {"error": str(e)}

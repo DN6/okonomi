@@ -10,6 +10,7 @@ from typing import List, Optional, Tuple, Union
 from urllib.parse import urlparse
 
 import chromadb
+import chromadb.utils.embedding_functions as embedding_functions
 import httpx
 from huggingface_hub import HfApi
 from PIL import Image
@@ -19,25 +20,20 @@ from .config import config
 
 REQUEST_TIMEOUT = 600
 hf_api = HfApi()
+hf_embedding_fn = embedding_functions.HuggingFaceEmbeddingFunction(api_key=os.getenv("HF_TOKEN"), model_name="")
 
 
-def get_chroma_client() -> Union[chromadb.CloudClient, chromadb.PersistentClient]:
-    """Get ChromaDB client - cloud if API key available, otherwise local persistent.
+def get_chroma_client() -> chromadb.PersistentClient:
+    """Get ChromaDB client in local persistent mode.
 
     Returns:
-        ChromaDB client instance (CloudClient or PersistentClient).
+        ChromaDB PersistentClient instance storing data locally.
     """
-    if os.getenv("CHROMA_API_KEY"):
-        return chromadb.CloudClient(
-            api_key=os.getenv("CHROMA_API_KEY"),
-            tenant=config.memory.chroma.tenant,
-            database=config.memory.chroma.database,
-        )
-    else:
-        # Use local persistent client
-        local_db_path = Path.home() / ".okonomi" / "chroma_db"
-        local_db_path.mkdir(parents=True, exist_ok=True)
-        return chromadb.PersistentClient(path=str(local_db_path))
+    # Use local persistent client - stores at ~/.okonomi/chroma_db by default
+    storage_path = config.memory.chroma.storage_path
+    local_db_path = Path(storage_path).expanduser()
+    local_db_path.mkdir(parents=True, exist_ok=True)
+    return chromadb.PersistentClient(path=str(local_db_path))
 
 
 @dataclass
@@ -222,53 +218,6 @@ def write_to_permanent_memory(data: List[dict]) -> dict:
 
     except Exception as e:
         return {"status": "failed to save to memory", "error": str(e)}
-
-
-def update_available_loras() -> None:
-    """
-    Retrieves all available LoRA (Low-Rank Adaptation) models from a Hugging Face collection
-    and updates the ChromaDB collection with them.
-
-    This function fetches LoRA models from a predefined Hugging Face collection, extracts
-    their IDs and descriptions from their model cards, and stores them in ChromaDB for
-    similarity search. When parsing the description pay close attention to the specific
-    trigger word needed in the prompt to apply the LoRA.
-
-    If lora_collection_id is not configured (empty string), this function will be a no-op.
-
-    Notes:
-        - Requires access to the Hugging Face API and the predefined LORA_COLLECTION_ID
-        - The description field often contains important trigger words needed to activate the LoRA
-        - The LoRA URLs point directly to .safetensors files which can be used with compatible
-          image generation tools
-        - Pay attention to the description field as it may contain usage instructions and examples
-    """
-    # Check if LoRA collection is configured
-    lora_collection_id = config.get("memory", {}).get("huggingface", {}).get("lora_collection_id", "")
-    if not lora_collection_id:
-        print("Note: Skipping LoRA collection update - lora_collection_id not configured in config.json")
-        return
-
-    try:
-        client = get_chroma_client()
-        collection = client.get_or_create_collection(name=config.memory.chroma.lora_collection_id)
-        lora_collection = hf_api.get_collection(lora_collection_id)
-
-        ids = []
-        documents = []
-        metadata = []
-        for idx, lora in enumerate(lora_collection.items):
-            lora_filename = [file for file in hf_api.list_repo_files(lora.item_id) if file.endswith(".safetensors")][0]
-            ids.append(str(idx))
-            metadata.append({"lora_id": f"https://huggingface.co/{lora.item_id}/resolve/main/{lora_filename}"})
-            note = lora.note
-            note = note or ""
-            documents.append(note)
-
-        collection.upsert(ids=ids, documents=documents, metadatas=metadata)
-
-    except Exception as e:
-        print(f"Warning: Failed to update LoRA collection: {e}")
 
 
 def image_to_uri(image: str, max_size_mb: float = 3.5) -> str:
