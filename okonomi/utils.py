@@ -1,15 +1,10 @@
 import base64
 import os
-import tempfile
 import uuid
-from dataclasses import dataclass
 from io import BytesIO
 from pathlib import Path
-from textwrap import dedent
-from typing import List, Optional, Tuple, Union
 from urllib.parse import urlparse
 
-import chromadb
 import httpx
 from huggingface_hub import HfApi
 from PIL import Image
@@ -158,54 +153,6 @@ def get_loras_catalog() -> str:
     return LORAS_FILE_PATH.read_text()
 
 
-def get_chroma_client() -> chromadb.PersistentClient:
-    """Get ChromaDB client in local persistent mode.
-
-    Returns:
-        ChromaDB PersistentClient instance storing data locally.
-    """
-    # Use local persistent client - stores at ~/.okonomi/chroma_db by default
-    storage_path = config.memory.chroma.storage_path
-    local_db_path = Path(storage_path).expanduser()
-    local_db_path.mkdir(parents=True, exist_ok=True)
-    return chromadb.PersistentClient(path=str(local_db_path))
-
-
-@dataclass
-class MemoryData:
-    concept_id: str = ""
-    image_id: str = ""
-    image_url: str = ""
-    creative_strategy: str = ""
-    user_input: str = ""
-    image: str = ""
-    prompt: str = ""
-    visual_critique_score: float = 0.0
-    prompt_concept_score: float = 0.0
-    lora_id: Optional[List[Tuple[str, float]]] = None
-    recommendations: str = ""
-    tool_name: str = ""
-
-    def __post_init__(self):
-        if self.lora_id is None:
-            self.lora_id = []
-
-    @classmethod
-    def from_dict(cls, dict):
-        field_names = set(cls.__dataclass_fields__.keys())
-        kwargs = {key: value for key, value in dict.items() if key in field_names}
-
-        return cls(**kwargs)
-
-    @property
-    def score(self) -> float:
-        scores = [
-            self.prompt_concept_score,
-            self.visual_critique_score,
-        ]
-        return sum(scores) // len(scores)
-
-
 def download_from_url(url: str, dir: str) -> str:
     """Download an image from URL and save it to a directory.
 
@@ -265,94 +212,8 @@ def upload_image_to_dataset(filepath: str, session_id: str) -> str:
         raise Exception(f"Failed to upload image to Hugging Face: {str(e)}")
 
 
-def prepare_document_text(memory_data: MemoryData) -> str:
-    lora_id_str = "\n".join(f"{item[0]} (scale: {item[1]})" for item in memory_data.lora_id)
-    creative_strategy_str = memory_data.creative_strategy.strip().split("\n")[0].strip(":")
-
-    return dedent(
-        f"""
-User Input:
-{memory_data.user_input}
-Creative Strategy:
-{creative_strategy_str}
-Candidate Prompt:
-{memory_data.prompt}
-Recommendations:
-{memory_data.recommendations}
-LoRA IDs:
-{lora_id_str}
-""".strip()
-    )
-
-
-def prepare_metadata(memory_data: MemoryData, hf_image_url: str) -> dict:
-    return {
-        "image_url": hf_image_url,
-        "input_image": memory_data.image,
-        "score": memory_data.score,
-        "prompt_concept_score": memory_data.prompt_concept_score,
-        "visual_critique_score": memory_data.visual_critique_score,
-        "concept_id": memory_data.concept_id,
-        "tool_name": memory_data.tool_name,
-    }
-
-
 def create_session_id() -> str:
     return str(uuid.uuid4())
-
-
-def write_to_permanent_memory(data: List[dict]) -> dict:
-    """
-    Store image generation memory data in ChromaDB vector database.
-
-    If image_repo_id is configured: downloads images, uploads to Hugging Face dataset,
-    and stores metadata with HF URLs for permanent storage.
-
-    If image_repo_id is not configured: stores metadata with original image URLs
-    (no download/upload, but still enables memory/learning functionality).
-
-    """
-
-    # Check if image repo is configured
-    image_repo_id = config.get("memory", {}).get("huggingface", {}).get("image_repo_id", "")
-
-    session_id = create_session_id()
-
-    client = get_chroma_client()
-    collection = client.get_or_create_collection(name=config.memory.chroma.image_eval_collection_id)
-
-    try:
-        ids = []
-        documents = []
-        metadata = []
-
-        if image_repo_id:
-            # Full workflow: download, upload to HF, store with HF URLs
-            with tempfile.TemporaryDirectory() as dir:
-                filepaths = [download_from_url(d["image_url"], dir) for d in data]
-
-                for idx, fp in enumerate(filepaths):
-                    memory_data = MemoryData.from_dict(data[idx])
-                    dataset_url = upload_image_to_dataset(fp, session_id)
-
-                    ids.append(f"{session_id}_{Path(fp).stem}")
-                    metadata.append(prepare_metadata(memory_data, dataset_url))
-                    documents.append(prepare_document_text(memory_data))
-        else:
-            for idx, item in enumerate(data):
-                memory_data = MemoryData.from_dict(item)
-
-                ids.append(f"{session_id}_{idx}")
-                # Use original image URL directly
-                metadata.append(prepare_metadata(memory_data, item["image_url"]))
-                documents.append(prepare_document_text(memory_data))
-
-        collection.upsert(ids=ids, documents=documents, metadatas=metadata)
-
-        return {"status": "success"}
-
-    except Exception as e:
-        return {"status": "failed to save to memory", "error": str(e)}
 
 
 def image_to_uri(image: str, max_size_mb: float = 3.5) -> str:

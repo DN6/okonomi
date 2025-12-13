@@ -40,8 +40,7 @@ class PromptTools(ToolMetadataMixin):
 
         Returns:
             A JSON string containing:
-            - candidate_prompt: The optimized text-to-image prompt
-            - concept_id: A unique identifier for this prompt concept
+            - prompt: The optimized text-to-image prompt
 
         Usage:
             1. Provide comprehensive context including the user's request and any relevant information
@@ -117,7 +116,7 @@ class PromptTools(ToolMetadataMixin):
                 max_tokens=self.config.inference_providers.huggingface.prompt_max_tokens,
             )
             generated_prompt = completion.choices[0].message.content
-            return {"prompt": str(generated_prompt), "concept_id": str(uuid.uuid4())}
+            return {"prompt": str(generated_prompt)}
 
         except Exception as e:
             return {"error": str(e)}
@@ -145,7 +144,6 @@ class PromptTools(ToolMetadataMixin):
         Returns:
             Dict containing:
             - structured_prompt: JSON object with scene components
-            - concept_id: A unique identifier for this prompt concept
 
         JSON Schema:
             {
@@ -257,7 +255,7 @@ class PromptTools(ToolMetadataMixin):
                 # Return raw content if JSON parsing fails
                 structured_prompt = generated_content
 
-            return {"structured_prompt": structured_prompt, "concept_id": str(uuid.uuid4())}
+            return {"structured_prompt": structured_prompt}
 
         except Exception as e:
             return {"error": str(e)}

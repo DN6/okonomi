@@ -9,16 +9,12 @@ from dotenv import load_dotenv
 
 @dataclass
 class AgentConfig:
-    model_type: str = "inference_client"
-    model_id: str = "moonshotai/Kimi-K2-Instruct-0905"
-    model_provider: str = "together"
+    model_id: str = "Qwen/Qwen3-VL-235B-A22B-Instruct"
+    model_provider: str = "huggingface"
     temperature: float = 0.2
     top_p: float = 1.0
-    planning_interval: int = 2
     max_steps: int = 50
-    max_tokens: int = 1000
-    verbosity_level: int = 1
-    autoplan: bool = True
+    max_tokens: int = 4096
 
 
 @dataclass
@@ -28,15 +24,13 @@ class HuggingfaceConfig:
     prompt_model_temperature: float = 0.6
     prompt_eval_model_temperature: float = 0.2
     prompt_max_tokens: int = 512
-    prompt_eval_max_tokens: int = 512
-    image_eval_model_id: str = "Qwen/Qwen3-VL-30B-A3B-Instruct"
+    image_text_model_id: str = "Qwen/Qwen3-VL-30B-A3B-Instruct"
     image_prompt_model_id: str = "Qwen/Qwen3-VL-30B-A3B-Instruct"
 
 
 @dataclass
 class FalConfig:
     text_to_image_model_id: str = "fal-ai/flux-lora"
-    image_to_image_model_id: str = "fal-ai/flux-2-pro/edit"
     edit_image_model_id: str = "fal-ai/flux-2-pro/edit"
     multi_angle_model_id: str = "fal-ai/qwen-image-edit-plus-lora-gallery/multiple-angles"
     image_to_video_model_id: str = "fal-ai/wan/v2.2-a14b/image-to-video"
@@ -66,13 +60,6 @@ class ToolsConfig:
 
 
 @dataclass
-class ChromaConfig:
-    storage_path: str = "~/.okonomi/chroma_db"
-    image_eval_collection_id: str = "image-evaluations"
-    max_image_eval_results: int = 3
-
-
-@dataclass
 class HuggingfaceMemoryConfig:
     image_repo_id: str = ""
 
@@ -85,14 +72,26 @@ class SessionConfig:
 
 @dataclass
 class MemoryConfig:
-    chroma: ChromaConfig = field(default_factory=ChromaConfig)
     huggingface: HuggingfaceMemoryConfig = field(default_factory=HuggingfaceMemoryConfig)
     sessions: SessionConfig = field(default_factory=SessionConfig)
+    max_messages: int = 50
+    truncation_strategy: str = "sliding_window"  # "sliding_window" or "keep_first_last"
+    summarize: bool = True  # Use LLM to summarize truncated messages
 
 
 @dataclass
 class EnvironmentVariablesConfig:
-    required: List[str] = field(default_factory=lambda: ["HF_TOKEN", "FAL_KEY"])
+    required: List[str] = field(default_factory=lambda: ["ANTHROPIC_API_KEY", "HF_TOKEN", "FAL_KEY"])
+
+
+@dataclass
+class TimeoutConfig:
+    """Timeout settings for various operations."""
+
+    api_request: float = 30.0
+    image_generation: float = 120.0
+    video_generation: float = 300.0
+    code_execution: float = 60.0
 
 
 @dataclass
@@ -104,6 +103,7 @@ class DefaultConfig:
     tools: ToolsConfig = field(default_factory=ToolsConfig)
     memory: MemoryConfig = field(default_factory=MemoryConfig)
     environment_variables: EnvironmentVariablesConfig = field(default_factory=EnvironmentVariablesConfig)
+    timeouts: TimeoutConfig = field(default_factory=TimeoutConfig)
 
     def to_dict(self) -> Dict[str, Any]:
         """Convert the config to a dictionary."""
@@ -214,6 +214,11 @@ class OkonomiConfig:
     def environment_variables(self) -> EnvironmentVariablesConfig:
         """Get environment variables configuration."""
         return self._config.environment_variables
+
+    @property
+    def timeouts(self) -> TimeoutConfig:
+        """Get timeout configuration."""
+        return self._config.timeouts
 
 
 # Global configuration instance

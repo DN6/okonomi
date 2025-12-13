@@ -7,7 +7,7 @@ Okonomi is an Agent meant for experimenting with creative image creation.
 - **Creative Strategy Tools**: Leverages multiple creative thinking techniques to generate unique prompts
 - **Multi-modal Image Generation**: Support for text-to-image, image-to-image, image editing, and style transfer
 - **LoRA Integration**: Dynamic loading and combination of LoRA models for enhanced control
-- **Memory System**: ChromaDB-based memory for learning from past generations
+- **Session Memory**: Session-based memory for tracking and learning from past generations
 - **Automatic Evaluation**: Built-in evaluation system for prompt and image quality
 - **MCP Tools**: Modular tool architecture for extensibility
 
@@ -98,7 +98,7 @@ The default configuration is in `config.json`. Key settings include:
 
 - **Agent Settings**: Model selection, temperature, planning interval
 - **Inference Providers**: HuggingFace and Fal.ai model configurations
-- **Memory Settings**: ChromaDB collections for storing evaluations and LoRAs
+- **Memory Settings**: Session storage and history management
 - **Tool Settings**: MCP tool configurations and callbacks
 
 ### Custom Configuration

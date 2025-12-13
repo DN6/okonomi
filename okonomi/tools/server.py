@@ -32,7 +32,7 @@ class OkonomiServer:
     code execution environment as global variables, allowing agents to
     use them naturally:
 
-        result = await image_generation.text_to_image(prompt="...", concept_id="...")
+        result = await image_generation.text_to_image(prompt="...")
     """
 
     def __init__(self, config: OkonomiConfig, server_name: str = "okonomi-tools"):

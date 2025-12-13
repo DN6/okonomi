@@ -2,8 +2,7 @@
 
 __version__ = "0.1.0"
 
-# from .agent import OkonomiAgent
-from .code_agent import OkonomiCodeAgent
+from .agent import OkonomiAgent
 
 
-__all__ = ["__version__", "OkonomiCodeAgent"]  # "OkonomiAgent" removed until agent.py is fixed
+__all__ = ["__version__", "OkonomiAgent"]

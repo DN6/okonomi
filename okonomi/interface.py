@@ -2,9 +2,38 @@
 
 import argparse
 
+from prompt_toolkit import prompt
+from prompt_toolkit.key_binding import KeyBindings
 from rich.console import Console
-from rich.panel import Panel
-from rich.text import Text
+
+
+def create_key_bindings() -> KeyBindings:
+    """Create key bindings for multiline input."""
+    bindings = KeyBindings()
+
+    @bindings.add("escape", "enter")  # Alt+Enter or Escape then Enter
+    def _(event):
+        """Insert newline on Alt+Enter."""
+        event.current_buffer.insert_text("\n")
+
+    return bindings
+
+
+def get_multiline_input(console: Console) -> str:
+    """Get input with multiline support (Alt+Enter for newline)."""
+    try:
+        bindings = create_key_bindings()
+        user_input = prompt(
+            "> ",
+            key_bindings=bindings,
+            multiline=False,  # Enter submits, special keys for newline
+        ).strip()
+        return user_input
+    except EOFError:
+        return ""
+    except KeyboardInterrupt:
+        console.print("\n[dim]Cancelled[/dim]")
+        raise
 
 
 def get_task_input(args: argparse.Namespace) -> str:
@@ -22,80 +51,13 @@ def get_task_input(args: argparse.Namespace) -> str:
     if task:
         return task
 
-    # Interactive mode with better in-terminal editing
+    # Interactive mode
     console = Console()
-    console.print(
-        Panel(
-            Text("What's on your mind?", style="bold cyan", justify="center"),
-            border_style="bright_blue",
-            expand=True,
-        )
-    )
+    console.print()
+    console.print("[#d787af]What's on your mind?[/#d787af]", justify="center")
+    console.print()
 
     try:
-        import readline
-
-        readline.parse_and_bind("tab: complete")
-        readline.parse_and_bind("set editing-mode vi")  # or vi
-
-        console.print(
-            "[dim]Enter your request. Use arrow keys to edit. Multi-line paste supported. Press Enter twice to finish:[/dim]\n"
-        )
-
-        lines = []
-        empty_line_count = 0
-
-        while empty_line_count < 2:
-            try:
-                if len(lines) == 0:
-                    prompt = "\x1b[92m>>> \x1b[0m"  # Bright green
-                else:
-                    prompt = "\x1b[92m... \x1b[0m"  # Bright green
-
-                line = input(prompt)
-
-                if line.strip() == "":
-                    empty_line_count += 1
-                else:
-                    empty_line_count = 0
-
-                lines.append(line)
-
-            except EOFError:
-                if lines:
-                    console.print("\n[yellow]Input finished with Ctrl+D, using what was entered so far...[/yellow]")
-                    break
-                else:
-                    console.print("\n[yellow]No input provided[/yellow]")
-                    return ""
-            except KeyboardInterrupt:
-                console.print("\n[red]Cancelled by user[/red]")
-                exit(0)
-
-        result = "\n".join(lines[:-empty_line_count] if empty_line_count > 0 else lines)
-        return result.strip()
-
-    except ImportError:
-        # Fallback if readline not available
-        console.print("[dim]Enter your request (type 'END' on a new line to finish):[/dim]\n")
-
-        lines = []
-        try:
-            while True:
-                if len(lines) == 0:
-                    line = console.input("[bright_green]>>> [/bright_green]")
-                else:
-                    line = console.input("[bright_green]... [/bright_green]")
-
-                if line.strip() == "END":
-                    break
-
-                lines.append(line)
-
-        except EOFError:
-            console.print("\n[yellow]Input finished with Ctrl+D[/yellow]")
-        except KeyboardInterrupt:
-            console.print("\n[red]Cancelled by user[/red]")
-            exit(0)
-
-        return "\n".join(lines)
+        return get_multiline_input(console)
+    except KeyboardInterrupt:
+        exit(0)

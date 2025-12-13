@@ -122,24 +122,26 @@ class SessionTools(ToolMetadataMixin):
         except Exception as e:
             return {"error": str(e)}
 
-    async def search_images(self, query: Optional[str] = None, min_score: float = 0.0, limit: int = 20) -> dict:
-        """Search for images across all sessions.
+    async def search_outputs(
+        self, query: Optional[str] = None, asset_type: Optional[str] = None, limit: int = 20
+    ) -> dict:
+        """Search for outputs across all sessions.
 
         Args:
-            query: Optional search query to match against session tasks and prompts.
-            min_score: Minimum visual critique score (0-10, default: 0).
+            query: Optional search query to match against session tasks.
+            asset_type: Filter by type ("image" or "video"), or None for all.
             limit: Maximum number of results (default: 20).
 
         Returns:
-            Dict with list of images with metadata, sorted by score (highest first).
+            Dict with list of outputs with metadata, sorted by timestamp (newest first).
         """
         try:
-            images = self.manager.search_images(query=query, min_score=min_score, limit=limit)
+            outputs = self.manager.search_outputs(query=query, asset_type=asset_type, limit=limit)
 
-            if not images:
-                return {"message": "No images found matching criteria", "images": []}
+            if not outputs:
+                return {"message": "No outputs found matching criteria", "outputs": []}
 
-            return {"images": images}
+            return {"outputs": outputs}
 
         except Exception as e:
             return {"error": str(e)}
