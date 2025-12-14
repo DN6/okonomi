@@ -7,23 +7,25 @@ any code generation or proxies.
 import sys
 from pathlib import Path
 
+
 # Add parent directory to path so imports work when running with mcp dev
 sys.path.insert(0, str(Path(__file__).parent.parent.parent))
+
+import asyncio
 
 from mcp.server import Server
 from mcp.server.stdio import stdio_server
 from mcp.types import Resource
-import asyncio
 
+from okonomi.config import OkonomiConfig
 from okonomi.tools._image import ImageTools
 from okonomi.tools._image_generation import ImageGenerationTools
-from okonomi.tools._prompt import PromptTools
 from okonomi.tools._memory import MemoryTools
+from okonomi.tools._prompt import PromptTools
 from okonomi.tools._research import ResearchTools
 from okonomi.tools._sessions import SessionTools
 from okonomi.tools._strategies import StrategiesTools
 from okonomi.tools._video import VideoTools
-from okonomi.config import OkonomiConfig
 
 
 class OkonomiServer:
@@ -199,7 +201,7 @@ class OkonomiServer:
 
 
 from okonomi.config import config
-import os
+
 
 # Create global server instance
 okonomi_server = OkonomiServer(config)

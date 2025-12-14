@@ -17,15 +17,12 @@ classifiers = [
   "Programming Language :: Python :: 3.12",
 ]
 dependencies = [
-  "arize-phoenix>=8.0.0",
   "fal-client>=0.7.0",
   "gradio>=5.38.2",
   "httpx>=0.28.1",
   "huggingface-hub>=0.33.5",
+  "langfuse>=3.0.0",
   "mcp[cli]>=1.12.2",
-  "opentelemetry-exporter-otlp-proto-http>=1.0.0",
-  "opentelemetry-api>=1.0.0",
-  "opentelemetry-sdk>=1.0.0",
   "prompt-toolkit>=3.0.0",
   "pydantic-ai>=0.2.0",
   "python-dotenv>=1.0.0",
@@ -40,7 +37,6 @@ okonomi = "okonomi.cli:main"
 [dependency-groups]
 debug = [
     "ipdb>=0.13.13",
-    "phoenix>=0.9.1",
 ]
 dev = ["ipdb>=0.13.13", "pyright>=1.1.403", "ruff>=0.12.5"]
 

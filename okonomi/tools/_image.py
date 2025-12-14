@@ -10,6 +10,7 @@ from PIL import Image
 
 from okonomi.tools._metadata import ToolMetadataMixin
 
+
 REQUEST_TIMEOUT = 120
 
 

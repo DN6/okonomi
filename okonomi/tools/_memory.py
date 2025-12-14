@@ -27,7 +27,7 @@ class MemoryTools(ToolMetadataMixin):
         for i, entry in enumerate(index[:limit]):
             tools = ", ".join(entry.get("tools_used", [])) or "none"
             lines.append(
-                f"{i+1}. [{entry['session_id'][:8]}] {entry.get('task_input', 'No task')} "
+                f"{i + 1}. [{entry['session_id'][:8]}] {entry.get('task_input', 'No task')} "
                 f"(outputs: {entry.get('num_outputs', 0)}, tools: {tools}, status: {entry.get('status', 'unknown')})"
             )
 
@@ -56,7 +56,7 @@ class MemoryTools(ToolMetadataMixin):
             lines.append("")
 
             for j, output in enumerate(session.generated_outputs):
-                lines.append(f"### Output {j+1} ({output.asset_type})")
+                lines.append(f"### Output {j + 1} ({output.asset_type})")
                 if output.prompt:
                     lines.append(f"Prompt: {output.prompt}")
                 lines.append(f"URL: {output.asset_url}")

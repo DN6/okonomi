@@ -1,5 +1,4 @@
 import json
-import uuid
 import os
 
 from huggingface_hub import InferenceClient

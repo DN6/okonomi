@@ -1,8 +1,8 @@
 """Configuration management for Okonomi."""
 
 import os
-from dataclasses import dataclass, field, asdict
-from typing import List, Dict, Any
+from dataclasses import asdict, dataclass, field
+from typing import Any, Dict, List
 
 from dotenv import load_dotenv
 
@@ -93,10 +93,15 @@ class TimeoutConfig:
 
 @dataclass
 class TracingConfig:
-    """Tracing/observability settings using Arize Phoenix."""
+    """Tracing/observability settings using Langfuse.
+
+    Langfuse configuration is done via environment variables:
+    - LANGFUSE_PUBLIC_KEY: Your Langfuse public key
+    - LANGFUSE_SECRET_KEY: Your Langfuse secret key
+    - LANGFUSE_HOST: Langfuse host (default: https://cloud.langfuse.com)
+    """
 
     enabled: bool = os.getenv("OKONOMI_TRACE", "false").lower() in ["true", "1"]
-    endpoint: str = "http://localhost:6006/v1/traces"  # Phoenix collector endpoint
 
 
 @dataclass

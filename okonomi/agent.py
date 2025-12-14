@@ -8,7 +8,7 @@ import asyncio
 import io
 import os
 import traceback
-from contextlib import redirect_stdout, redirect_stderr
+from contextlib import redirect_stderr, redirect_stdout
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
@@ -16,20 +16,14 @@ from typing import Any, Optional
 from urllib.parse import urlparse
 
 import httpx
-from opentelemetry import trace
-from opentelemetry.sdk.trace import TracerProvider
-from opentelemetry.sdk.trace.export import SimpleSpanProcessor
-from opentelemetry.exporter.otlp.proto.http.trace_exporter import OTLPSpanExporter
-from opentelemetry.trace import Status, StatusCode
-
+from langfuse import Langfuse, observe
 from pydantic_ai import Agent, RunContext
-from pydantic_ai.messages import ModelMessage, ModelRequest, ModelResponse, ToolCallPart, ToolReturnPart, TextPart
+from pydantic_ai.messages import ModelMessage, ModelRequest, ModelResponse, TextPart, ToolCallPart, ToolReturnPart
 from pydantic_ai.models.anthropic import AnthropicModel
 from pydantic_ai.models.openai import OpenAIModel
 from pydantic_ai.providers.openai import OpenAIProvider
 from rich.console import Console
 from rich.live import Live
-from rich.markdown import Markdown
 from rich.panel import Panel
 from rich.spinner import Spinner
 from rich.syntax import Syntax
@@ -119,7 +113,6 @@ class AsyncToolWrapper:
         self._tool_instance = tool_instance
         self._deps = deps
         self._namespace = namespace
-        self._tracer = trace.get_tracer(__name__)
 
     def __getattr__(self, name: str) -> Any:
         attr = getattr(self._tool_instance, name)
@@ -127,47 +120,39 @@ class AsyncToolWrapper:
         if asyncio.iscoroutinefunction(attr):
 
             def sync_wrapper(*args, **kwargs):
-                import json
+                tool_name = f"{self._namespace}.{name}"
 
-                # Create span for tool execution tracing with OpenInference conventions
-                with self._tracer.start_as_current_span(
-                    f"{self._namespace}.{name}",
-                    attributes={
-                        "openinference.span.kind": "TOOL",
-                        "tool.name": f"{self._namespace}.{name}",
-                        "input.value": json.dumps(kwargs, default=str)[:2000],
-                    },
-                ) as span:
+                # Use Langfuse observation for tool tracing
+                @observe(name=tool_name, as_type="tool")
+                def traced_call():
                     try:
-                        try:
-                            loop = asyncio.get_running_loop()
-                            import concurrent.futures
+                        import concurrent.futures
 
-                            with concurrent.futures.ThreadPoolExecutor() as executor:
-                                future = executor.submit(asyncio.run, attr(*args, **kwargs))
-                                result = future.result()
-                        except RuntimeError:
-                            result = asyncio.run(attr(*args, **kwargs))
+                        with concurrent.futures.ThreadPoolExecutor() as executor:
+                            future = executor.submit(asyncio.run, attr(*args, **kwargs))
+                            return future.result()
+                    except RuntimeError:
+                        return asyncio.run(attr(*args, **kwargs))
 
-                        # Track tool usage
-                        self._deps.tools_used.add(f"{self._namespace}.{name}")
+                try:
+                    result = traced_call()
 
-                        # Track input assets from kwargs
-                        for key in ["image", "image_url", "video", "video_url", "first_frame", "last_frame"]:
-                            if key in kwargs and kwargs[key]:
-                                self._deps.add_input_asset(kwargs[key])
+                    # Track tool usage
+                    self._deps.tools_used.add(tool_name)
 
-                        # Track outputs and add to span with OpenInference conventions
-                        if isinstance(result, dict):
-                            self._track_outputs(result, name, kwargs)
-                            span.set_attribute("output.value", json.dumps(result, default=str)[:2000])
+                    # Track input assets from kwargs
+                    for key in ["image", "image_url", "video", "video_url", "first_frame", "last_frame"]:
+                        if key in kwargs and kwargs[key]:
+                            self._deps.add_input_asset(kwargs[key])
 
-                        return result
+                    # Track outputs
+                    if isinstance(result, dict):
+                        self._track_outputs(result, name, kwargs)
 
-                    except Exception as e:
-                        span.set_attribute("exception.message", str(e)[:500])
-                        span.set_status(Status(StatusCode.ERROR, str(e)))
-                        raise
+                    return result
+
+                except Exception:
+                    raise
 
             return sync_wrapper
         return attr
@@ -260,31 +245,27 @@ class OkonomiAgent:
         self.agent = self._create_agent()
 
     def _setup_tracing(self) -> None:
-        """Configure Arize Phoenix tracing if enabled in config."""
+        """Configure Langfuse tracing if enabled in config."""
         if not self.config.tracing.enabled:
             return
 
         if OkonomiAgent._tracing_configured:
             return
 
-        # Check if Phoenix endpoint is available
+        # Initialize Langfuse client and verify authentication
         try:
-            with httpx.Client(timeout=2.0) as client:
-                response = client.get(self.config.tracing.endpoint.replace("/v1/traces", ""))
-                if response.status_code >= 500:
-                    return
-        except (httpx.ConnectError, httpx.TimeoutException):
+            langfuse = Langfuse()
+            if not langfuse.auth_check():
+                self.console.print("[dim]Langfuse: Authentication failed, tracing disabled[/dim]")
+                return
+        except Exception as e:
+            self.console.print(f"[dim]Langfuse: {e}, tracing disabled[/dim]")
             return
-
-        # Set up OpenTelemetry with Phoenix exporter
-        tracer_provider = TracerProvider()
-        exporter = OTLPSpanExporter(endpoint=self.config.tracing.endpoint)
-        tracer_provider.add_span_processor(SimpleSpanProcessor(exporter))
-        trace.set_tracer_provider(tracer_provider)
 
         # Use Pydantic AI's built-in instrumentation
         Agent.instrument_all()
         OkonomiAgent._tracing_configured = True
+        self.console.print("[dim]Langfuse: Tracing enabled[/dim]")
 
     def _create_tools(self) -> dict[str, Any]:
         """Create all tool instances."""
@@ -580,7 +561,7 @@ Signature: `{method_name}{sig}`
 
                 return result.strip() if result.strip() else "Code executed successfully (no output)"
 
-            except Exception as e:
+            except Exception:
                 error_msg = f"Error executing code:\n{traceback.format_exc()}"
                 console.print(Panel(error_msg, title="[dim]error[/dim]", border_style="red dim"))
                 return error_msg
@@ -629,6 +610,7 @@ Signature: `{method_name}{sig}`
             self.console.print(f"\n[dim]{part.tool_name}[/dim]")
             self.console.print(f"[dim]{part.args}[/dim]")
 
+    @observe(name="okonomi-agent", capture_input=True, capture_output=True)
     async def run_async(self, user_message: str, reset: bool = False) -> str:
         """Run the agent asynchronously with a user message.
 

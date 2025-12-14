@@ -5,11 +5,11 @@ import logging
 import os
 
 from rich.console import Console
-from rich.panel import Panel
 
+from .agent import OkonomiAgent
 from .config import config
 from .interface import get_multiline_input, get_task_input
-from .agent import OkonomiAgent
+
 
 # Suppress noisy loggers
 logging.getLogger("httpx").setLevel(logging.WARNING)

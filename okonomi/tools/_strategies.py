@@ -187,7 +187,7 @@ class StrategiesTools(ToolMetadataMixin):
         """
         try:
             if strategy_name not in self.strategies:
-                available = ", ".join(self.strategies.keys())
+                ", ".join(self.strategies.keys())
                 return {
                     "error": f"Unknown strategy '{strategy_name}'",
                     "available_strategies": list(self.strategies.keys()),

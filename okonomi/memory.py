@@ -162,9 +162,7 @@ class MemoryManager:
     def _summarize_messages(self, messages: list[ModelMessage]) -> str:
         """Use LLM to summarize a list of messages."""
         # Convert messages to readable text
-        conversation_text = "\n\n".join(
-            self._message_to_text(msg) for msg in messages
-        )
+        conversation_text = "\n\n".join(self._message_to_text(msg) for msg in messages)
 
         prompt = f"""Summarize this conversation excerpt concisely. Focus on:
 1. Key user requests and goals
@@ -201,7 +199,7 @@ Provide a brief summary (2-4 sentences) that captures the essential context:"""
         """
         # Find which messages were removed (the middle section)
         first_message = original_messages[0]
-        retained_set = set(id(m) for m in truncated_messages)
+        retained_set = {id(m) for m in truncated_messages}
         removed_messages = [m for m in original_messages if id(m) not in retained_set]
 
         if not removed_messages:

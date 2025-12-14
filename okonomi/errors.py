@@ -1,6 +1,6 @@
 """Structured error types for Okonomi with user-friendly messages."""
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from enum import Enum
 from typing import Any, Optional
 
@@ -156,9 +156,7 @@ class ValidationError(OkonomiError):
     value: str = ""
 
     @classmethod
-    def create(
-        cls, field: str, constraint: str, value: str = ""
-    ) -> "ValidationError":
+    def create(cls, field: str, constraint: str, value: str = "") -> "ValidationError":
         """Create a ValidationError with standard messaging."""
         return cls(
             message=f"Validation failed for '{field}': {constraint}",
@@ -197,9 +195,7 @@ class ExecutionError(OkonomiError):
     line_number: Optional[int] = None
 
     @classmethod
-    def create(
-        cls, error: Exception, code: str = "", line_number: Optional[int] = None
-    ) -> "ExecutionError":
+    def create(cls, error: Exception, code: str = "", line_number: Optional[int] = None) -> "ExecutionError":
         """Create an ExecutionError from an exception."""
         return cls(
             message=str(error),
