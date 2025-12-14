@@ -15,8 +15,10 @@ from pathlib import Path
 from typing import Any, Optional
 from urllib.parse import urlparse
 
+import subprocess
+
 import httpx
-from langfuse import Langfuse, observe
+from langfuse import Langfuse, observe, propagate_attributes
 from pydantic_ai import Agent, RunContext
 from pydantic_ai.messages import ModelMessage, ModelRequest, ModelResponse, TextPart, ToolCallPart, ToolReturnPart
 from pydantic_ai.models.anthropic import AnthropicModel
@@ -195,10 +197,28 @@ class OkonomiAgent:
     - Code execution with tool instances injected into the environment
     - Session management for continuity
     - Message history for multi-turn conversations
-    - Optional Arize Phoenix tracing for observability
+    - Optional Langfuse tracing for observability
     """
 
     _tracing_configured: bool = False
+    _git_commit: Optional[str] = None
+
+    @classmethod
+    def _get_git_commit(cls) -> Optional[str]:
+        """Get the short git commit hash, cached at class level."""
+        if cls._git_commit is None:
+            try:
+                result = subprocess.run(
+                    ["git", "rev-parse", "--short", "HEAD"],
+                    capture_output=True,
+                    text=True,
+                    timeout=5,
+                )
+                if result.returncode == 0:
+                    cls._git_commit = result.stdout.strip()
+            except Exception:
+                cls._git_commit = ""
+        return cls._git_commit or None
 
     def __init__(
         self,
@@ -645,60 +665,74 @@ Signature: `{method_name}{sig}`
                 )
                 self.message_history = truncated_history
 
+        # Build trace metadata
+        trace_metadata = {
+            "model_id": self.config.agent.model_id,
+            "model_provider": self.config.agent.model_provider,
+        }
+        if git_commit := self._get_git_commit():
+            trace_metadata["git_commit"] = git_commit
+
         try:
-            async with self.agent.iter(
-                user_message,
-                deps=deps,
-                message_history=self.message_history if self.message_history else None,
-            ) as agent_run:
-                async for node in agent_run:
-                    # Handle model request nodes - stream the text output
-                    if Agent.is_model_request_node(node):
-                        async with node.stream(agent_run.ctx) as stream:
-                            accumulated_text = ""
+            with propagate_attributes(
+                session_id=self.session_id,
+                metadata=trace_metadata,
+                tags=["okonomi"],
+                version=git_commit,
+            ):
+                async with self.agent.iter(
+                    user_message,
+                    deps=deps,
+                    message_history=self.message_history if self.message_history else None,
+                ) as agent_run:
+                    async for node in agent_run:
+                        # Handle model request nodes - stream the text output
+                        if Agent.is_model_request_node(node):
+                            async with node.stream(agent_run.ctx) as stream:
+                                accumulated_text = ""
 
-                            # Use Live display for streaming text
-                            with Live(
-                                Spinner("dots", style="#d787af"),
-                                console=self.console,
-                                refresh_per_second=15,
-                                transient=True,
-                            ) as live:
-                                async for text in stream.stream_text(delta=True, debounce_by=None):
-                                    accumulated_text += text
-                                    live.update(Text(accumulated_text, style="dim"))
+                                # Use Live display for streaming text
+                                with Live(
+                                    Spinner("dots", style="#d787af"),
+                                    console=self.console,
+                                    refresh_per_second=15,
+                                    transient=True,
+                                ) as live:
+                                    async for text in stream.stream_text(delta=True, debounce_by=None):
+                                        accumulated_text += text
+                                        live.update(Text(accumulated_text, style="dim"))
 
-                            # Print accumulated text if any
-                            if accumulated_text.strip():
-                                self.console.print(Text(accumulated_text, style="dim"))
-                                final_output = accumulated_text
+                                # Print accumulated text if any
+                                if accumulated_text.strip():
+                                    self.console.print(Text(accumulated_text, style="dim"))
+                                    final_output = accumulated_text
 
-                            # Display tool calls from the response
-                            response = stream.response
-                            if response and response.parts:
-                                for part in response.parts:
-                                    if isinstance(part, ToolCallPart):
-                                        self._display_tool_call(part)
+                                # Display tool calls from the response
+                                response = stream.response
+                                if response and response.parts:
+                                    for part in response.parts:
+                                        if isinstance(part, ToolCallPart):
+                                            self._display_tool_call(part)
 
-                result = agent_run.result
+                    result = agent_run.result
 
-                # Track token usage
-                usage = agent_run.usage()
-                self.token_usage.add(
-                    input_tokens=usage.request_tokens or 0,
-                    output_tokens=usage.response_tokens or 0,
-                    requests=usage.requests or 1,
-                )
+                    # Track token usage
+                    usage = agent_run.usage()
+                    self.token_usage.add(
+                        input_tokens=usage.request_tokens or 0,
+                        output_tokens=usage.response_tokens or 0,
+                        requests=usage.requests or 1,
+                    )
 
-            # Update message history for conversation continuity
-            self.message_history = result.new_messages()
-            self.generated_outputs = deps.generated_outputs
+                # Update message history for conversation continuity
+                self.message_history = result.new_messages()
+                self.generated_outputs = deps.generated_outputs
 
-            # Display token usage
-            self.console.print(f"[dim]{self.token_usage}[/dim]")
+                # Display token usage
+                self.console.print(f"[dim]{self.token_usage}[/dim]")
 
-            # Return the final output (use result.output if we didn't capture it during streaming)
-            return final_output if final_output else result.output
+                # Return the final output (use result.output if we didn't capture it during streaming)
+                return final_output if final_output else result.output
 
         except Exception as e:
             self.console.print(f"[dim red]Error: {e}[/dim red]")
