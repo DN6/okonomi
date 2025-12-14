@@ -9,8 +9,8 @@ from dotenv import load_dotenv
 
 @dataclass
 class AgentConfig:
-    model_id: str = "Qwen/Qwen3-VL-235B-A22B-Instruct"
-    model_provider: str = "huggingface"
+    model_id: str = "claude-sonnet-4-5"
+    model_provider: str = "anthropic"
     temperature: float = 0.2
     top_p: float = 1.0
     max_steps: int = 50
@@ -20,12 +20,9 @@ class AgentConfig:
 @dataclass
 class HuggingfaceConfig:
     prompt_model_id: str = "Qwen/Qwen3-VL-30B-A3B-Instruct"
-    prompt_eval_model_id: str = "openai/gpt-oss-20b"
     prompt_model_temperature: float = 0.6
-    prompt_eval_model_temperature: float = 0.2
     prompt_max_tokens: int = 512
     image_text_model_id: str = "Qwen/Qwen3-VL-30B-A3B-Instruct"
-    image_prompt_model_id: str = "Qwen/Qwen3-VL-30B-A3B-Instruct"
 
 
 @dataclass
@@ -74,7 +71,7 @@ class SessionConfig:
 class MemoryConfig:
     huggingface: HuggingfaceMemoryConfig = field(default_factory=HuggingfaceMemoryConfig)
     sessions: SessionConfig = field(default_factory=SessionConfig)
-    max_messages: int = 50
+    max_messages: int = 25
     truncation_strategy: str = "sliding_window"  # "sliding_window" or "keep_first_last"
     summarize: bool = True  # Use LLM to summarize truncated messages
 
@@ -95,6 +92,14 @@ class TimeoutConfig:
 
 
 @dataclass
+class TracingConfig:
+    """Tracing/observability settings using Arize Phoenix."""
+
+    enabled: bool = os.getenv("OKONOMI_TRACE", "false").lower() in ["true", "1"]
+    endpoint: str = "http://localhost:6006/v1/traces"  # Phoenix collector endpoint
+
+
+@dataclass
 class DefaultConfig:
     """Main configuration class for Okonomi."""
 
@@ -104,6 +109,7 @@ class DefaultConfig:
     memory: MemoryConfig = field(default_factory=MemoryConfig)
     environment_variables: EnvironmentVariablesConfig = field(default_factory=EnvironmentVariablesConfig)
     timeouts: TimeoutConfig = field(default_factory=TimeoutConfig)
+    tracing: TracingConfig = field(default_factory=TracingConfig)
 
     def to_dict(self) -> Dict[str, Any]:
         """Convert the config to a dictionary."""
@@ -219,6 +225,11 @@ class OkonomiConfig:
     def timeouts(self) -> TimeoutConfig:
         """Get timeout configuration."""
         return self._config.timeouts
+
+    @property
+    def tracing(self) -> TracingConfig:
+        """Get tracing configuration."""
+        return self._config.tracing
 
 
 # Global configuration instance

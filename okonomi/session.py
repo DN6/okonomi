@@ -7,6 +7,7 @@ generation history.
 
 import fcntl
 import json
+import shutil
 import uuid
 from contextlib import contextmanager
 from dataclasses import dataclass, field, asdict
@@ -28,12 +29,16 @@ class GeneratedOutput:
     model_id: str = ""
     loras: List[tuple] = field(default_factory=list)
     timestamp: str = ""
+    local_path: str = ""  # Local file path after download
 
     def to_dict(self) -> Dict[str, Any]:
         return asdict(self)
 
     @classmethod
     def from_dict(cls, data: Dict[str, Any]) -> "GeneratedOutput":
+        # Handle older sessions without local_path
+        if "local_path" not in data:
+            data["local_path"] = ""
         return cls(**data)
 
 
@@ -190,10 +195,13 @@ class SessionManager:
             temp_file.rename(self.index_file)
 
     def _recover_index(self) -> List[Dict[str, Any]]:
-        """Recover index by scanning session files."""
+        """Recover index by scanning session folders."""
         index = []
-        for session_file in self.storage_dir.glob("*.json"):
-            if session_file.name == "index.json":
+        for session_dir in self.storage_dir.iterdir():
+            if not session_dir.is_dir():
+                continue
+            session_file = session_dir / "session.json"
+            if not session_file.exists():
                 continue
             try:
                 with open(session_file, "r") as f:
@@ -247,13 +255,28 @@ class SessionManager:
         )
         return Session(metadata=metadata)
 
+    def get_session_dir(self, session_id: str) -> Path:
+        """Get the directory path for a session.
+
+        Args:
+            session_id: ID of the session
+
+        Returns:
+            Path to the session directory
+        """
+        return self.storage_dir / session_id
+
     def save_session(self, session: Session) -> None:
         """Save a session to disk.
+
+        Creates a folder for the session with session.json inside.
 
         Args:
             session: Session to save
         """
-        session_file = self.storage_dir / f"{session.metadata.session_id}.json"
+        session_dir = self.get_session_dir(session.metadata.session_id)
+        session_dir.mkdir(parents=True, exist_ok=True)
+        session_file = session_dir / "session.json"
 
         with open(session_file, "w") as f:
             json.dump(session.to_dict(), f, indent=2)
@@ -270,7 +293,8 @@ class SessionManager:
         Returns:
             Session if found, None otherwise
         """
-        session_file = self.storage_dir / f"{session_id}.json"
+        session_dir = self.get_session_dir(session_id)
+        session_file = session_dir / "session.json"
 
         if not session_file.exists():
             return None
@@ -338,7 +362,7 @@ class SessionManager:
         return [SessionMetadata.from_dict(entry) for entry in matches]
 
     def delete_session(self, session_id: str) -> bool:
-        """Delete a session.
+        """Delete a session and all its artifacts.
 
         Args:
             session_id: ID of the session to delete
@@ -346,13 +370,13 @@ class SessionManager:
         Returns:
             True if deleted, False if not found
         """
-        session_file = self.storage_dir / f"{session_id}.json"
+        session_dir = self.get_session_dir(session_id)
 
-        if not session_file.exists():
+        if not session_dir.exists():
             return False
 
-        # Delete file
-        session_file.unlink()
+        # Delete entire session folder
+        shutil.rmtree(session_dir)
 
         # Update index
         index = self._read_index()

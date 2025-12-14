@@ -11,10 +11,19 @@ import traceback
 from contextlib import redirect_stdout, redirect_stderr
 from dataclasses import dataclass, field
 from datetime import datetime
+from pathlib import Path
 from typing import Any, Optional
+from urllib.parse import urlparse
+
+import httpx
+from opentelemetry import trace
+from opentelemetry.sdk.trace import TracerProvider
+from opentelemetry.sdk.trace.export import SimpleSpanProcessor
+from opentelemetry.exporter.otlp.proto.http.trace_exporter import OTLPSpanExporter
+from opentelemetry.trace import Status, StatusCode
 
 from pydantic_ai import Agent, RunContext
-from pydantic_ai.messages import ModelMessage, ToolCallPart, TextPart
+from pydantic_ai.messages import ModelMessage, ModelRequest, ModelResponse, ToolCallPart, ToolReturnPart, TextPart
 from pydantic_ai.models.anthropic import AnthropicModel
 from pydantic_ai.models.openai import OpenAIModel
 from pydantic_ai.providers.openai import OpenAIProvider
@@ -37,6 +46,26 @@ from .tools._research import ResearchTools
 from .tools._sessions import SessionTools
 from .tools._strategies import StrategiesTools
 from .tools._video import VideoTools
+
+
+@dataclass
+class TokenUsage:
+    """Tracks token usage across agent runs."""
+
+    input_tokens: int = 0
+    output_tokens: int = 0
+    total_tokens: int = 0
+    requests: int = 0
+
+    def add(self, input_tokens: int, output_tokens: int, requests: int = 1) -> None:
+        """Add usage from a single run."""
+        self.input_tokens += input_tokens
+        self.output_tokens += output_tokens
+        self.total_tokens += input_tokens + output_tokens
+        self.requests += requests
+
+    def __str__(self) -> str:
+        return f"tokens: {self.total_tokens:,} (in: {self.input_tokens:,}, out: {self.output_tokens:,}) | requests: {self.requests}"
 
 
 @dataclass
@@ -90,6 +119,7 @@ class AsyncToolWrapper:
         self._tool_instance = tool_instance
         self._deps = deps
         self._namespace = namespace
+        self._tracer = trace.get_tracer(__name__)
 
     def __getattr__(self, name: str) -> Any:
         attr = getattr(self._tool_instance, name)
@@ -97,29 +127,47 @@ class AsyncToolWrapper:
         if asyncio.iscoroutinefunction(attr):
 
             def sync_wrapper(*args, **kwargs):
-                try:
-                    loop = asyncio.get_running_loop()
-                    import concurrent.futures
+                import json
 
-                    with concurrent.futures.ThreadPoolExecutor() as executor:
-                        future = executor.submit(asyncio.run, attr(*args, **kwargs))
-                        result = future.result()
-                except RuntimeError:
-                    result = asyncio.run(attr(*args, **kwargs))
+                # Create span for tool execution tracing with OpenInference conventions
+                with self._tracer.start_as_current_span(
+                    f"{self._namespace}.{name}",
+                    attributes={
+                        "openinference.span.kind": "TOOL",
+                        "tool.name": f"{self._namespace}.{name}",
+                        "input.value": json.dumps(kwargs, default=str)[:2000],
+                    },
+                ) as span:
+                    try:
+                        try:
+                            loop = asyncio.get_running_loop()
+                            import concurrent.futures
 
-                # Track tool usage
-                self._deps.tools_used.add(f"{self._namespace}.{name}")
+                            with concurrent.futures.ThreadPoolExecutor() as executor:
+                                future = executor.submit(asyncio.run, attr(*args, **kwargs))
+                                result = future.result()
+                        except RuntimeError:
+                            result = asyncio.run(attr(*args, **kwargs))
 
-                # Track input assets from kwargs
-                for key in ["image", "image_url", "video", "video_url", "first_frame", "last_frame"]:
-                    if key in kwargs and kwargs[key]:
-                        self._deps.add_input_asset(kwargs[key])
+                        # Track tool usage
+                        self._deps.tools_used.add(f"{self._namespace}.{name}")
 
-                # Track outputs
-                if isinstance(result, dict):
-                    self._track_outputs(result, name, kwargs)
+                        # Track input assets from kwargs
+                        for key in ["image", "image_url", "video", "video_url", "first_frame", "last_frame"]:
+                            if key in kwargs and kwargs[key]:
+                                self._deps.add_input_asset(kwargs[key])
 
-                return result
+                        # Track outputs and add to span with OpenInference conventions
+                        if isinstance(result, dict):
+                            self._track_outputs(result, name, kwargs)
+                            span.set_attribute("output.value", json.dumps(result, default=str)[:2000])
+
+                        return result
+
+                    except Exception as e:
+                        span.set_attribute("exception.message", str(e)[:500])
+                        span.set_status(Status(StatusCode.ERROR, str(e)))
+                        raise
 
             return sync_wrapper
         return attr
@@ -162,7 +210,10 @@ class OkonomiAgent:
     - Code execution with tool instances injected into the environment
     - Session management for continuity
     - Message history for multi-turn conversations
+    - Optional Arize Phoenix tracing for observability
     """
+
+    _tracing_configured: bool = False
 
     def __init__(
         self,
@@ -196,11 +247,44 @@ class OkonomiAgent:
         self.loras_used: list[tuple] = []
         self.errors: list[str] = []
 
+        # Token usage tracking
+        self.token_usage = TokenUsage()
+
         # Memory management for message history
         self.memory_manager = MemoryManager(config)
 
+        # Configure tracing if enabled
+        self._setup_tracing()
+
         # Create the Pydantic AI agent
         self.agent = self._create_agent()
+
+    def _setup_tracing(self) -> None:
+        """Configure Arize Phoenix tracing if enabled in config."""
+        if not self.config.tracing.enabled:
+            return
+
+        if OkonomiAgent._tracing_configured:
+            return
+
+        # Check if Phoenix endpoint is available
+        try:
+            with httpx.Client(timeout=2.0) as client:
+                response = client.get(self.config.tracing.endpoint.replace("/v1/traces", ""))
+                if response.status_code >= 500:
+                    return
+        except (httpx.ConnectError, httpx.TimeoutException):
+            return
+
+        # Set up OpenTelemetry with Phoenix exporter
+        tracer_provider = TracerProvider()
+        exporter = OTLPSpanExporter(endpoint=self.config.tracing.endpoint)
+        tracer_provider.add_span_processor(SimpleSpanProcessor(exporter))
+        trace.set_tracer_provider(tracer_provider)
+
+        # Use Pydantic AI's built-in instrumentation
+        Agent.instrument_all()
+        OkonomiAgent._tracing_configured = True
 
     def _create_tools(self) -> dict[str, Any]:
         """Create all tool instances."""
@@ -223,6 +307,7 @@ class OkonomiAgent:
             model,
             deps_type=AgentDependencies,
             system_prompt=self._get_system_prompt(),
+            instrument=self._tracing_configured,
         )
 
         # Register the code execution tool
@@ -315,7 +400,15 @@ print(loras)
 2. Use `print()` to see results
 3. Variables persist between executions
 4. All methods are synchronous - do NOT use `await`
-5. Use `get_tool_method_documentation('tool.method')` for detailed parameter info
+5. **IMPORTANT**: For tools marked with `[detailed docs]`, ALWAYS call `get_tool_documentation('tool.method')` first to read the full documentation before using them. These tools have specific instructions for best results.
+
+## Documentation Helper
+
+```python
+# Read detailed documentation before using complex tools
+docs = get_tool_documentation('image_generation.reference_image')
+print(docs)
+```
 
 Be creative and help users generate stunning images and videos."""
 
@@ -333,7 +426,11 @@ Be creative and help users generate stunning images and videos."""
                 for method_name, method_info in metadata.get("methods", {}).items():
                     signature = method_info.get("signature", f"{method_name}(...)")
                     description = method_info.get("description", "")
-                    docs.append(f"- `{namespace}.{signature}` - {description}")
+                    # Mark methods with detailed documentation (docstring > 500 chars)
+                    docstring = method_info.get("docstring", "")
+                    has_detailed_docs = len(docstring) > 500
+                    doc_marker = " [detailed docs]" if has_detailed_docs else ""
+                    docs.append(f"- `{namespace}.{signature}` - {description}{doc_marker}")
 
                 docs.append("")
 
@@ -387,11 +484,22 @@ Be creative and help users generate stunning images and videos."""
                             readme += "\n"
                     return readme
 
-                def get_tool_method_documentation(method_path: str) -> str:
+                def get_tool_documentation(method_path: str) -> str:
                     """Get detailed documentation for a specific tool method.
 
+                    IMPORTANT: Use this function before calling tools with complex parameters
+                    or specific instructions. Many tools (especially reference_image, text_to_image,
+                    edit_image) have detailed usage guides in their documentation.
+
                     Args:
-                        method_path: The path to the method, e.g., 'image_generation.text_to_image'
+                        method_path: The path to the method, e.g., 'image_generation.reference_image'
+
+                    Returns:
+                        Full documentation including signature, parameters, and usage examples.
+
+                    Example:
+                        docs = get_tool_documentation('image_generation.reference_image')
+                        print(docs)
                     """
                     parts = method_path.split(".")
                     if len(parts) != 2:
@@ -400,19 +508,50 @@ Be creative and help users generate stunning images and videos."""
                     namespace, method_name = parts
                     tool = ctx.deps.tools.get(namespace)
                     if not tool:
-                        return f"Tool '{namespace}' not found"
+                        available = ", ".join(ctx.deps.tools.keys())
+                        return f"Tool '{namespace}' not found. Available tools: {available}"
 
                     method = getattr(tool, method_name, None)
                     if not method:
-                        return f"Method '{method_name}' not found in tool '{namespace}'"
+                        # List available methods
+                        methods = [m for m in dir(tool) if not m.startswith("_") and callable(getattr(tool, m))]
+                        return f"Method '{method_name}' not found in '{namespace}'. Available: {', '.join(methods)}"
 
                     import inspect
 
                     doc = inspect.getdoc(method) or "No documentation available"
                     sig = inspect.signature(method)
-                    return f"## {namespace}.{method_name}\n\nSignature: `{method_name}{sig}`\n\n{doc}"
+
+                    # Build parameter details
+                    params_doc = []
+                    for param_name, param in sig.parameters.items():
+                        if param_name == "self":
+                            continue
+                        param_type = str(param.annotation) if param.annotation != inspect.Parameter.empty else "Any"
+                        default = ""
+                        if param.default != inspect.Parameter.empty:
+                            default = f" = {param.default!r}"
+                        params_doc.append(f"  - {param_name}: {param_type}{default}")
+
+                    params_section = "\n".join(params_doc) if params_doc else "  (no parameters)"
+
+                    return f"""# {namespace}.{method_name}
+
+Signature: `{method_name}{sig}`
+
+## Parameters:
+{params_section}
+
+## Documentation:
+{doc}"""
+
+                # Alias for backward compatibility
+                def get_tool_method_documentation(method_path: str) -> str:
+                    """Alias for get_tool_documentation."""
+                    return get_tool_documentation(method_path)
 
                 ctx.deps.execution_globals["get_tools_readme"] = get_tools_readme
+                ctx.deps.execution_globals["get_tool_documentation"] = get_tool_documentation
                 ctx.deps.execution_globals["get_tool_method_documentation"] = get_tool_method_documentation
 
             # Capture stdout and stderr
@@ -508,6 +647,7 @@ Be creative and help users generate stunning images and videos."""
             self.models_used = set()
             self.loras_used = []
             self.errors = []
+            self.token_usage = TokenUsage()
 
         self.task = user_message
         deps = self._get_dependencies()
@@ -560,9 +700,20 @@ Be creative and help users generate stunning images and videos."""
 
                 result = agent_run.result
 
+                # Track token usage
+                usage = agent_run.usage()
+                self.token_usage.add(
+                    input_tokens=usage.request_tokens or 0,
+                    output_tokens=usage.response_tokens or 0,
+                    requests=usage.requests or 1,
+                )
+
             # Update message history for conversation continuity
             self.message_history = result.new_messages()
             self.generated_outputs = deps.generated_outputs
+
+            # Display token usage
+            self.console.print(f"[dim]{self.token_usage}[/dim]")
 
             # Return the final output (use result.output if we didn't capture it during streaming)
             return final_output if final_output else result.output
@@ -583,12 +734,125 @@ Be creative and help users generate stunning images and videos."""
         """
         return asyncio.run(self.run_async(user_message, reset=reset))
 
+    def _message_to_text(self, message: ModelMessage) -> str:
+        """Convert a ModelMessage to readable text."""
+        lines = []
+        if isinstance(message, ModelRequest):
+            for part in message.parts:
+                if isinstance(part, TextPart):
+                    lines.append(f"User: {part.content}")
+                elif isinstance(part, ToolReturnPart):
+                    content = str(part.content)[:500]
+                    lines.append(f"Tool Result ({part.tool_name}): {content}")
+        elif isinstance(message, ModelResponse):
+            for part in message.parts:
+                if isinstance(part, TextPart):
+                    lines.append(f"Assistant: {part.content}")
+                elif isinstance(part, ToolCallPart):
+                    args = str(part.args)[:200]
+                    lines.append(f"Tool Call ({part.tool_name}): {args}")
+        return "\n".join(lines)
+
+    def _generate_steps_summary(self) -> str:
+        """Generate LLM summary of session actions."""
+        if not self.message_history:
+            return ""
+
+        try:
+            conversation_text = "\n\n".join(self._message_to_text(msg) for msg in self.message_history)
+
+            prompt = f"""Summarize the steps taken in this image/video generation session.
+Focus on:
+1. Tools used and their sequence
+2. Key prompts and parameters
+3. Any iterations or refinements
+4. Final outcomes
+
+Conversation:
+{conversation_text}
+
+Provide a concise summary (2-4 sentences):"""
+
+            response = self.memory_manager.client.chat.completions.create(
+                model=self.config.inference_providers.huggingface.prompt_model_id,
+                messages=[{"role": "user", "content": prompt}],
+                temperature=0.3,
+                max_tokens=256,
+            )
+            return response.choices[0].message.content.strip()
+        except Exception:
+            return ""
+
+    def _download_asset(self, url: str, session_dir: Path, asset_type: str) -> str:
+        """Download an asset from URL to the session directory.
+
+        Args:
+            url: URL to download from
+            session_dir: Directory to save the asset
+            asset_type: "image" or "video"
+
+        Returns:
+            Local file path, or empty string if download failed
+        """
+        try:
+            # Extract filename from URL path (e.g., "1Bq5pfalxttyXEHIrNcNX.jpg")
+            parsed = urlparse(url)
+            url_filename = Path(parsed.path).name
+
+            # Use the URL filename if it has an extension, otherwise add default
+            if Path(url_filename).suffix.lower() in [
+                ".jpg",
+                ".jpeg",
+                ".png",
+                ".webp",
+                ".gif",
+                ".mp4",
+                ".webm",
+                ".mov",
+            ]:
+                filename = url_filename
+            else:
+                ext = ".jpg" if asset_type == "image" else ".mp4"
+                filename = f"{url_filename}{ext}"
+
+            local_path = session_dir / filename
+
+            # Download the file
+            with httpx.Client(timeout=60.0) as client:
+                response = client.get(url, follow_redirects=True)
+                response.raise_for_status()
+
+                with open(local_path, "wb") as f:
+                    f.write(response.content)
+
+            return str(local_path)
+        except Exception:
+            return ""
+
+    def _download_session_assets(self, session_dir: Path) -> None:
+        """Download all generated outputs to the session directory.
+
+        Args:
+            session_dir: Directory to save assets
+        """
+        for output in self.generated_outputs:
+            if output.asset_url and not output.local_path:
+                local_path = self._download_asset(output.asset_url, session_dir, output.asset_type)
+                output.local_path = local_path
+
     def save_session(self, status: str = "completed") -> None:
         """Save the current session state.
 
         Args:
             status: Status of the session (completed, error, abandoned)
         """
+        # Get session directory and ensure it exists
+        session_dir = self.session_manager.get_session_dir(self.session_id)
+        session_dir.mkdir(parents=True, exist_ok=True)
+
+        # Download all assets to the session directory
+        self._download_session_assets(session_dir)
+
         now = datetime.now().isoformat()
         metadata = SessionMetadata(
             session_id=self.session_id,
@@ -606,6 +870,7 @@ Be creative and help users generate stunning images and videos."""
             metadata=metadata,
             generated_outputs=self.generated_outputs,
             input_assets=self.input_assets,
+            steps_summary=self._generate_steps_summary(),
             loras_used=self.loras_used,
             errors=self.errors,
         )

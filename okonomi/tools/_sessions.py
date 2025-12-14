@@ -37,12 +37,12 @@ class SessionTools(ToolMetadataMixin):
             results = [
                 {
                     "session_id": s.session_id,
-                    "task": s.task,
-                    "timestamp": s.timestamp,
+                    "task_input": s.task_input,
+                    "created_at": s.created_at,
                     "status": s.status,
                     "num_outputs": s.num_outputs,
-                    "model_id": s.model_id,
-                    "total_steps": s.total_steps,
+                    "tools_used": s.tools_used,
+                    "models_used": s.models_used,
                 }
                 for s in sessions
             ]
@@ -88,11 +88,11 @@ class SessionTools(ToolMetadataMixin):
             results = [
                 {
                     "session_id": s.session_id,
-                    "task": s.task,
-                    "timestamp": s.timestamp,
+                    "task_input": s.task_input,
+                    "created_at": s.created_at,
                     "status": s.status,
                     "num_outputs": s.num_outputs,
-                    "model_id": s.model_id,
+                    "models_used": s.models_used,
                 }
                 for s in sessions
             ]

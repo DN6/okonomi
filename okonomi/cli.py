@@ -49,8 +49,8 @@ def handle_list_sessions(console: Console) -> None:
     console.print("\n[bold cyan]Past Sessions:[/bold cyan]\n")
     for session in sessions:
         console.print(f"[bold]{session.session_id}[/bold]")
-        console.print(f"  Task: {session.task}")
-        console.print(f"  Time: {session.timestamp}")
+        console.print(f"  Task: {session.task_input}")
+        console.print(f"  Time: {session.created_at}")
         console.print(f"  Status: {session.status}")
         console.print(f"  Outputs: {session.num_outputs}")
         console.print()
@@ -90,7 +90,7 @@ def resolve_session(console: Console, args: argparse.Namespace) -> str | None:
         latest = manager.get_latest_session()
         if latest:
             console.print(f"[bold green]Resuming from session: {latest.metadata.session_id}[/bold green]")
-            console.print(f"Previous task: {latest.metadata.task}\n")
+            console.print(f"Previous task: {latest.metadata.task_input}\n")
             return latest.metadata.session_id
         console.print("[yellow]No previous sessions found. Starting new session.[/yellow]\n")
         return None
@@ -99,7 +99,7 @@ def resolve_session(console: Console, args: argparse.Namespace) -> str | None:
     session = manager.load_session(args.session)
     if session:
         console.print(f"[bold green]Loaded session: {args.session}[/bold green]")
-        console.print(f"Task: {session.metadata.task}\n")
+        console.print(f"Task: {session.metadata.task_input}\n")
         return args.session
 
     console.print(f"[red]Session {args.session} not found. Starting new session.[/red]\n")

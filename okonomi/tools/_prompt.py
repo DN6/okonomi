@@ -335,7 +335,7 @@ class PromptTools(ToolMetadataMixin):
             }
 
             completion = self.client.chat.completions.create(
-                model=self.config.inference_providers.huggingface.image_prompt_model_id,
+                model=self.config.inference_providers.huggingface.image_text_model_id,
                 messages=[{"role": "system", "content": system_prompt}, user_message],
                 temperature=0.3,  # Lower temperature for more consistent descriptions
                 max_tokens=self.config.inference_providers.huggingface.prompt_max_tokens,
