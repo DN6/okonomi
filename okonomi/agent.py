@@ -7,6 +7,7 @@ with a local Python code executor that has access to all tool instances.
 import asyncio
 import io
 import os
+import subprocess
 import traceback
 from contextlib import redirect_stderr, redirect_stdout
 from dataclasses import dataclass, field
@@ -14,8 +15,6 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any, Optional
 from urllib.parse import urlparse
-
-import subprocess
 
 import httpx
 from langfuse import Langfuse, observe, propagate_attributes
@@ -401,7 +400,8 @@ print(loras)
 2. Use `print()` to see results
 3. Variables persist between executions
 4. All methods are synchronous - do NOT use `await`
-5. **IMPORTANT**: For tools marked with `[detailed docs]`, ALWAYS call `get_tool_documentation('tool.method')` first to read the full documentation before using them. These tools have specific instructions for best results.
+5. Unless explicit instructions are provided by the user, use available research and strategies tools to develop prompt concepts
+6. **IMPORTANT**: For tools marked with `[detailed docs]`, ALWAYS call `get_tool_documentation('tool.method')` first to read the full documentation before using them. These tools have specific instructions for best results.
 
 ## Documentation Helper
 
