@@ -400,7 +400,7 @@ print(loras)
 2. Use `print()` to see results
 3. Variables persist between executions
 4. All methods are synchronous - do NOT use `await`
-5. Unless explicit instructions are provided by the user, use available research and strategies tools to develop prompt concepts
+5. Unless explicit instructions are provided by the user, ALWAYS use available research and strategies tools to develop prompt concepts before generating any media
 6. **IMPORTANT**: For tools marked with `[detailed docs]`, ALWAYS call `get_tool_documentation('tool.method')` first to read the full documentation before using them. These tools have specific instructions for best results.
 
 ## Documentation Helper
