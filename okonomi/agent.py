@@ -368,13 +368,57 @@ class OkonomiAgent:
 
 {tool_docs}
 
-## Quick Examples
+## Creative Workflow
 
-**Generate an image:**
+Before generating any media, you must determine if the request is **direct** or **conceptual**:
+
+### Direct Requests (proceed to generation)
+User provides specific visual details: subject, composition, style, colors, lighting.
+Examples:
+- "A red fox sitting in snow, soft morning light, photorealistic"
+- "Edit this image to change the background to a beach"
+- "Generate the same character but in a different pose"
+
+### Conceptual Requests (develop concept first)
+User provides themes, moods, abstract ideas, or vague descriptions.
+Examples:
+- "Something cyberpunk" → explore cyberpunk aesthetics, subgenres, visual motifs
+- "Create art about loneliness" → brainstorm visual metaphors, compositions, color palettes
+- "Make a cool character" → define archetype, style, setting, distinguishing features
+- "Generate an image for my podcast" → understand the podcast, audience, tone
+
+**For conceptual requests, follow this workflow:**
+
+1. **Explore strategies** - Use `strategies.list_strategies()` and `strategies.apply_strategy()` to find creative angles
+2. **Research references** - Use `research.find_loras()` to discover styles that match the concept
+3. **Develop the prompt** - Use `prompt.create_prompt()` with rich context from your exploration
+4. **Generate** - Only after developing a strong concept, proceed to image generation
+
 ```python
-result = prompt.create_prompt(context="A cyberpunk cityscape at night")
-print(result)
-image = image_generation.text_to_image(prompt=result["prompt"])
+# Example workflow for "create something cyberpunk"
+strategies_list = strategies.list_strategies()
+print(strategies_list)
+
+strategy_result = strategies.apply_strategy(strategy="genre_mashup", context="cyberpunk aesthetic")
+print(strategy_result)
+
+loras = research.find_loras(query="cyberpunk neon")
+print(loras)
+
+prompt_result = prompt.create_prompt(
+    context="Cyberpunk scene with neon-lit rain-soaked streets, inspired by genre mashup strategy"
+)
+print(prompt_result)
+
+image = image_generation.text_to_image(prompt=prompt_result["prompt"], lora_id=[(loras[0]["url"], 0.8)])
+print(image)
+```
+
+## Quick Reference
+
+**Direct generation:**
+```python
+image = image_generation.text_to_image(prompt="A detailed, specific prompt here")
 print(image)
 ```
 
@@ -387,26 +431,17 @@ edited = image_generation.edit_image(
 print(edited)
 ```
 
-**Use LoRAs:**
-```python
-loras = research.find_loras(query="cinematic")
-print(loras)
-# Then use in text_to_image with lora_id parameter
-```
-
 ## Rules
 
 1. Use `execute_code` to run Python code
 2. Use `print()` to see results
 3. Variables persist between executions
 4. All methods are synchronous - do NOT use `await`
-5. Unless explicit instructions are provided by the user, ALWAYS use available research and strategies tools to develop prompt concepts before generating any media
-6. **IMPORTANT**: For tools marked with `[detailed docs]`, ALWAYS call `get_tool_documentation('tool.method')` first to read the full documentation before using them. These tools have specific instructions for best results.
+5. **IMPORTANT**: For tools marked with `[detailed docs]`, ALWAYS call `get_tool_documentation('tool.method')` first to read the full documentation before using them.
 
 ## Documentation Helper
 
 ```python
-# Read detailed documentation before using complex tools
 docs = get_tool_documentation('image_generation.reference_image')
 print(docs)
 ```
