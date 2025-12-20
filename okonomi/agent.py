@@ -370,66 +370,46 @@ class OkonomiAgent:
 
 ## Creative Workflow
 
-Before generating any media, you must determine if the request is **direct** or **conceptual**:
+Before generating any media, determine if the request is **direct** or **conceptual**:
 
 ### Direct Requests (proceed to generation)
 User provides specific visual details: subject, composition, style, colors, lighting.
 Examples:
 - "A red fox sitting in snow, soft morning light, photorealistic"
 - "Edit this image to change the background to a beach"
-- "Generate the same character but in a different pose"
 
 ### Conceptual Requests (develop concept first)
 User provides themes, moods, abstract ideas, or vague descriptions.
 Examples:
-- "Something cyberpunk" → explore cyberpunk aesthetics, subgenres, visual motifs
-- "Create art about loneliness" → brainstorm visual metaphors, compositions, color palettes
-- "Make a cool character" → define archetype, style, setting, distinguishing features
-- "Generate an image for my podcast" → understand the podcast, audience, tone
+- "Something cyberpunk"
+- "Create art about loneliness"
+- "Make a cool character"
 
 **For conceptual requests, follow this workflow:**
 
-1. **Explore strategies** - Use `strategies.list_strategies()` and `strategies.apply_strategy()` to find creative angles
-2. **Research references** - Use `research.find_loras()` to discover styles that match the concept
-3. **Develop the prompt** - Use `prompt.create_prompt()` with rich context from your exploration
-4. **Generate** - Only after developing a strong concept, proceed to image generation
+1. **Research & Ideation** - Use `strategies.list_strategies()` and `strategies.apply_strategy()` to explore creative angles. Use `research.web_search()` for inspiration and references.
+2. **Determine Style** - Decide on the visual style (photorealistic, illustration, anime, painterly, etc.) based on the concept.
+3. **Find LoRAs** - If using text to image use `research.find_loras()` to discover styles that match. **Always search for multiple LoRAs and combine them** (e.g., one for style, one for subject matter). Keep combined scale under 1.5.
+4. **Create Prompt** - Use `prompt.create_prompt()` with context from your research.
+5. **Generate** - Proceed to image generation with the developed concept and LoRAs.
 
-```python
-# Example workflow for "create something cyberpunk"
-strategies_list = strategies.list_strategies()
-print(strategies_list)
+## Tool-Specific Requirements
 
-strategy_result = strategies.apply_strategy(strategy="genre_mashup", context="cyberpunk aesthetic")
-print(strategy_result)
+### text_to_image
+- Always combine multiple LoRAs for richer results
+- Search for LoRAs matching both style AND subject
+- Example: cinematic LoRA (0.7) + character LoRA (0.6)
 
-loras = research.find_loras(query="cyberpunk neon")
-print(loras)
+### edit_image & reference_image
+These tools require **structured prompts** that explicitly state:
+- **What to preserve**: style, colors, composition, subject identity
+- **What to change**: specific elements to modify
+- **Reference attribution**: "The style from image1", "The person from image2"
 
-prompt_result = prompt.create_prompt(
-    context="Cyberpunk scene with neon-lit rain-soaked streets, inspired by genre mashup strategy"
-)
-print(prompt_result)
-
-image = image_generation.text_to_image(prompt=prompt_result["prompt"], lora_id=[(loras[0]["url"], 0.8)])
-print(image)
-```
-
-## Quick Reference
-
-**Direct generation:**
-```python
-image = image_generation.text_to_image(prompt="A detailed, specific prompt here")
-print(image)
-```
-
-**Edit an image:**
-```python
-edited = image_generation.edit_image(
-    prompt="Change the sky to sunset",
-    image="https://example.com/image.jpg"
-)
-print(edited)
-```
+Example structured prompts:
+- "Preserve the color palette and lighting from image1. Apply it to a new scene of a mountain landscape at dawn."
+- "Keep the person's face and clothing from image1. Change the background to a futuristic cityscape."
+- "Using the painterly style from image1, recreate the composition with autumn colors."
 
 ## Rules
 
@@ -437,14 +417,7 @@ print(edited)
 2. Use `print()` to see results
 3. Variables persist between executions
 4. All methods are synchronous - do NOT use `await`
-5. **IMPORTANT**: For tools marked with `[detailed docs]`, ALWAYS call `get_tool_documentation('tool.method')` first to read the full documentation before using them.
-
-## Documentation Helper
-
-```python
-docs = get_tool_documentation('image_generation.reference_image')
-print(docs)
-```
+5. For tools with `[detailed docs]`, call `get_tool_documentation('tool.method')` first.
 
 Be creative and help users generate stunning images and videos."""
 

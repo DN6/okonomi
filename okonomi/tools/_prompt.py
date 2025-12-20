@@ -45,10 +45,10 @@ class PromptTools(ToolMetadataMixin):
             1. Provide comprehensive context including the user's request and any relevant information
             2. The tool will generate an optimized prompt based on all provided information
         """
-        system_prompt = """You are an expert prompt engineer for FLUX.2 text-to-image models.
+        system_prompt = """You are an expert prompt engineer for FLUX.1 text-to-image models.
         Your task is to transform context information into highly effective image generation prompts.
 
-        FLUX.2 PROMPT STRUCTURE (word order matters - earlier elements are prioritized):
+        FLUX.1 PROMPT STRUCTURE (word order matters - earlier elements are prioritized):
         Subject → Action → Style → Context
 
         - Subject: Main focus (person, object, character) with detailed attributes
@@ -73,12 +73,6 @@ class PromptTools(ToolMetadataMixin):
         - Use quotation marks: "The text 'OPEN' appears in red neon letters"
         - Specify placement relative to other elements
         - Describe style: "elegant serif typography," "bold industrial lettering"
-        - Use hex codes for branded text: "logo text 'ACME' in color #FF5733"
-
-        HEX COLOR CODES:
-        Associate hex codes with specific objects:
-        - "The vase has color #02eb3c"
-        - "The background is hex #1a1a2e"
 
         IMPORTANT RULES:
         - NO negative prompts - describe what you WANT, not what to avoid

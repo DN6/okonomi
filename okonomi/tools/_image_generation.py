@@ -1,9 +1,6 @@
 """Tools for AI-powered image generation, editing, and transformation."""
 
 import fal_client
-from rich.console import Console
-from rich.live import Live
-from rich.spinner import Spinner
 
 from okonomi.tools._metadata import ToolMetadataMixin
 
@@ -68,17 +65,11 @@ class ImageGenerationTools(ToolMetadataMixin):
                 kwargs["loras"] = [{"path": url, "scale": scale} for url, scale in lora_id]
 
             model_id = self.config.inference_providers.fal.text_to_image_model_id
-            console = Console()
-            with Live(
-                Spinner("dots", text="[#CD5C5C]Generating image...[/#CD5C5C]", style="#CD5C5C"),
-                console=console,
-                refresh_per_second=10,
-            ):
-                result = self.fal_client.subscribe(
-                    model_id,
-                    arguments=kwargs,
-                    with_logs=True,
-                )
+            result = self.fal_client.subscribe(
+                model_id,
+                arguments=kwargs,
+                with_logs=True,
+            )
 
             return {
                 "images": [img["url"] for img in result["images"]],
@@ -90,7 +81,7 @@ class ImageGenerationTools(ToolMetadataMixin):
 
     async def edit_image(
         self,
-        prompt: str,
+        structured_prompt: str,
         image: str,
         image_size: str = "portrait_16_9",
         seed: int = 42,
@@ -115,7 +106,7 @@ class ImageGenerationTools(ToolMetadataMixin):
         """
         try:
             kwargs = {
-                "prompt": prompt,
+                "prompt": structured_prompt,
                 "seed": seed,
                 "guidance_scale": 2.0,
                 "num_inference_steps": 28,
@@ -125,17 +116,11 @@ class ImageGenerationTools(ToolMetadataMixin):
             }
 
             model_id = self.config.inference_providers.fal.edit_image_model_id
-            console = Console()
-            with Live(
-                Spinner("dots", text="[#CD5C5C]Editing image...[/#CD5C5C]", style="#CD5C5C"),
-                console=console,
-                refresh_per_second=10,
-            ):
-                result = self.fal_client.subscribe(
-                    model_id,
-                    arguments=kwargs,
-                    with_logs=True,
-                )
+            result = self.fal_client.subscribe(
+                model_id,
+                arguments=kwargs,
+                with_logs=True,
+            )
 
             return {
                 "images": [img["url"] for img in result["images"]],
@@ -147,7 +132,7 @@ class ImageGenerationTools(ToolMetadataMixin):
 
     async def reference_image(
         self,
-        prompt: str,
+        structured_prompt: str,
         images: str | list[str],
         image_size: str = "portrait_16_9",
         seed: int = 42,
@@ -207,7 +192,7 @@ class ImageGenerationTools(ToolMetadataMixin):
                 image_urls = [self.image_to_uri(img) for img in images]
 
             kwargs = {
-                "prompt": prompt,
+                "prompt": structured_prompt,
                 "seed": seed,
                 "guidance_scale": 2.5,
                 "num_inference_steps": 28,
@@ -217,17 +202,11 @@ class ImageGenerationTools(ToolMetadataMixin):
             }
 
             model_id = self.config.inference_providers.fal.edit_image_model_id
-            console = Console()
-            with Live(
-                Spinner("dots", text="[#CD5C5C]Generating with reference...[/#CD5C5C]", style="#CD5C5C"),
-                console=console,
-                refresh_per_second=10,
-            ):
-                result = self.fal_client.subscribe(
-                    model_id,
-                    arguments=kwargs,
-                    with_logs=True,
-                )
+            result = self.fal_client.subscribe(
+                model_id,
+                arguments=kwargs,
+                with_logs=True,
+            )
 
             return {
                 "images": [img["url"] for img in result["images"]],
@@ -273,17 +252,11 @@ class ImageGenerationTools(ToolMetadataMixin):
             }
 
             model_id = self.config.inference_providers.fal.multi_angle_model_id
-            console = Console()
-            with Live(
-                Spinner("dots", text="[#CD5C5C]Generating multiple angles...[/#CD5C5C]", style="#CD5C5C"),
-                console=console,
-                refresh_per_second=10,
-            ):
-                result = self.fal_client.subscribe(
-                    model_id,
-                    arguments=kwargs,
-                    with_logs=True,
-                )
+            result = self.fal_client.subscribe(
+                model_id,
+                arguments=kwargs,
+                with_logs=True,
+            )
 
             return {
                 "images": [img["url"] for img in result["images"]],

@@ -4,9 +4,6 @@ Provides tools for converting images to videos using AI models.
 """
 
 import fal_client
-from rich.console import Console
-from rich.live import Live
-from rich.spinner import Spinner
 
 from okonomi.tools._metadata import ToolMetadataMixin
 from okonomi.utils import image_to_uri
@@ -63,17 +60,11 @@ class VideoTools(ToolMetadataMixin):
             }
 
             model_id = self.config.inference_providers.fal.image_to_video_model_id
-            console = Console()
-            with Live(
-                Spinner("dots", text="[#CD5C5C]Generating video...[/#CD5C5C]", style="#CD5C5C"),
-                console=console,
-                refresh_per_second=10,
-            ):
-                result = self.fal_client.subscribe(
-                    model_id,
-                    arguments=kwargs,
-                    with_logs=True,
-                )
+            result = self.fal_client.subscribe(
+                model_id,
+                arguments=kwargs,
+                with_logs=True,
+            )
 
             return {
                 "video": result["video"]["url"],
@@ -107,23 +98,17 @@ class VideoTools(ToolMetadataMixin):
         """
         try:
             kwargs = {
-                "first_frame_url": image_to_uri(first_frame),
-                "last_frame_url": image_to_uri(last_frame),
+                "start_image_url": image_to_uri(first_frame),
+                "end_image_url": image_to_uri(last_frame),
                 "prompt": prompt,
             }
 
             model_id = self.config.inference_providers.fal.first_last_frame_to_video_model_id
-            console = Console()
-            with Live(
-                Spinner("dots", text="[#CD5C5C]Generating video from frames...[/#CD5C5C]", style="#CD5C5C"),
-                console=console,
-                refresh_per_second=10,
-            ):
-                result = self.fal_client.subscribe(
-                    model_id,
-                    arguments=kwargs,
-                    with_logs=True,
-                )
+            result = self.fal_client.subscribe(
+                model_id,
+                arguments=kwargs,
+                with_logs=True,
+            )
 
             return {
                 "video": result["video"]["url"],
