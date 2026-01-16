@@ -25,7 +25,7 @@ class ImageTools(ToolMetadataMixin):
         """
         self.config = config
 
-    async def load_image_from_url(self, url: str) -> dict:
+    def load_image_from_url(self, url: str) -> dict:
         """Load an image from a URL and return it as a PIL Image.
 
         Args:
@@ -52,7 +52,7 @@ class ImageTools(ToolMetadataMixin):
         except Exception as e:
             return {"error": str(e)}
 
-    async def load_images_from_urls(self, urls: List[str]) -> dict:
+    def load_images_from_urls(self, urls: List[str]) -> dict:
         """Load multiple images from URLs and return them as PIL Images.
 
         Args:
@@ -76,7 +76,7 @@ class ImageTools(ToolMetadataMixin):
         except Exception as e:
             return {"error": str(e)}
 
-    async def load_video_frames_from_url(
+    def load_video_frames_from_url(
         self,
         url: str,
         max_frames: int = 16,

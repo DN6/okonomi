@@ -28,7 +28,7 @@ class ImageGenerationTools(ToolMetadataMixin):
         """
         return image
 
-    async def text_to_image(
+    def text_to_image(
         self,
         prompt: str,
         lora_id: list[tuple[str, float]] = [],
@@ -79,7 +79,7 @@ class ImageGenerationTools(ToolMetadataMixin):
         except Exception as e:
             return {"error": str(e)}
 
-    async def edit_image(
+    def edit_image(
         self,
         structured_prompt: str,
         image: str,
@@ -130,7 +130,7 @@ class ImageGenerationTools(ToolMetadataMixin):
         except Exception as e:
             return {"error": str(e)}
 
-    async def reference_image(
+    def reference_image(
         self,
         structured_prompt: str,
         images: str | list[str],
@@ -202,56 +202,6 @@ class ImageGenerationTools(ToolMetadataMixin):
             }
 
             model_id = self.config.inference_providers.fal.edit_image_model_id
-            result = self.fal_client.subscribe(
-                model_id,
-                arguments=kwargs,
-                with_logs=True,
-            )
-
-            return {
-                "images": [img["url"] for img in result["images"]],
-                "model_id": model_id,
-            }
-
-        except Exception as e:
-            return {"error": str(e)}
-
-    async def generate_multiple_angles(
-        self,
-        image: str,
-        rotate_right_left: float = 0,
-        move_forward: float = 0,
-        wide_angle_lens: bool = False,
-        lora_scale: float = 1.25,
-    ) -> dict:
-        """Generate multiple viewing angles of an image using AI with camera control.
-
-        This tool takes a single image and generates multiple variations showing the subject
-        from different angles and perspectives based on camera movement parameters. Useful for
-        creating product shots, character turnarounds, or exploring different viewpoints.
-
-        Args:
-            image: URI to source image (URL or data URI from local file).
-            rotate_right_left: Horizontal rotation. Positive values rotate right, negative rotate left.
-                              Example: 50 = rotate right, -50 = rotate left.
-            move_forward: Forward camera movement amount (e.g., 3.6 for forward movement).
-            wide_angle_lens: If True, uses wide-angle lens for the shot.
-            lora_scale: LoRA scale for style control (default: 1.25).
-
-        Returns:
-            Dict with list of image URLs showing different angles, or error message if generation fails.
-            Example: {"images": ["https://...", "https://...", ...]}
-        """
-        try:
-            kwargs = {
-                "image_urls": [self.image_to_uri(image)],
-                "rotate_right_left": rotate_right_left,
-                "move_forward": move_forward,
-                "wide_angle_lens": wide_angle_lens,
-                "lora_scale": lora_scale,
-            }
-
-            model_id = self.config.inference_providers.fal.multi_angle_model_id
             result = self.fal_client.subscribe(
                 model_id,
                 arguments=kwargs,

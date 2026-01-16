@@ -176,7 +176,7 @@ class StrategiesTools(ToolMetadataMixin):
             "perspective_shifting": perspective_shifting,
         }
 
-    async def fetch_creative_strategy(self, strategy_name: str) -> dict:
+    def fetch_creative_strategy(self, strategy_name: str) -> dict:
         """Fetch instructions for a creative strategy that is essential to prompt creation.
 
         Args:
@@ -199,7 +199,7 @@ class StrategiesTools(ToolMetadataMixin):
         except Exception as e:
             return {"error": str(e)}
 
-    async def list_creative_strategies(self) -> dict:
+    def list_creative_strategies(self) -> dict:
         """List all available creative strategies for prompt creation with descriptions and examples.
 
         Returns:

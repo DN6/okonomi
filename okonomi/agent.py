@@ -107,8 +107,8 @@ class AgentDependencies:
         return self.tools.get(namespace)
 
 
-class AsyncToolWrapper:
-    """Wrapper that converts async tool methods to sync for code execution."""
+class ToolWrapper:
+    """Wrapper that adds tracking and tracing to tool method calls."""
 
     def __init__(self, tool_instance: Any, deps: AgentDependencies, namespace: str):
         self._tool_instance = tool_instance
@@ -118,44 +118,29 @@ class AsyncToolWrapper:
     def __getattr__(self, name: str) -> Any:
         attr = getattr(self._tool_instance, name)
 
-        if asyncio.iscoroutinefunction(attr):
+        if callable(attr) and not name.startswith("_"):
 
-            def sync_wrapper(*args, **kwargs):
+            def wrapper(*args, **kwargs):
                 tool_name = f"{self._namespace}.{name}"
 
-                # Use Langfuse observation for tool tracing
                 @observe(name=tool_name, as_type="tool")
                 def traced_call():
-                    try:
-                        import concurrent.futures
+                    return attr(*args, **kwargs)
 
-                        with concurrent.futures.ThreadPoolExecutor() as executor:
-                            future = executor.submit(asyncio.run, attr(*args, **kwargs))
-                            return future.result()
-                    except RuntimeError:
-                        return asyncio.run(attr(*args, **kwargs))
+                result = traced_call()
 
-                try:
-                    result = traced_call()
+                self._deps.tools_used.add(tool_name)
 
-                    # Track tool usage
-                    self._deps.tools_used.add(tool_name)
+                for key in ["image", "image_url", "video", "video_url", "first_frame", "last_frame"]:
+                    if key in kwargs and kwargs[key]:
+                        self._deps.add_input_asset(kwargs[key])
 
-                    # Track input assets from kwargs
-                    for key in ["image", "image_url", "video", "video_url", "first_frame", "last_frame"]:
-                        if key in kwargs and kwargs[key]:
-                            self._deps.add_input_asset(kwargs[key])
+                if isinstance(result, dict):
+                    self._track_outputs(result, name, kwargs)
 
-                    # Track outputs
-                    if isinstance(result, dict):
-                        self._track_outputs(result, name, kwargs)
+                return result
 
-                    return result
-
-                except Exception:
-                    raise
-
-            return sync_wrapper
+            return wrapper
         return attr
 
     def _track_outputs(self, result: dict, method_name: str, kwargs: dict) -> None:
@@ -476,7 +461,7 @@ Be creative and help users generate stunning images and videos."""
                 }
                 # Add wrapped tools
                 for namespace, tool_instance in ctx.deps.tools.items():
-                    ctx.deps.execution_globals[namespace] = AsyncToolWrapper(tool_instance, ctx.deps, namespace)
+                    ctx.deps.execution_globals[namespace] = ToolWrapper(tool_instance, ctx.deps, namespace)
 
                 # Add helper functions for tool discovery
                 def get_tools_readme() -> str:
@@ -559,9 +544,27 @@ Signature: `{method_name}{sig}`
                     """Alias for get_tool_documentation."""
                     return get_tool_documentation(method_path)
 
+                def get_session_dir() -> str:
+                    """Get the current session's directory path.
+
+                    Use this to save files (like stitched videos) to the session folder.
+
+                    Returns:
+                        Absolute path to the current session directory.
+
+                    Example:
+                        session_dir = get_session_dir()
+                        output_path = f"{session_dir}/final_video.mp4"
+                        result = video.stitch_videos(video_urls, output_path)
+                    """
+                    session_dir = ctx.deps.session_manager.get_session_dir(ctx.deps.session_id)
+                    session_dir.mkdir(parents=True, exist_ok=True)
+                    return str(session_dir)
+
                 ctx.deps.execution_globals["get_tools_readme"] = get_tools_readme
                 ctx.deps.execution_globals["get_tool_documentation"] = get_tool_documentation
                 ctx.deps.execution_globals["get_tool_method_documentation"] = get_tool_method_documentation
+                ctx.deps.execution_globals["get_session_dir"] = get_session_dir
 
             # Capture stdout and stderr
             stdout_capture = io.StringIO()

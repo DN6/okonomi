@@ -29,7 +29,6 @@ class HuggingfaceConfig:
 class FalConfig:
     text_to_image_model_id: str = "fal-ai/flux-lora"
     edit_image_model_id: str = "fal-ai/flux-2-pro/edit"
-    multi_angle_model_id: str = "fal-ai/qwen-image-edit-plus-lora-gallery/multiple-angles"
     image_to_video_model_id: str = "fal-ai/wan/v2.2-a14b/image-to-video"
     first_last_frame_to_video_model_id: str = "fal-ai/wan-flf2v"
 

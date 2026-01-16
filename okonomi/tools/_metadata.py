@@ -13,7 +13,7 @@ class ToolMetadataMixin:
         """Get metadata for all public methods in this tool class."""
         metadata = {"namespace": self.__namespace__, "description": self.__description__, "methods": {}}
 
-        for name, method in inspect.getmembers(self, predicate=inspect.iscoroutinefunction):
+        for name, method in inspect.getmembers(self, predicate=inspect.ismethod):
             if name.startswith("_"):
                 continue
 
@@ -58,7 +58,7 @@ class ToolMetadataMixin:
 
             metadata["methods"][name] = {
                 "description": short_desc,
-                "signature": f"async def {name}({params_str}) -> {return_type}",
+                "signature": f"{name}({params_str}) -> {return_type}",
                 "parameters": parameters,
                 "returns": return_type,
                 "docstring": doc,

@@ -21,7 +21,7 @@ class SessionTools(ToolMetadataMixin):
         self.config = config
         self.manager = SessionManager()
 
-    async def list_sessions(self, limit: int = 10, status: Optional[str] = None) -> dict:
+    def list_sessions(self, limit: int = 10, status: Optional[str] = None) -> dict:
         """List past generation sessions.
 
         Args:
@@ -52,7 +52,7 @@ class SessionTools(ToolMetadataMixin):
         except Exception as e:
             return {"error": str(e)}
 
-    async def get_session_details(self, session_id: str) -> dict:
+    def get_session_details(self, session_id: str) -> dict:
         """Get detailed information about a specific session.
 
         Args:
@@ -72,7 +72,7 @@ class SessionTools(ToolMetadataMixin):
         except Exception as e:
             return {"error": str(e)}
 
-    async def search_sessions(self, query: str, limit: int = 10) -> dict:
+    def search_sessions(self, query: str, limit: int = 10) -> dict:
         """Search past sessions by task description.
 
         Args:
@@ -102,7 +102,7 @@ class SessionTools(ToolMetadataMixin):
         except Exception as e:
             return {"error": str(e)}
 
-    async def view_session_images(self, session_id: str) -> dict:
+    def view_session_images(self, session_id: str) -> dict:
         """View all images generated in a specific session.
 
         Args:
@@ -122,7 +122,7 @@ class SessionTools(ToolMetadataMixin):
         except Exception as e:
             return {"error": str(e)}
 
-    async def search_outputs(
+    def search_outputs(
         self, query: Optional[str] = None, asset_type: Optional[str] = None, limit: int = 20
     ) -> dict:
         """Search for outputs across all sessions.
@@ -146,7 +146,7 @@ class SessionTools(ToolMetadataMixin):
         except Exception as e:
             return {"error": str(e)}
 
-    async def get_latest_session(self) -> dict:
+    def get_latest_session(self) -> dict:
         """Get the most recent generation session.
 
         Returns:
@@ -163,7 +163,7 @@ class SessionTools(ToolMetadataMixin):
         except Exception as e:
             return {"error": str(e)}
 
-    async def delete_session(self, session_id: str) -> dict:
+    def delete_session(self, session_id: str) -> dict:
         """Delete a session and all its data.
 
         Args:

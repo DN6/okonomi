@@ -3,7 +3,12 @@
 Provides tools for converting images to videos using AI models.
 """
 
+import subprocess
+import tempfile
+from pathlib import Path
+
 import fal_client
+import httpx
 
 from okonomi.tools._metadata import ToolMetadataMixin
 from okonomi.utils import image_to_uri
@@ -21,7 +26,7 @@ class VideoTools(ToolMetadataMixin):
         self.config = config
         self.fal_client = fal_client
 
-    async def image_to_video(
+    def image_to_video(
         self,
         prompt: str,
         image: str,
@@ -74,7 +79,7 @@ class VideoTools(ToolMetadataMixin):
         except Exception as e:
             return {"error": str(e)}
 
-    async def first_last_frame_to_video(
+    def first_last_frame_to_video(
         self,
         first_frame: str,
         last_frame: str,
@@ -114,6 +119,76 @@ class VideoTools(ToolMetadataMixin):
                 "video": result["video"]["url"],
                 "model_id": model_id,
             }
+
+        except Exception as e:
+            return {"error": str(e)}
+
+    def stitch_videos(
+        self,
+        video_urls: list[str],
+        output_path: str,
+    ) -> dict:
+        """Stitch multiple videos together into a single video file.
+
+        Downloads videos from URLs and concatenates them in order using ffmpeg.
+        The output is saved to the specified path.
+
+        Args:
+            video_urls: List of video URLs to stitch together, in order.
+            output_path: Path where the stitched video will be saved.
+                        Use get_session_dir() to save to the current session folder.
+
+        Returns:
+            Dict with output path, or error message if stitching fails.
+            Example: {"video_path": "/path/to/stitched_video.mp4"}
+        """
+        try:
+            # Create temp directory for downloaded videos
+            with tempfile.TemporaryDirectory() as temp_dir:
+                temp_path = Path(temp_dir)
+                video_files = []
+
+                # Download all videos
+                with httpx.Client(timeout=120.0) as client:
+                    for i, url in enumerate(video_urls):
+                        response = client.get(url, follow_redirects=True)
+                        response.raise_for_status()
+
+                        video_file = temp_path / f"video_{i:03d}.mp4"
+                        with open(video_file, "wb") as f:
+                            f.write(response.content)
+                        video_files.append(video_file)
+
+                # Create concat file for ffmpeg
+                concat_file = temp_path / "concat.txt"
+                with open(concat_file, "w") as f:
+                    for video_file in video_files:
+                        f.write(f"file '{video_file}'\n")
+
+                # Ensure output directory exists
+                output = Path(output_path)
+                output.parent.mkdir(parents=True, exist_ok=True)
+
+                # Run ffmpeg to concatenate videos
+                result = subprocess.run(
+                    [
+                        "ffmpeg",
+                        "-f", "concat",
+                        "-safe", "0",
+                        "-i", str(concat_file),
+                        "-c", "copy",
+                        "-y",
+                        str(output),
+                    ],
+                    capture_output=True,
+                    text=True,
+                    timeout=300,
+                )
+
+                if result.returncode != 0:
+                    return {"error": f"ffmpeg failed: {result.stderr}"}
+
+                return {"video_path": str(output)}
 
         except Exception as e:
             return {"error": str(e)}

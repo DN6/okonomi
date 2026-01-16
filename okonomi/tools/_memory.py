@@ -68,7 +68,7 @@ class MemoryTools(ToolMetadataMixin):
 
         return "\n".join(lines)
 
-    async def retrieve_from_memory(self, query: str, top_k: int = 3) -> dict:
+    def retrieve_from_memory(self, query: str, top_k: int = 3) -> dict:
         """Retrieve relevant information from past sessions using two-stage LLM retrieval.
 
         Stage 1: Scan session index (metadata) to find top matching sessions

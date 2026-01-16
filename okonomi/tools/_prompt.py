@@ -19,7 +19,7 @@ class PromptTools(ToolMetadataMixin):
         self.config = config
         self.client = InferenceClient(api_key=os.environ["HF_TOKEN"])
 
-    async def create_prompt(self, context: str) -> dict:
+    def create_prompt(self, context: str) -> dict:
         """Generate an optimized text-to-image prompt.
 
         This tool transforms context information into highly effective image generation prompts
@@ -114,7 +114,7 @@ class PromptTools(ToolMetadataMixin):
         except Exception as e:
             return {"error": str(e)}
 
-    async def create_structured_prompt(self, context: str) -> dict:
+    def create_structured_prompt(self, context: str) -> dict:
         """Generate a JSON structured prompt for complex scenes with precise control.
 
         Use this instead of create_prompt when you need:
@@ -253,7 +253,7 @@ class PromptTools(ToolMetadataMixin):
         except Exception as e:
             return {"error": str(e)}
 
-    async def describe_image(self, image_url: str) -> dict:
+    def describe_image(self, image_url: str) -> dict:
         """Generate a detailed description of an image from its URI.
 
         This tool analyzes an image and provides a comprehensive description that can be used

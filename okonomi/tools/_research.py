@@ -26,7 +26,7 @@ class ResearchTools(ToolMetadataMixin):
         else:
             self.tavily_client = None
 
-    async def search_web(
+    def search_web(
         self,
         query: str,
         max_results: int = 5,
@@ -74,7 +74,7 @@ class ResearchTools(ToolMetadataMixin):
         except Exception as e:
             return {"error": str(e), "query": query}
 
-    async def get_search_context(
+    def get_search_context(
         self,
         query: str,
         max_results: int = 5,
@@ -105,7 +105,7 @@ class ResearchTools(ToolMetadataMixin):
         except Exception as e:
             return {"error": str(e), "query": query}
 
-    async def qna_search(self, query: str, search_depth: str = "advanced") -> dict:
+    def qna_search(self, query: str, search_depth: str = "advanced") -> dict:
         """Get a direct answer to a question using Tavily's QNA search.
 
         Args:
@@ -129,7 +129,7 @@ class ResearchTools(ToolMetadataMixin):
         except Exception as e:
             return {"error": str(e), "query": query}
 
-    async def find_loras(self, query: str, max_results: int = 3) -> dict:
+    def find_loras(self, query: str, max_results: int = 3) -> dict:
         """Find relevant LoRA models for a given style, effect, or use case.
 
         Searches through the available FLUX LoRA catalog and uses an LLM to find
@@ -221,7 +221,7 @@ Return only the JSON array, no other text."""
         except Exception as e:
             return {"error": str(e), "query": query}
 
-    async def refresh_loras_catalog(self) -> dict:
+    def refresh_loras_catalog(self) -> dict:
         """Refresh the LoRA catalog by fetching the latest from Hugging Face.
 
         Call this to update the local LoRA catalog with any new LoRAs that have
