@@ -4,6 +4,7 @@ import tempfile
 from io import BytesIO
 from pathlib import Path
 from typing import List
+from urllib.parse import urlparse
 
 import httpx
 from PIL import Image
@@ -14,9 +15,15 @@ from okonomi.tools._metadata import ToolMetadataMixin
 REQUEST_TIMEOUT = 120
 
 
-class ImageTools(ToolMetadataMixin):
+def _is_url(uri: str) -> bool:
+    """Check if a string is a URL."""
+    parsed = urlparse(uri)
+    return parsed.scheme in ("http", "https") and bool(parsed.netloc)
+
+
+class EditingTools(ToolMetadataMixin):
     __namespace__ = "image"
-    __description__ = "Tools for loading images and videos from URLs"
+    __description__ = "Tools for loading and editing images and videos from URIs (URLs or file paths)"
 
     def __init__(self, config):
         """
@@ -25,50 +32,30 @@ class ImageTools(ToolMetadataMixin):
         """
         self.config = config
 
-    def load_image_from_url(self, url: str) -> dict:
-        """Load an image from a URL and return it as a PIL Image.
+    def load_images(self, uris: str | List[str]) -> dict:
+        """Load images from URIs (URLs or file paths) and return them as PIL Images.
 
         Args:
-            url: URL of the image to load.
-
-        Returns:
-            Dict with PIL Image object or error message.
-            Example: {"image": <PIL.Image>, "width": 1920, "height": 1080, "format": "JPEG"}
-        """
-        try:
-            with httpx.Client(timeout=REQUEST_TIMEOUT) as client:
-                response = client.get(url)
-                response.raise_for_status()
-
-            image = Image.open(BytesIO(response.content))
-
-            return {
-                "image": image,
-                "width": image.width,
-                "height": image.height,
-                "format": image.format,
-            }
-
-        except Exception as e:
-            return {"error": str(e)}
-
-    def load_images_from_urls(self, urls: List[str]) -> dict:
-        """Load multiple images from URLs and return them as PIL Images.
-
-        Args:
-            urls: List of URLs of images to load.
+            uris: Single URI or list of URIs (URLs or local file paths) to load.
 
         Returns:
             Dict with list of PIL Image objects or error message.
             Example: {"images": [<PIL.Image>, ...], "count": 3}
         """
         try:
+            if isinstance(uris, str):
+                uris = [uris]
+
             images = []
             with httpx.Client(timeout=REQUEST_TIMEOUT) as client:
-                for url in urls:
-                    response = client.get(url)
-                    response.raise_for_status()
-                    image = Image.open(BytesIO(response.content))
+                for uri in uris:
+                    if _is_url(uri):
+                        response = client.get(uri)
+                        response.raise_for_status()
+                        image = Image.open(BytesIO(response.content))
+
+                    else:
+                        image = Image.open(uri)
                     images.append(image)
 
             return {"images": images, "count": len(images)}
@@ -76,19 +63,19 @@ class ImageTools(ToolMetadataMixin):
         except Exception as e:
             return {"error": str(e)}
 
-    def load_video_frames_from_url(
+    def load_video_frames(
         self,
-        url: str,
+        uri: str,
         max_frames: int = 16,
         sample_rate: int = 1,
     ) -> dict:
-        """Load a video from URL and extract frames as PIL Images.
+        """Load a video from a URI (URL or file path) and extract frames as PIL Images.
 
-        Downloads the video and extracts frames at the specified sample rate.
+        Downloads the video (if URL) and extracts frames at the specified sample rate.
         Useful for video analysis or processing individual frames.
 
         Args:
-            url: URL of the video to load.
+            uri: URL or local file path of the video to load.
             max_frames: Maximum number of frames to extract (default: 16).
             sample_rate: Extract every Nth frame (default: 1 = every frame).
 
@@ -99,25 +86,27 @@ class ImageTools(ToolMetadataMixin):
         try:
             import imageio.v3 as iio
 
-            # Download video to temp file
-            with httpx.Client(timeout=REQUEST_TIMEOUT) as client:
-                response = client.get(url)
-                response.raise_for_status()
+            if _is_url(uri):
+                with httpx.Client(timeout=REQUEST_TIMEOUT) as client:
+                    response = client.get(uri)
+                    response.raise_for_status()
 
-            with tempfile.NamedTemporaryFile(suffix=".mp4", delete=False) as tmp:
-                tmp.write(response.content)
-                tmp_path = tmp.name
+                with tempfile.NamedTemporaryFile(suffix=".mp4", delete=False) as tmp:
+                    tmp.write(response.content)
+                    video_path = tmp.name
+                cleanup_temp = True
+            else:
+                video_path = uri
+                cleanup_temp = False
 
-            # Get video metadata
-            meta = iio.immeta(tmp_path, plugin="pyav")
+            meta = iio.immeta(video_path, plugin="pyav")
             fps = meta.get("fps", 30.0)
             duration = meta.get("duration", 0.0)
 
-            # Extract frames using imageio
             frames = []
             frame_idx = 0
 
-            for frame in iio.imiter(tmp_path, plugin="pyav"):
+            for frame in iio.imiter(video_path, plugin="pyav"):
                 if len(frames) >= max_frames:
                     break
 
@@ -127,8 +116,8 @@ class ImageTools(ToolMetadataMixin):
 
                 frame_idx += 1
 
-            # Clean up temp file
-            Path(tmp_path).unlink(missing_ok=True)
+            if cleanup_temp:
+                Path(video_path).unlink(missing_ok=True)
 
             return {
                 "frames": frames,

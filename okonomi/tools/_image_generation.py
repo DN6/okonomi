@@ -3,11 +3,12 @@
 import fal_client
 
 from okonomi.tools._metadata import ToolMetadataMixin
+from okonomi.utils import image_to_uri
 
 
 class ImageGenerationTools(ToolMetadataMixin):
     __namespace__ = "image_generation"
-    __description__ = "Tools for AI-powered image generation, editing, and transformation using FLUX models"
+    __description__ = "Tools for prompt based AI-powered image generation, editing, and transformation"
 
     def __init__(self, config):
         """
@@ -17,54 +18,33 @@ class ImageGenerationTools(ToolMetadataMixin):
         self.fal_client = fal_client
         self.config = config
 
-    def image_to_uri(self, image: str) -> str:
-        """Convert image path/URL to URI format.
-
-        Args:
-            image: Image path or URL
-
-        Returns:
-            Formatted URI string
-        """
-        return image
-
     def text_to_image(
         self,
         prompt: str,
-        lora_id: list[tuple[str, float]] = [],
         image_size: str = "portrait_16_9",
         seed: int = 42,
     ) -> dict:
-        """Generate images using FLUX text-to-image model with optional LoRA support.
+        """Generate images using FLUX text-to-image model.
 
         Args:
             prompt: Text description with subject, style, composition, lighting details.
-                   Include LoRA trigger words in the prompt for best results.
-            lora_id: List of (url, scale) tuples for LoRA models. Scale: 0.6-1.0.
-                    When combining multiple LoRAs ensure the sum of scales stays under 1.5.
-                    Use research.find_loras() to discover available LoRAs.
-                    Example: [("https://huggingface.co/.../lora.safetensors", 0.9)]
             image_size: Dimensions (square_hd, square, portrait/landscape_4_3/16_9).
             seed: Random seed for reproducibility.
 
         Returns:
-            Dict with image URL.
+            Dict with "images" (list of URL strings), or "error" (str) on failure.
         """
         try:
             kwargs = {
                 "prompt": prompt,
                 "seed": seed,
                 "guidance_scale": 3.5,
-                "num_inference_steps": 28,
+                "num_inference_steps": 40,
                 "image_size": image_size,
                 "num_images": 1,
             }
 
-            # Add LoRAs if provided
-            if lora_id:
-                kwargs["loras"] = [{"path": url, "scale": scale} for url, scale in lora_id]
-
-            model_id = self.config.inference_providers.fal.text_to_image_model_id
+            model_id = self.config.fal.text_to_image_model_id
             result = self.fal_client.subscribe(
                 model_id,
                 arguments=kwargs,
@@ -73,7 +53,6 @@ class ImageGenerationTools(ToolMetadataMixin):
 
             return {
                 "images": [img["url"] for img in result["images"]],
-                "model_id": model_id,
             }
 
         except Exception as e:
@@ -81,10 +60,8 @@ class ImageGenerationTools(ToolMetadataMixin):
 
     def edit_image(
         self,
-        structured_prompt: str,
+        prompt: str,
         image: str,
-        image_size: str = "portrait_16_9",
-        seed: int = 42,
     ) -> dict:
         """Tool to edit the contents of an image. Supports object changes, style transfer, and text edits.
 
@@ -102,29 +79,18 @@ class ImageGenerationTools(ToolMetadataMixin):
             seed: Random seed.
 
         Returns:
-            Dict with edited image URL.
+            Dict with "images" (list of URL strings), or "error" (str) on failure.
         """
         try:
-            kwargs = {
-                "prompt": structured_prompt,
-                "seed": seed,
-                "guidance_scale": 2.0,
-                "num_inference_steps": 28,
-                "image_size": image_size,
-                "num_images": 1,
-                "image_urls": [self.image_to_uri(image)],
-            }
-
-            model_id = self.config.inference_providers.fal.edit_image_model_id
+            kwargs = {"prompt": prompt, "image_urls": [image_to_uri(image)]}
+            model_id = self.config.fal.edit_image_model_id
             result = self.fal_client.subscribe(
                 model_id,
                 arguments=kwargs,
-                with_logs=True,
             )
 
             return {
                 "images": [img["url"] for img in result["images"]],
-                "model_id": model_id,
             }
 
         except Exception as e:
@@ -132,14 +98,14 @@ class ImageGenerationTools(ToolMetadataMixin):
 
     def reference_image(
         self,
-        structured_prompt: str,
+        prompt: str,
         images: str | list[str],
         image_size: str = "portrait_16_9",
         seed: int = 42,
     ) -> dict:
         """Generate images using one or more reference images for style transfer, character consistency, or compositing.
 
-        FLUX.2 Multi-Reference Image Editing allows combining multiple input images to influence
+        Multi-Reference Image Editing allows combining multiple input images to influence
         the final output. Supports up to 8 reference images at 1MP output resolution.
 
         KEY USE CASES:
@@ -182,26 +148,24 @@ class ImageGenerationTools(ToolMetadataMixin):
             seed: Random seed for reproducibility.
 
         Returns:
-            Dict with generated image URL.
+            Dict with "images" (list of URL strings), or "error" (str) on failure.
         """
         try:
             # Handle single image or list of images
             if isinstance(images, str):
-                image_urls = [self.image_to_uri(images)]
+                image_urls = [image_to_uri(images)]
             else:
-                image_urls = [self.image_to_uri(img) for img in images]
+                image_urls = [image_to_uri(img) for img in images]
 
             kwargs = {
-                "prompt": structured_prompt,
+                "prompt": prompt,
                 "seed": seed,
-                "guidance_scale": 2.5,
-                "num_inference_steps": 28,
                 "image_size": image_size,
                 "num_images": 1,
                 "image_urls": image_urls,
             }
 
-            model_id = self.config.inference_providers.fal.edit_image_model_id
+            model_id = self.config.fal.edit_image_model_id
             result = self.fal_client.subscribe(
                 model_id,
                 arguments=kwargs,
@@ -210,7 +174,6 @@ class ImageGenerationTools(ToolMetadataMixin):
 
             return {
                 "images": [img["url"] for img in result["images"]],
-                "model_id": model_id,
             }
 
         except Exception as e:

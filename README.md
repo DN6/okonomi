@@ -6,7 +6,6 @@ Okonomi is an Agent meant for experimenting with creative image creation.
 
 - **Creative Strategy Tools**: Leverages multiple creative thinking techniques to generate unique prompts
 - **Multi-modal Image Generation**: Support for text-to-image, image-to-image, image editing, and style transfer
-- **LoRA Integration**: Dynamic loading and combination of LoRA models for enhanced control
 - **Session Memory**: Session-based memory for tracking and learning from past generations
 - **Automatic Evaluation**: Built-in evaluation system for prompt and image quality
 - **MCP Tools**: Modular tool architecture for extensibility
@@ -122,7 +121,7 @@ Okonomi includes several MCP (Model Context Protocol) tools:
 
 - **prompt.py**: Creative prompt generation and image description
 - **image.py**: Image generation tools (text-to-image, image-to-image, editing)
-- **memory.py**: Memory management and LoRA discovery
+- **memory.py**: Memory management
 - **strategies.py**: Creative strategy selection
 
 ## Troubleshooting

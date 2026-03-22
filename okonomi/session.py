@@ -27,7 +27,6 @@ class GeneratedOutput:
     prompt: str = ""
     tool_name: str = ""
     model_id: str = ""
-    loras: List[tuple] = field(default_factory=list)
     timestamp: str = ""
     local_path: str = ""  # Local file path after download
 
@@ -55,6 +54,7 @@ class SessionMetadata:
     tools_used: List[str] = field(default_factory=list)
     models_used: List[str] = field(default_factory=list)
     has_input_assets: bool = False
+    token_usage: Optional[Dict[str, int]] = None
 
     def to_dict(self) -> Dict[str, Any]:
         return asdict(self)
@@ -70,10 +70,10 @@ class Session:
 
     metadata: SessionMetadata
     generated_outputs: List[GeneratedOutput] = field(default_factory=list)
-    input_assets: List[str] = field(default_factory=list)  # URLs/paths of input images/videos
-    steps_summary: str = ""  # LLM-generated summary of actions + user feedback
-    loras_used: List[tuple] = field(default_factory=list)  # [(lora_url, scale), ...]
+    input_assets: List[str] = field(default_factory=list)
+    steps_summary: str = ""
     errors: List[str] = field(default_factory=list)
+    message_history: Optional[List[Any]] = None
 
     def to_dict(self) -> Dict[str, Any]:
         return {
@@ -81,7 +81,6 @@ class Session:
             "generated_outputs": [o.to_dict() for o in self.generated_outputs],
             "input_assets": self.input_assets,
             "steps_summary": self.steps_summary,
-            "loras_used": self.loras_used,
             "errors": self.errors,
         }
 
@@ -93,7 +92,6 @@ class Session:
             generated_outputs=outputs,
             input_assets=data.get("input_assets", []),
             steps_summary=data.get("steps_summary", ""),
-            loras_used=data.get("loras_used", []),
             errors=data.get("errors", []),
         )
 
@@ -110,7 +108,7 @@ class SessionManager:
         """
         if storage_dir is None:
             # Try to get from config
-            config_dir = config.memory.sessions.storage_dir
+            config_dir = config.context.sessions.storage_dir
             if config_dir:
                 storage_dir = Path(config_dir)
             else:
@@ -269,7 +267,8 @@ class SessionManager:
     def save_session(self, session: Session) -> None:
         """Save a session to disk.
 
-        Creates a folder for the session with session.json inside.
+        Writes session.json for metadata/outputs and messages.jsonl for
+        the conversation history (one JSON object per message).
 
         Args:
             session: Session to save
@@ -281,11 +280,22 @@ class SessionManager:
         with open(session_file, "w") as f:
             json.dump(session.to_dict(), f, indent=2)
 
-        # Update index
+        if session.message_history:
+            from pydantic_ai.messages import ModelMessagesTypeAdapter
+
+            messages_file = session_dir / "messages.jsonl"
+            serialized = json.loads(ModelMessagesTypeAdapter.dump_json(session.message_history))
+            with open(messages_file, "w") as f:
+                for msg in serialized:
+                    f.write(json.dumps(msg, ensure_ascii=False) + "\n")
+
         self._update_index(session.metadata)
 
     def load_session(self, session_id: str) -> Optional[Session]:
         """Load a session from disk.
+
+        Reads session.json and, if present, messages.jsonl to restore
+        the full conversation history.
 
         Args:
             session_id: ID of the session to load
@@ -302,7 +312,24 @@ class SessionManager:
         with open(session_file, "r") as f:
             data = json.load(f)
 
-        return Session.from_dict(data)
+        session = Session.from_dict(data)
+
+        messages_file = session_dir / "messages.jsonl"
+        if messages_file.exists():
+            try:
+                from pydantic_ai.messages import ModelMessagesTypeAdapter
+
+                raw_messages = []
+                with open(messages_file, "r") as f:
+                    for line in f:
+                        line = line.strip()
+                        if line:
+                            raw_messages.append(json.loads(line))
+                session.message_history = ModelMessagesTypeAdapter.validate_json(json.dumps(raw_messages))
+            except Exception:
+                pass
+
+        return session
 
     def list_sessions(self, limit: Optional[int] = None, status: Optional[str] = None) -> List[SessionMetadata]:
         """List all sessions.

@@ -1,10 +1,7 @@
 import json
-import os
-
-from huggingface_hub import InferenceClient
 
 from okonomi.tools._metadata import ToolMetadataMixin
-from okonomi.utils import image_to_uri
+from okonomi.utils import create_chat_client, image_to_uri
 
 
 class PromptTools(ToolMetadataMixin):
@@ -17,7 +14,24 @@ class PromptTools(ToolMetadataMixin):
             config: Configuration object containing model IDs and settings
         """
         self.config = config
-        self.client = InferenceClient(api_key=os.environ["HF_TOKEN"])
+        self._client = create_chat_client()
+
+    def _chat_completion(
+        self, system_prompt: str, user_message: str, temperature: float = 0.7, max_tokens: int = 1024
+    ) -> str:
+        """Create a chat completion using the configured provider."""
+        model_id = self.config.agent.model_id
+
+        response = self._client.chat.completions.create(
+            model=model_id,
+            messages=[
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": user_message},
+            ],
+            temperature=temperature,
+            max_tokens=max_tokens,
+        )
+        return response.choices[0].message.content
 
     def create_prompt(self, context: str) -> dict:
         """Generate an optimized text-to-image prompt.
@@ -45,10 +59,10 @@ class PromptTools(ToolMetadataMixin):
             1. Provide comprehensive context including the user's request and any relevant information
             2. The tool will generate an optimized prompt based on all provided information
         """
-        system_prompt = """You are an expert prompt engineer for FLUX.1 text-to-image models.
+        system_prompt = """You are an expert prompt engineer for text-to-image models.
         Your task is to transform context information into highly effective image generation prompts.
 
-        FLUX.1 PROMPT STRUCTURE (word order matters - earlier elements are prioritized):
+        PROMPT STRUCTURE (word order matters - earlier elements are prioritized):
         Subject → Action → Style → Context
 
         - Subject: Main focus (person, object, character) with detailed attributes
@@ -99,156 +113,13 @@ class PromptTools(ToolMetadataMixin):
         Output ONLY the prompt text itself, no explanations or additional formatting."""
 
         try:
-            completion = self.client.chat.completions.create(
-                model=self.config.inference_providers.huggingface.prompt_model_id,
-                messages=[
-                    {"role": "system", "content": system_prompt},
-                    {"role": "user", "content": user_message},
-                ],
-                temperature=self.config.inference_providers.huggingface.prompt_model_temperature,
-                max_tokens=self.config.inference_providers.huggingface.prompt_max_tokens,
+            generated_prompt = self._chat_completion(
+                system_prompt,
+                user_message,
+                temperature=0.7,
+                max_tokens=1024,
             )
-            generated_prompt = completion.choices[0].message.content
             return {"prompt": str(generated_prompt)}
-
-        except Exception as e:
-            return {"error": str(e)}
-
-    def create_structured_prompt(self, context: str) -> dict:
-        """Generate a JSON structured prompt for complex scenes with precise control.
-
-        Use this instead of create_prompt when you need:
-        - Complex scenes with multiple subjects and relationships
-        - Precise color control with hex codes for specific elements
-        - Production workflows requiring consistent structure
-        - Automation and programmatic generation
-        - Independent iteration on specific elements
-
-        For simple, single-subject scenes or quick creative exploration, use create_prompt instead.
-
-        Args:
-            context: Context information to guide prompt generation. This can include:
-                    - The user's request describing the complex scene they want
-                    - Multiple subjects and their relationships
-                    - Specific color requirements (brand colors, hex codes)
-                    - Camera and composition requirements
-                    - Style and mood specifications
-
-        Returns:
-            Dict containing:
-            - structured_prompt: JSON object with scene components
-
-        JSON Schema:
-            {
-                "scene": "overall scene description",
-                "subjects": [
-                    {
-                        "description": "detailed subject description",
-                        "position": "where in frame (left, center, right, foreground, background)",
-                        "action": "what they're doing",
-                        "colors": ["#hex1", "#hex2"]
-                    }
-                ],
-                "style": "artistic style or photographic approach",
-                "color_palette": ["#hex1", "#hex2", "#hex3"],
-                "lighting": "lighting description",
-                "mood": "emotional tone",
-                "background": "background details",
-                "composition": "framing and layout",
-                "camera": {
-                    "angle": "camera angle (eye-level, low, high, bird's eye)",
-                    "lens": "lens type (wide-angle, telephoto, 50mm, etc.)",
-                    "depth_of_field": "shallow, deep, or specific f-stop"
-                },
-                "text": {
-                    "content": "text to display",
-                    "style": "typography style",
-                    "color": "#hex",
-                    "position": "where in frame"
-                }
-            }
-        """
-        system_prompt = """You are an expert prompt engineer for FLUX.2 text-to-image models.
-        Your task is to create JSON structured prompts for complex image generation scenes.
-
-        JSON STRUCTURED PROMPTING provides precise control over:
-        - Multiple subjects with individual positioning and colors
-        - Exact color matching with hex codes
-        - Camera settings and composition
-        - Typography and text placement
-
-        OUTPUT FORMAT - Generate a valid JSON object with this schema:
-        {
-            "scene": "Brief overall scene description",
-            "subjects": [
-                {
-                    "description": "Detailed subject description with physical attributes",
-                    "position": "left/center/right/foreground/background",
-                    "action": "What the subject is doing or their pose",
-                    "colors": ["#hex1", "#hex2"] // Optional: specific colors for this subject
-                }
-            ],
-            "style": "Artistic style, medium, or photographic approach",
-            "color_palette": ["#hex1", "#hex2", "#hex3"], // Overall color scheme
-            "lighting": "Lighting type, direction, quality, time of day",
-            "mood": "Emotional tone and atmosphere",
-            "background": "Background environment details",
-            "composition": "Framing, layout, rule of thirds, etc.",
-            "camera": {
-                "angle": "eye-level/low/high/bird's eye/worm's eye",
-                "lens": "wide-angle/telephoto/50mm/85mm/etc.",
-                "depth_of_field": "shallow/deep/f-stop value",
-                "film_stock": "Optional: Kodak Portra 400, etc."
-            },
-            "text": { // Optional: only include if text is needed
-                "content": "The exact text to display",
-                "style": "Typography style (serif, sans-serif, neon, etc.)",
-                "color": "#hex",
-                "position": "where the text appears"
-            }
-        }
-
-        GUIDELINES:
-        - Include only relevant fields - omit optional fields if not needed
-        - Use hex codes for precise color control
-        - Be specific with subject descriptions
-        - Position subjects clearly relative to each other
-        - For photorealism, specify camera/lens/film in the camera object
-
-        IMPORTANT: Output ONLY valid JSON, no explanations or markdown formatting."""
-
-        user_message = f"""Create a JSON structured prompt based on the following context:
-
-        CONTEXT:
-        {context}
-
-        Analyze the request and create a structured JSON prompt that provides precise control over all elements.
-        Output ONLY the JSON object, no explanations."""
-
-        try:
-            completion = self.client.chat.completions.create(
-                model=self.config.inference_providers.huggingface.prompt_model_id,
-                messages=[
-                    {"role": "system", "content": system_prompt},
-                    {"role": "user", "content": user_message},
-                ],
-                temperature=self.config.inference_providers.huggingface.prompt_model_temperature,
-                max_tokens=self.config.inference_providers.huggingface.prompt_max_tokens,
-            )
-            generated_content = completion.choices[0].message.content.strip()
-
-            # Try to parse as JSON to validate
-            try:
-                # Remove markdown code blocks if present
-                if generated_content.startswith("```"):
-                    lines = generated_content.split("\n")
-                    generated_content = "\n".join(lines[1:-1])
-                structured_prompt = json.loads(generated_content)
-            except json.JSONDecodeError:
-                # Return raw content if JSON parsing fails
-                structured_prompt = generated_content
-
-            return {"structured_prompt": structured_prompt}
 
         except Exception as e:
             return {"error": str(e)}
@@ -327,11 +198,11 @@ class PromptTools(ToolMetadataMixin):
                 ],
             }
 
-            completion = self.client.chat.completions.create(
-                model=self.config.inference_providers.huggingface.image_text_model_id,
+            completion = self._client.chat.completions.create(
+                model=self.config.agent.vision_model_id,
                 messages=[{"role": "system", "content": system_prompt}, user_message],
-                temperature=0.3,  # Lower temperature for more consistent descriptions
-                max_tokens=self.config.inference_providers.huggingface.prompt_max_tokens,
+                temperature=0.3,
+                max_tokens=1024,
             )
 
             description = completion.choices[0].message.content

@@ -9,8 +9,8 @@ from dotenv import load_dotenv
 
 @dataclass
 class AgentConfig:
-    model_id: str = "claude-sonnet-4-5"
-    model_provider: str = "anthropic"
+    model_id: str = "anthropic/claude-sonnet-4-5"
+    vision_model_id: str = "anthropic/claude-sonnet-4-5"
     temperature: float = 0.2
     top_p: float = 1.0
     max_steps: int = 50
@@ -18,25 +18,11 @@ class AgentConfig:
 
 
 @dataclass
-class HuggingfaceConfig:
-    prompt_model_id: str = "Qwen/Qwen3-VL-30B-A3B-Instruct"
-    prompt_model_temperature: float = 0.6
-    prompt_max_tokens: int = 512
-    image_text_model_id: str = "Qwen/Qwen3-VL-30B-A3B-Instruct"
-
-
-@dataclass
 class FalConfig:
-    text_to_image_model_id: str = "fal-ai/flux-lora"
+    text_to_image_model_id: str = "fal-ai/bytedance/seedream/v4.5/text-to-image"
     edit_image_model_id: str = "fal-ai/flux-2-pro/edit"
-    image_to_video_model_id: str = "fal-ai/wan/v2.2-a14b/image-to-video"
-    first_last_frame_to_video_model_id: str = "fal-ai/wan-flf2v"
-
-
-@dataclass
-class InferenceProvidersConfig:
-    huggingface: HuggingfaceConfig = field(default_factory=HuggingfaceConfig)
-    fal: FalConfig = field(default_factory=FalConfig)
+    image_to_video_model_id: str = "fal-ai/ltx-2-19b/image-to-video"
+    first_last_frame_to_video_model_id: str = "fal-ai/ltx-2-19b/image-to-video"
 
 
 @dataclass
@@ -45,19 +31,8 @@ class McpConfig:
 
 
 @dataclass
-class CallbacksConfig:
-    autoeval: bool = True
-
-
-@dataclass
 class ToolsConfig:
     mcp: McpConfig = field(default_factory=McpConfig)
-    callbacks: CallbacksConfig = field(default_factory=CallbacksConfig)
-
-
-@dataclass
-class HuggingfaceMemoryConfig:
-    image_repo_id: str = ""
 
 
 @dataclass
@@ -67,17 +42,15 @@ class SessionConfig:
 
 
 @dataclass
-class MemoryConfig:
-    huggingface: HuggingfaceMemoryConfig = field(default_factory=HuggingfaceMemoryConfig)
+class ContextConfig:
     sessions: SessionConfig = field(default_factory=SessionConfig)
-    max_messages: int = 25
-    truncation_strategy: str = "sliding_window"  # "sliding_window" or "keep_first_last"
-    summarize: bool = True  # Use LLM to summarize truncated messages
+    context_length: int = 200_000
+    compression_threshold: float = 0.85
 
 
 @dataclass
 class EnvironmentVariablesConfig:
-    required: List[str] = field(default_factory=lambda: ["ANTHROPIC_API_KEY", "HF_TOKEN", "FAL_KEY"])
+    required: List[str] = field(default_factory=lambda: ["OPENROUTER_API_KEY", "HF_TOKEN", "FAL_KEY"])
 
 
 @dataclass
@@ -91,29 +64,15 @@ class TimeoutConfig:
 
 
 @dataclass
-class TracingConfig:
-    """Tracing/observability settings using Langfuse.
-
-    Langfuse configuration is done via environment variables:
-    - LANGFUSE_PUBLIC_KEY: Your Langfuse public key
-    - LANGFUSE_SECRET_KEY: Your Langfuse secret key
-    - LANGFUSE_HOST: Langfuse host (default: https://cloud.langfuse.com)
-    """
-
-    enabled: bool = os.getenv("OKONOMI_TRACE", "false").lower() in ["true", "1"]
-
-
-@dataclass
 class DefaultConfig:
     """Main configuration class for Okonomi."""
 
     agent: AgentConfig = field(default_factory=AgentConfig)
-    inference_providers: InferenceProvidersConfig = field(default_factory=InferenceProvidersConfig)
+    fal: FalConfig = field(default_factory=FalConfig)
     tools: ToolsConfig = field(default_factory=ToolsConfig)
-    memory: MemoryConfig = field(default_factory=MemoryConfig)
+    context: ContextConfig = field(default_factory=ContextConfig)
     environment_variables: EnvironmentVariablesConfig = field(default_factory=EnvironmentVariablesConfig)
     timeouts: TimeoutConfig = field(default_factory=TimeoutConfig)
-    tracing: TracingConfig = field(default_factory=TracingConfig)
 
     def to_dict(self) -> Dict[str, Any]:
         """Convert the config to a dictionary."""
@@ -201,9 +160,9 @@ class OkonomiConfig:
         return self._config.agent
 
     @property
-    def inference_providers(self) -> InferenceProvidersConfig:
-        """Get inference providers configuration."""
-        return self._config.inference_providers
+    def fal(self) -> FalConfig:
+        """Get Fal configuration."""
+        return self._config.fal
 
     @property
     def tools(self) -> ToolsConfig:
@@ -211,14 +170,14 @@ class OkonomiConfig:
         return self._config.tools
 
     @property
-    def memory(self) -> MemoryConfig:
-        """Get memory configuration."""
-        return self._config.memory
+    def context(self) -> ContextConfig:
+        """Get context configuration."""
+        return self._config.context
 
     @property
     def sessions(self) -> SessionConfig:
         """Get session configuration."""
-        return self._config.memory.sessions
+        return self._config.context.sessions
 
     @property
     def environment_variables(self) -> EnvironmentVariablesConfig:
@@ -229,11 +188,6 @@ class OkonomiConfig:
     def timeouts(self) -> TimeoutConfig:
         """Get timeout configuration."""
         return self._config.timeouts
-
-    @property
-    def tracing(self) -> TracingConfig:
-        """Get tracing configuration."""
-        return self._config.tracing
 
 
 # Global configuration instance
