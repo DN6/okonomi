@@ -619,9 +619,7 @@ Signature: `{method_name}{sig}`
                     result += f"\nStderr:\n{stderr_output}"
 
                 output_text = result.strip() if result.strip() else "Code executed successfully"
-                is_skill_load = "skills.load_skill" in code
-                if not is_skill_load:
-                    print_ansi_box(output_text, label="output")
+                print_ansi_box(output_text, label="output")
 
                 return result.strip() if result.strip() else "Code executed successfully (no output)"
 
