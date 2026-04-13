@@ -17,10 +17,12 @@ import logging
 import os
 import shutil
 import threading
+from pathlib import Path
 import time
 from queue import Queue
 
 from prompt_toolkit.application import Application
+from prompt_toolkit.history import FileHistory
 from prompt_toolkit.completion import Completer, Completion
 from prompt_toolkit.filters import has_completions
 from prompt_toolkit.key_binding import KeyBindings
@@ -34,8 +36,9 @@ from prompt_toolkit.widgets import TextArea
 from .agent import OkonomiAgent
 from .config import config
 from .display import (
-    BOLD, CYAN, DIM, GREEN, PINK, RED, RST, SPINNER_FRAMES, YELLOW,
-    get_task_input, print_interrupt, print_loading_art, print_user_message,
+    BOLD, CYAN, DIM, GREEN, PINK, RED, RST, YELLOW,
+    get_task_input, highlight_code, print_interrupt, print_loading_art, print_user_message,
+    spinner_formatted_text,
 )
 
 
@@ -44,13 +47,8 @@ logging.getLogger("httpcore").setLevel(logging.WARNING)
 
 
 def _print_welcome() -> None:
-    w = shutil.get_terminal_size().columns
-
     print_loading_art()
     print()
-    label = "What's on your mind?"
-    pad = (w - len(label)) // 2
-    print(f"\033[38;2;215;135;175;1m{' ' * pad}{label}{RST}\n")
 
 
 # =============================================================================
@@ -119,16 +117,14 @@ def resolve_session(args: argparse.Namespace) -> str | None:
     if args.resume:
         latest = manager.get_latest_session()
         if latest:
-            print(f"{BOLD}{GREEN}Resuming from session: {latest.metadata.session_id}{RST}")
-            print(f"Previous task: {latest.metadata.task_input}\n")
+            print(f"{BOLD}{GREEN}Resuming: {latest.metadata.display_name}{RST}\n")
             return latest.metadata.session_id
         print(f"{YELLOW}No previous sessions found. Starting new session.{RST}\n")
         return None
 
     session = manager.load_session(args.session)
     if session:
-        print(f"{BOLD}{GREEN}Loaded session: {args.session}{RST}")
-        print(f"Task: {session.metadata.task_input}\n")
+        print(f"{BOLD}{GREEN}Loaded: {session.metadata.display_name}{RST}\n")
         return args.session
 
     print(f"{RED}Session {args.session} not found. Starting new session.{RST}\n")
@@ -162,6 +158,7 @@ Examples:
     parser.add_argument("--session", "-s", type=str, help="Load specific session by ID")
     parser.add_argument("--list-sessions", action="store_true", help="List all past sessions")
     parser.add_argument("--search-outputs", type=str, metavar="QUERY", help="Search outputs across sessions")
+    parser.add_argument("--discord", action="store_true", help="Run as a Discord bot")
     parser.add_argument("--verbose", "-V", action="store_true", help="Show executed code and output")
     parser.add_argument("--version", "-v", action="version", version="okonomi 0.1.0")
 
@@ -175,9 +172,15 @@ Examples:
 
 SLASH_COMMANDS: list[tuple[str, str]] = [
     ("/help", "Show available commands"),
+    ("/bg", "Run a task in the background"),
     ("/clear", "Clear conversation history"),
     ("/reset", "Clear conversation history"),
-    ("/resume", "Resume a past session (or /resume <query>)"),
+    ("/session", "Browse and resume a past session"),
+    ("/last", "Resume the most recent session"),
+    ("/title", "Set/show session title"),
+    ("/fav", "Favourite the last generated media asset"),
+    ("/favs", "List all favourited assets"),
+    ("/prune", "Delete empty sessions older than 24h"),
     ("/save", "Save current session"),
     ("/exit", "End session"),
     ("/quit", "End session"),
@@ -234,48 +237,52 @@ COMPLETION_STYLE = PTStyle.from_dict(
 )
 
 
-def _handle_resume(command: str, agent: OkonomiAgent) -> bool:
-    """Handle /resume with optional search query."""
-    from .session import SessionManager
 
-    manager = SessionManager()
-    query = command[7:].strip() if len(command) > 7 else ""
-
-    if query:
-        direct = manager.load_session(query)
-        if direct:
-            if agent.load_session(query):
-                print(f"{GREEN}Resumed session: {query[:8]}...{RST}")
-                print(f"{DIM}Task: {direct.metadata.task_input}{RST}")
-            else:
-                print(f"{RED}Failed to load session.{RST}")
-            return True
-
-        sessions = manager.search_sessions(query, limit=10)
-        if not sessions:
-            print(f"{YELLOW}No sessions matching '{query}'.{RST}")
-            return True
-    else:
-        sessions = manager.list_sessions(limit=10)
-        if not sessions:
-            print(f"{YELLOW}No past sessions found.{RST}")
-            return True
-
-    if len(sessions) == 1:
-        s = sessions[0]
-        if agent.load_session(s.session_id):
-            print(f"{GREEN}Resumed session: {s.session_id[:8]}...{RST}")
-            print(f"{DIM}Task: {s.task_input}{RST}")
-        else:
-            print(f"{RED}Failed to load session.{RST}")
+def _handle_fav(agent: OkonomiAgent) -> bool:
+    outputs = agent.generated_outputs
+    if not outputs:
+        print(f"{DIM}No generated media in this session.{RST}")
         return True
 
-    print(f"\n{BOLD}Sessions:{RST}")
-    for i, s in enumerate(sessions, 1):
-        task_preview = s.task_input[:60] + ("..." if len(s.task_input) > 60 else "")
-        print(f"{DIM}  {i}. [{s.session_id[:8]}] {task_preview}{RST}")
-        print(f"{DIM}     {s.created_at}  {s.status}  {s.num_outputs} outputs{RST}")
-    print(f"\n{DIM}Type /resume <query> to narrow results, or copy a session ID.{RST}\n")
+    last = outputs[-1]
+    local = last.local_path
+    if not local or not os.path.exists(local):
+        print(f"{DIM}Last output has no local file yet. Try /save first.{RST}")
+        return True
+
+    session_dir = agent.session_manager.get_session_dir(agent.session_id)
+    favs = session_dir / "favourites"
+    favs.mkdir(parents=True, exist_ok=True)
+
+    src = Path(local)
+    dest = favs / src.name
+
+    if dest.exists() or dest.is_symlink():
+        print(f"{DIM}Already favourited: {src.name}{RST}")
+        return True
+
+    dest.symlink_to(src.resolve())
+    print(f"{PINK}★{RST} {DIM}Favourited: {src.name}{RST}")
+    return True
+
+
+def _handle_favs(agent: OkonomiAgent) -> bool:
+    session_dir = agent.session_manager.get_session_dir(agent.session_id)
+    favs = session_dir / "favourites"
+
+    if not favs.exists():
+        print(f"{DIM}No favourites in this session. Use /fav to favourite the last generated asset.{RST}")
+        return True
+
+    links = sorted(favs.iterdir())
+    if not links:
+        print(f"{DIM}No favourites in this session. Use /fav to favourite the last generated asset.{RST}")
+        return True
+
+    print(f"\n{DIM}Favourites ({len(links)}):{RST}")
+    for link in links:
+        print(f"  {PINK}★{RST} {link.name}")
+    print()
     return True
 
 
@@ -291,11 +298,44 @@ def _handle_command(command: str, agent: OkonomiAgent) -> str | bool:
         print(f"{DIM}Conversation cleared.{RST}")
         agent.message_history = []
         return True
-    elif cmd == "/resume" or cmd.startswith("/resume "):
-        return _handle_resume(command, agent)
+    elif cmd == "/last":
+        sessions = agent.session_manager.list_sessions(limit=1)
+        if sessions:
+            if agent.load_session(sessions[0].session_id):
+                print(f"{GREEN}Resumed: {sessions[0].display_name}{RST}")
+            else:
+                print(f"{RED}Failed to load last session.{RST}")
+        else:
+            print(f"{DIM}No previous sessions.{RST}")
+        return True
+    elif cmd.startswith("/title"):
+        title_text = command[6:].strip()
+        if title_text:
+            if agent.session_manager.set_title(agent.session_id, title_text):
+                print(f"{DIM}Title set: {title_text}{RST}")
+            else:
+                print(f"{RED}Failed to set title (conflict or session not saved yet).{RST}")
+        else:
+            index = agent.session_manager._read_index()
+            for entry in index:
+                if entry["session_id"] == agent.session_id:
+                    title = entry.get("title", "")
+                    print(f"{DIM}Title: {title or '(none)'}{RST}")
+                    break
+            else:
+                print(f"{DIM}Title: (none — save session first){RST}")
+        return True
+    elif cmd == "/fav":
+        return _handle_fav(agent)
+    elif cmd == "/favs":
+        return _handle_favs(agent)
+    elif cmd == "/prune":
+        count = agent.session_manager.prune_empty_sessions()
+        print(f"{DIM}Pruned {count} empty session{'s' if count != 1 else ''}.{RST}")
+        return True
     elif cmd == "/save":
         agent.save_session(status="saved")
-        print(f"{DIM}Session saved: {agent.session_id}{RST}")
+        print(f"{DIM}Session saved.{RST}")
         return True
     elif cmd == "/help":
         print(f"\n{DIM}Commands:{RST}")
@@ -321,19 +361,28 @@ def _handle_command(command: str, agent: OkonomiAgent) -> str | bool:
 # =============================================================================
 
 
-def _shutdown_loop(loop: asyncio.AbstractEventLoop) -> None:
-    """Cancel remaining tasks and close the event loop cleanly."""
+def _shutdown_loop(loop: asyncio.AbstractEventLoop, timeout: float = 2.0) -> None:
+    """Cancel remaining tasks and close the event loop.
+
+    Uses a timeout to avoid blocking indefinitely when threads are stuck
+    in blocking calls (e.g. FAL API requests via asyncio.to_thread).
+    """
     try:
         pending = asyncio.all_tasks(loop)
         for t in pending:
             t.cancel()
         if pending:
-            loop.run_until_complete(asyncio.gather(*pending, return_exceptions=True))
+            async def _wait():
+                await asyncio.wait(pending, timeout=timeout)
+            loop.run_until_complete(_wait())
         loop.run_until_complete(loop.shutdown_asyncgens())
     except Exception:
         pass
     finally:
-        loop.close()
+        try:
+            loop.close()
+        except Exception:
+            pass
 
 
 class InteractiveSession:
@@ -359,6 +408,112 @@ class InteractiveSession:
         self._input_queue: Queue[str | None] = Queue()
         self._next_reset = False
 
+        self._session_candidates: list | None = None
+        self._prompt_style = ("#d787af bold", "> ")
+
+        self._approval_queue: Queue[str] = Queue()
+        self._awaiting_approval = False
+        self._show_code_panel = False
+        self.agent.approval_callback = self._approval_callback
+
+        self._bg_tasks: dict[str, threading.Thread] = {}
+        self._bg_counter = 0
+
+    async def _approval_callback(self, code: str) -> bool | str:
+        """Called by the agent before running expensive code. Blocks until user responds.
+
+        Returns True to run, False to skip, or a feedback string for the agent to revise.
+        """
+        print(f"\n{YELLOW}Run this code? [Enter] approve / [a] approve all / [n] skip / or type feedback{RST}")
+        self._awaiting_approval = True
+        self._prompt_style = ("#ffaf00 bold", "approve> ")
+
+        decision = await asyncio.to_thread(self._approval_queue.get)
+
+        self._awaiting_approval = False
+        self._prompt_style = ("#d787af bold", "> ")
+
+        d = decision.strip().lower()
+        if d in ("y", "yes", ""):
+            return True
+        if d in ("a", "all", "approve all"):
+            return "__auto_approve__"
+        if d in ("n", "no", "skip"):
+            return False
+        return decision.strip()
+
+    def _enter_session_mode(self) -> None:
+        from .session import SessionManager
+
+        manager = SessionManager()
+        sessions = manager.list_sessions(limit=20)
+        if not sessions:
+            print(f"{YELLOW}No past sessions found.{RST}")
+            return
+
+        self._session_candidates = sessions
+        self._prompt_style = ("#00cc66 bold", "session> ")
+        self._print_session_list(sessions)
+        print(f"{DIM}Type to filter, number to select, Enter to cancel.{RST}\n")
+
+    def _print_session_list(self, sessions: list) -> None:
+        print()
+        for i, s in enumerate(sessions, 1):
+            name = s.display_name
+            date = s.created_at[:10] if s.created_at else ""
+            outputs = f"{s.num_outputs} outputs" if s.num_outputs else "no outputs"
+            print(f"  {BOLD}{i}.{RST} {name}")
+            print(f"     {DIM}{date}  {outputs}  [{s.session_id[:12]}]{RST}")
+        print()
+
+    def _handle_session_input(self, text: str) -> None:
+        candidates = self._session_candidates or []
+
+        if text.isdigit():
+            idx = int(text) - 1
+            if 0 <= idx < len(candidates):
+                self._select_session(candidates[idx])
+                return
+            print(f"{RED}Invalid number. Pick 1-{len(candidates)}.{RST}")
+            return
+
+        from .session import SessionManager
+        manager = SessionManager()
+
+        direct = manager.load_session(text)
+        if direct:
+            self._session_candidates = None
+            self._prompt_style = ("#d787af bold", "> ")
+            if self.agent.load_session(text):
+                self._next_reset = False
+                print(f"{GREEN}Resumed: {direct.metadata.display_name}{RST}")
+                print(f"{DIM}Task: {direct.metadata.task_input}{RST}")
+            else:
+                print(f"{RED}Failed to load session.{RST}")
+            return
+
+        filtered = manager.search_sessions(text, limit=20)
+        if not filtered:
+            print(f"{YELLOW}No matches for '{text}'. Keep typing or Enter to cancel.{RST}")
+            return
+
+        if len(filtered) == 1:
+            self._select_session(filtered[0])
+            return
+
+        self._session_candidates = filtered
+        self._print_session_list(filtered)
+
+    def _select_session(self, session_meta) -> None:
+        self._session_candidates = None
+        self._prompt_style = ("#d787af bold", "> ")
+        if self.agent.load_session(session_meta.session_id):
+            self._next_reset = False
+            print(f"{GREEN}Resumed: {session_meta.display_name}{RST}")
+            print(f"{DIM}{session_meta.created_at[:10]}  [{session_meta.session_id[:12]}]{RST}")
+        else:
+            print(f"{RED}Failed to load session.{RST}")
+
     def _build_app(self) -> Application:
         session = self
 
@@ -368,29 +523,56 @@ class InteractiveSession:
 
         completer = SlashCommandCompleter(skill_provider=_get_skills)
 
+        history_path = Path.home() / ".okonomi" / "input_history"
+        history_path.parent.mkdir(parents=True, exist_ok=True)
+        self._history = FileHistory(str(history_path))
+
         input_area = TextArea(
-            multiline=False,
-            prompt=[("#d787af bold", "> ")],
+            multiline=True,
+            prompt=lambda: [session._prompt_style],
             completer=completer,
             complete_while_typing=True,
             style="class:input-area",
-            height=Dimension(min=1, max=1),
+            height=Dimension(min=1, max=6),
+            history=self._history,
+            scrollbar=False,
         )
         self._input_area = input_area
 
-        def _rule_text():
-            w = shutil.get_terminal_size().columns
-            return [("#d787af", "\u2500" * w)]
+        rule = Window(height=0)
 
-        rule = Window(FormattedTextControl(_rule_text), height=1)
-        spacer = Window(height=Dimension(weight=1))
+        # Collapsible code preview panel (toggled via Ctrl+O)
+        def _code_panel_text():
+            code = session.agent._last_code
+            if not code:
+                return [("#888888", "  (no code executed yet)\n")]
+            highlighted = highlight_code(code)
+            lines = highlighted.split("\n")
+            result = [("#888888", " code preview "), ("#888888", "─" * 30 + "\n")]
+            for line in lines:
+                result.append(("", f" {line}\n"))
+            result.append(("#888888", "─" * 40 + " Ctrl+O to close\n"))
+            return result
+
+        def _code_panel_height():
+            if not session._show_code_panel:
+                return 0
+            code = session.agent._last_code
+            if not code:
+                return 3
+            return min(code.count("\n") + 4, 20)
+
+        code_panel = Window(
+            content=FormattedTextControl(_code_panel_text),
+            height=_code_panel_height,
+        )
 
         def _spinner_text():
             txt = session.agent.spinner_text
             if not txt:
                 return []
-            frame = SPINNER_FRAMES[int(time.monotonic() * 10) % len(SPINNER_FRAMES)]
-            return [("#00cc66", f"  {frame} {txt}")]
+            tick = int(time.monotonic() * 5)
+            return spinner_formatted_text(txt, tick)
 
         def _spinner_height():
             return 1 if session.agent.spinner_text else 0
@@ -404,15 +586,15 @@ class InteractiveSession:
             usage = session.agent.token_usage
             if usage.total_tokens:
                 return [("#888888", f" {usage} ")]
-            return [("#888888", f" session: {session.agent.session_id[:8]} ")]
+            return [("#888888", " ")]
 
-        status_bar = Window(FormattedTextControl(_status_text), height=3)
+        status_bar = Window(FormattedTextControl(_status_text), height=1)
 
         layout = Layout(
             HSplit(
                 [
-                    spacer,
                     spinner_widget,
+                    code_panel,
                     rule,
                     input_area,
                     CompletionsMenu(max_height=8),
@@ -424,12 +606,41 @@ class InteractiveSession:
 
         kb = KeyBindings()
 
+        @kb.add("c-o")
+        def _toggle_code(event):
+            session._show_code_panel = not session._show_code_panel
+
         @kb.add("escape", "enter")
         def _newline(event):
             input_area.buffer.insert_text("\n")
 
+        @kb.add("up", filter=~has_completions)
+        def _history_prev(event):
+            buf = input_area.buffer
+            if "\n" in buf.text:
+                buf.cursor_up()
+            else:
+                buf.history_backward()
+
+        @kb.add("down", filter=~has_completions)
+        def _history_next(event):
+            buf = input_area.buffer
+            if "\n" in buf.text:
+                buf.cursor_down()
+            else:
+                buf.history_forward()
+
         @kb.add("escape")
         def _escape(event):
+            if session._awaiting_approval:
+                session._approval_queue.put("n")
+                return
+            if session._session_candidates is not None:
+                session._session_candidates = None
+                session._prompt_style = ("#d787af bold", "> ")
+                input_area.text = ""
+                print(f"{DIM}Cancelled.{RST}")
+                return
             if session._agent_running.is_set():
                 session._cancel_agent()
                 print_interrupt()
@@ -437,22 +648,55 @@ class InteractiveSession:
         @kb.add("enter", filter=has_completions)
         def _accept_completion(event):
             buf = event.current_buffer
-            if buf.complete_state:
+            if buf.complete_state and buf.complete_state.current_completion:
                 buf.apply_completion(buf.complete_state.current_completion)
 
         @kb.add("enter", filter=~has_completions)
         def _submit(event):
             text = input_area.text.strip()
+
+            if session._awaiting_approval:
+                input_area.text = ""
+                session._approval_queue.put(text if text else "y")
+                return
+
+            if session._session_candidates is not None:
+                input_area.text = ""
+                if not text:
+                    session._session_candidates = None
+                    session._prompt_style = ("#d787af bold", "> ")
+                    print(f"{DIM}Cancelled.{RST}")
+                    return
+                session._handle_session_input(text)
+                return
+
             if not text:
                 if session._agent_running.is_set():
                     session._cancel_agent()
                     print_interrupt()
                 return
 
-            input_area.text = ""
+            input_area.buffer.reset(append_to_history=True)
 
             if text.lower() in ["/exit", "/quit", "exit", "quit"]:
                 event.app.exit()
+                return
+
+            if text.lower().startswith("/bg "):
+                bg_input = text[4:].strip()
+                if bg_input:
+                    print_user_message(text)
+                    session._run_bg_task(bg_input)
+                else:
+                    print(f"{DIM}Usage: /bg <task description>{RST}")
+                return
+
+            if text.lower() == "/session" or text.lower().startswith("/session "):
+                query = text[8:].strip() if len(text) > 8 else ""
+                if query:
+                    session._handle_session_input(query)
+                else:
+                    session._enter_session_mode()
                 return
 
             if text.startswith("/"):
@@ -465,6 +709,10 @@ class InteractiveSession:
             if session._agent_running.is_set():
                 session._cancel_agent()
                 print_interrupt()
+                print_user_message(text)
+                print(f"{DIM}(queued — waiting for current operation to stop){RST}")
+                session._input_queue.put(text)
+                return
 
             print_user_message(text)
             session._input_queue.put(text)
@@ -507,8 +755,53 @@ class InteractiveSession:
             with self._agent_lock:
                 self._agent_task = None
                 self._agent_loop = None
-            _shutdown_loop(loop)
+            try:
+                _shutdown_loop(loop)
+            except Exception:
+                pass
             self._agent_running.clear()
+
+    def _run_bg_task(self, task_input: str) -> None:
+        """Run a task in the background with a separate agent, same session."""
+        from .agent import OkonomiAgent
+        from .utils import generate_title
+
+        self._bg_counter += 1
+        task_id = f"bg-{self._bg_counter}"
+        title = generate_title(task_input) or task_id
+        parent_agent = self.agent
+
+        print(f"{DIM}Background task started: {title}{RST}")
+
+        def _run():
+            try:
+                bg_agent = OkonomiAgent(
+                    parent_agent.config,
+                    session_id=parent_agent.session_id,
+                )
+                bg_agent.auto_approve = True
+
+                loop = asyncio.new_event_loop()
+                asyncio.set_event_loop(loop)
+                try:
+                    loop.run_until_complete(bg_agent.run_async(task_input, reset=True))
+                    parent_agent.generated_outputs.extend(bg_agent.generated_outputs)
+                    parent_agent.artifacts.extend(bg_agent.artifacts)
+                    parent_agent.tools_used.update(bg_agent.tools_used)
+                    n = len(bg_agent.generated_outputs)
+                    print(f"\n{GREEN}✓ Background done: {title} — {n} output{'s' if n != 1 else ''}{RST}")
+                except Exception as e:
+                    print(f"\n{RED}✗ Background failed: {title} — {e}{RST}")
+                finally:
+                    _shutdown_loop(loop)
+                    self._bg_tasks.pop(task_id, None)
+            except Exception as e:
+                print(f"\n{RED}✗ Background error: {title} — {e}{RST}")
+                self._bg_tasks.pop(task_id, None)
+
+        t = threading.Thread(target=_run, daemon=True, name=f"okonomi-{task_id}")
+        self._bg_tasks[task_id] = t
+        t.start()
 
     def _cancel_agent(self) -> None:
         with self._agent_lock:
@@ -516,6 +809,8 @@ class InteractiveSession:
             task = self._agent_task
         if loop and task and not task.done():
             loop.call_soon_threadsafe(task.cancel)
+            # Don't block — the worker thread will pick up CancelledError
+            # and move to the next queued message immediately.
 
     def _worker(self) -> None:
         """Background thread: pull messages from the queue and run the agent."""
@@ -534,6 +829,7 @@ class InteractiveSession:
                 self._next_reset = False
 
                 self._agent_running.set()
+                self.agent.spinner_text = "Thinking..."
                 self._run_agent(msg, reset=reset)
             except Exception as e:
                 print(f"{RED}Worker error: {e}{RST}")
@@ -550,13 +846,17 @@ class InteractiveSession:
         """Run the interactive session with a persistent floating input."""
         print("\033[2J\033[H", end="", flush=True)
 
-        if not initial_message:
-            _print_welcome()
-
         app = self._build_app()
         self._stop_refresh = threading.Event()
 
         with pt_patch_stdout(raw=True):
+            if not initial_message:
+                _print_welcome()
+
+            pruned = self.agent.session_manager.prune_empty_sessions()
+            if pruned:
+                print(f"{DIM}Pruned {pruned} empty session{'s' if pruned != 1 else ''}.{RST}")
+
             self._next_reset = True
             self._echo_first = bool(initial_message)
             if initial_message:
@@ -582,7 +882,7 @@ class InteractiveSession:
 
         try:
             self.agent.save_session(status="completed")
-            print(f"\033[2mSession saved: {self.agent.session_id}\033[0m")
+            print(f"\033[2mSession saved.\033[0m")
         except Exception as e:
             print(f"\033[31mError saving session: {e}\033[0m")
 
@@ -655,6 +955,15 @@ async def run_agent_async(args: argparse.Namespace, user_request: str) -> None:
 
 def main() -> None:
     args = parse_arguments()
+
+    if args.discord:
+        try:
+            from .integrations.discord_bot import run_discord_bot
+        except ImportError:
+            print(f"{RED}discord.py not installed. Run: pip install okonomi[discord]{RST}")
+            return
+        run_discord_bot()
+        return
 
     if args.list_sessions:
         handle_list_sessions()

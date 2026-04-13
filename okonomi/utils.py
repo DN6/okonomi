@@ -1,5 +1,6 @@
 import base64
 import os
+import re
 import uuid
 from io import BytesIO
 from pathlib import Path
@@ -69,3 +70,23 @@ def image_to_uri(image: str, max_size_mb: float = 3.5) -> str:
             ext = Path(image).suffix.lower()
             mime_type = "jpeg" if ext in [".jpg", ".jpeg"] else "png"
             return f"data:image/{mime_type};base64,{img_str}"
+
+
+_TITLE_STOP_WORDS = {
+    "a", "an", "the", "and", "or", "but", "in", "on", "at", "to", "for",
+    "of", "with", "by", "from", "is", "it", "that", "this", "my", "me",
+    "can", "you", "please", "i", "want", "would", "like", "make", "create",
+    "generate", "do", "some", "using", "use", "let", "lets", "also",
+}
+
+
+def generate_title(task_input: str) -> str:
+    """Extract a short title (3-5 meaningful words) from the first user message."""
+    text = task_input.strip()
+    if not text:
+        return ""
+    text = text.split("\n")[0]
+    words = re.findall(r"[a-zA-Z0-9]+", text.lower())
+    meaningful = [w for w in words if w not in _TITLE_STOP_WORDS and len(w) > 1]
+    title_words = meaningful[:5] or words[:5]
+    return " ".join(title_words) if title_words else ""

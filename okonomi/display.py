@@ -114,35 +114,171 @@ def print_code_box(code: str, label: str = "code", language: str = "python") -> 
 
 def print_user_message(text: str) -> None:
     """Echo the user's message into the output area."""
-    w = shutil.get_terminal_size().columns
-    print(f"\n{PINK}{'━' * w}{RST}")
+    print(f"\n{PINK}{'─' * 20}{RST}")
     if "\n" in text:
         first_line = text.split("\n")[0]
         line_count = text.count("\n") + 1
         print(f"{PINK}{BOLD}●{RST} {BOLD}{first_line}{RST} {DIM}(+{line_count - 1} lines){RST}")
     else:
         print(f"{PINK}{BOLD}●{RST} {BOLD}{text}{RST}")
+    print()
 
 
 def print_interrupt() -> None:
     print(f"{PINK}Interrupted.{RST} {DIM}History preserved.{RST}")
 
 
-_SUNSET_ART = [
-    ("240;135;175",  r"~^~^~^~^~^~^~^~^~^~^~"),
-    ("225;110;155",  r" ~^~^~^~^~^~^~^~^~^~ "),
-    ("210;90;135",   r"  ~^~  ~^~  ~^~  ~^~ "),
-    ("195;75;120",   r"    ~^~  ~^~  ~^~    "),
-    ("165;55;95",    r"      ~^~    ~^~     "),
+WAVE_COLORS = [
+    ("240;135;175", "#f087af"),
+    ("210;90;135",  "#d25a87"),
+    ("165;55;95",   "#a5375f"),
 ]
 
+_GRADIENT_STEPS = [
+    (215, 135, 175),
+    (195, 120, 158),
+    (175, 105, 141),
+    (155, 90, 124),
+    (135, 75, 107),
+    (115, 60, 90),
+    (95, 45, 73),
+    (75, 35, 58),
+]
 
-def print_loading_art() -> None:
-    """Print sakura wave reflection art, centered."""
+_BLOCK_CHARS = "█▓▒░"
+
+
+import math
+
+_HEARTBEAT_FRAMES = ["·", "•", "●", "◉", "●", "•", "·", " "]
+_HEARTBEAT_BRIGHTNESS = [0.4, 0.6, 0.8, 1.0, 0.8, 0.6, 0.4, 0.3]
+_EQ_BARS = "▁▂▃▄▅▆▇█"
+
+
+def _heartbeat(tick: int) -> list[tuple[str, str]]:
+    """Heartbeat — single dot expands and contracts with pulsing color."""
+    idx = tick % len(_HEARTBEAT_FRAMES)
+    br = _HEARTBEAT_BRIGHTNESS[idx]
+    r, g, b = int(215 * br), int(135 * br), int(175 * br)
+    return [(f"#{r:02x}{g:02x}{b:02x}", _HEARTBEAT_FRAMES[idx])]
+
+
+_TRAIL_DOTS = ["●", "●", "•", "·"]
+_TRAIL_BRIGHTNESS = [1.0, 0.7, 0.45, 0.25]
+
+
+def _trailing_dots(width: int, tick: int) -> list[tuple[str, str]]:
+    """Trailing dots — a dot sweeps across leaving a fading trail."""
+    cycle = width + 2
+    result = []
+    for i in range(width):
+        pos = (tick - i) % cycle
+        if pos < len(_TRAIL_DOTS):
+            br = _TRAIL_BRIGHTNESS[pos]
+            r, g, b = int(215 * br), int(135 * br), int(175 * br)
+            ch = _TRAIL_DOTS[pos]
+        else:
+            r, g, b = 25, 20, 23
+            ch = " "
+        result.append((f"#{r:02x}{g:02x}{b:02x}", ch))
+    return result
+
+
+def spinner_formatted_text(label: str, tick: int) -> list[tuple[str, str]]:
+    """Generate spinner animation.
+
+    Uses heartbeat for 'Thinking', trailing dots for everything else.
+    """
+    if "thinking" in label.lower():
+        blocks = _heartbeat(tick)
+    else:
+        blocks = _trailing_dots(4, tick)
+
+    result = [("", "  ")]
+    result.extend(blocks)
+    result.append(("", " "))
+    result.append(("bold #d787af", label))
+    return result
+
+
+def _wave_line(content_w: int, offset: int = 0) -> str:
+    """Generate a wave string of given width with animation offset."""
+    wave = "~^~"
+    shifted = wave[offset % 3:] + wave[:offset % 3]
+    return (shifted * (content_w // 3 + 2))[offset % 3: offset % 3 + content_w]
+
+
+def wave_formatted_text(label: str, w: int, tick: int = 0, mode: str = "diamond") -> list[tuple[str, str]]:
+    """Generate animated wave text as prompt_toolkit formatted text tuples.
+
+    Args:
+        label: Center text.
+        w: Terminal width.
+        tick: Animation tick (increment for movement).
+        mode: "diamond" for expanding waves above/below, "inline" for waves flanking text.
+
+    Returns:
+        List of (style, text) tuples for FormattedTextControl.
+    """
+    if mode == "inline":
+        wave_w = max((w - len(label) - 4) // 2, 6)
+        left = _wave_line(wave_w, tick)
+        right = _wave_line(wave_w, tick + 1)
+        pad = max((w - wave_w * 2 - len(label) - 2) // 2, 0)
+        return [
+            (WAVE_COLORS[0][1], " " * pad + left + " "),
+            ("bold #d787af", label),
+            (WAVE_COLORS[0][1], " " + right + "\n"),
+        ]
+
+    result = []
+
+    # Waves above (outermost first)
+    for i in range(len(WAVE_COLORS) - 1, -1, -1):
+        color_hex = WAVE_COLORS[i][1]
+        content_w = len(label) + (i + 1) * 6
+        line = _wave_line(content_w, tick + i)
+        pad = max((w - content_w) // 2, 0)
+        result.append((color_hex, " " * pad + line + "\n"))
+
+    # Label
+    pad = max((w - len(label)) // 2, 0)
+    result.append(("bold #d787af", " " * pad + label + "\n"))
+
+    # Waves below (innermost first)
+    for i in range(len(WAVE_COLORS)):
+        color_hex = WAVE_COLORS[i][1]
+        content_w = len(label) + (i + 1) * 6
+        line = _wave_line(content_w, tick + i + 1)
+        pad = max((w - content_w) // 2, 0)
+        result.append((color_hex, " " * pad + line + "\n"))
+
+    return result
+
+
+def _render_ft_ansi(formatted_text: list[tuple[str, str]]) -> str:
+    """Convert prompt_toolkit formatted text tuples to ANSI string."""
+    out = []
+    for style, text in formatted_text:
+        if "bold" in style:
+            out.append(f"\033[1m\033[38;2;215;135;175m{text}{RST}")
+        else:
+            hex_c = style.lstrip("#")
+            if len(hex_c) == 6:
+                r, g, b = int(hex_c[0:2], 16), int(hex_c[2:4], 16), int(hex_c[4:6], 16)
+                out.append(f"\033[38;2;{r};{g};{b}m{text}{RST}")
+            else:
+                out.append(text)
+    return "".join(out)
+
+
+def print_loading_art(label: str = "What's on your mind?") -> None:
+    """Print static sakura waves expanding outward from centered label."""
+    import sys
+
     w = shutil.get_terminal_size().columns
-    for color, line in _SUNSET_ART:
-        pad = (w - len(line)) // 2
-        print(f"\033[38;2;{color}m{' ' * pad}{line}{RST}")
+    sys.stdout.write(_render_ft_ansi(wave_formatted_text(label, w, 0)))
+    sys.stdout.flush()
 
 
 def print_rule() -> None:

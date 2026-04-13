@@ -7,15 +7,40 @@ generation history.
 
 import fcntl
 import json
+import re
 import shutil
 import uuid
 from contextlib import contextmanager
-from dataclasses import asdict, dataclass, field
+from dataclasses import asdict, dataclass, field, fields
 from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any, Dict, Generator, List, Optional
 
 from .config import config
+
+
+_ASSET_EXTENSIONS = {
+    "images": {".png", ".jpg", ".jpeg", ".webp", ".gif"},
+    "videos": {".mp4", ".webm", ".mov"},
+    "html": {".html", ".htm"},
+}
+
+
+def _slugify(text: str, max_len: int = 50) -> str:
+    text = text.lower().strip()
+    text = re.sub(r"[^\w\s-]", "", text)
+    text = re.sub(r"[\s_]+", "-", text)
+    text = re.sub(r"-+", "-", text)
+    text = text.strip("-")
+    return text[:max_len].rstrip("-")
+
+
+def asset_subdir_for_file(filename: str) -> str:
+    ext = Path(filename).suffix.lower()
+    for subdir, extensions in _ASSET_EXTENSIONS.items():
+        if ext in extensions:
+            return subdir
+    return "other"
 
 
 @dataclass
@@ -35,10 +60,29 @@ class GeneratedOutput:
 
     @classmethod
     def from_dict(cls, data: Dict[str, Any]) -> "GeneratedOutput":
-        # Handle older sessions without local_path
-        if "local_path" not in data:
-            data["local_path"] = ""
-        return cls(**data)
+        known = {f.name for f in fields(cls)}
+        filtered = {k: v for k, v in data.items() if k in known}
+        return cls(**filtered)
+
+
+@dataclass
+class Artifact:
+    """A file or resource created during a session."""
+
+    path: str
+    artifact_type: str  # "image", "video", "research", "skill", "download", "other"
+    description: str = ""
+    timestamp: str = ""
+    url: str = ""
+
+    def to_dict(self) -> Dict[str, Any]:
+        return asdict(self)
+
+    @classmethod
+    def from_dict(cls, data: Dict[str, Any]) -> "Artifact":
+        known = {f.name for f in fields(cls)}
+        filtered = {k: v for k, v in data.items() if k in known}
+        return cls(**filtered)
 
 
 @dataclass
@@ -51,17 +95,30 @@ class SessionMetadata:
     created_at: str
     updated_at: str
     num_outputs: int = 0
+    num_artifacts: int = 0
     tools_used: List[str] = field(default_factory=list)
     models_used: List[str] = field(default_factory=list)
     has_input_assets: bool = False
     token_usage: Optional[Dict[str, int]] = None
+    title: str = ""
+    dir_name: str = ""
 
     def to_dict(self) -> Dict[str, Any]:
         return asdict(self)
 
     @classmethod
     def from_dict(cls, data: Dict[str, Any]) -> "SessionMetadata":
-        return cls(**data)
+        known = {f.name for f in fields(cls)}
+        filtered = {k: v for k, v in data.items() if k in known}
+        return cls(**filtered)
+
+    @property
+    def display_name(self) -> str:
+        if self.title:
+            return self.title
+        if self.task_input:
+            return self.task_input[:60]
+        return self.session_id[:8]
 
 
 @dataclass
@@ -70,15 +127,26 @@ class Session:
 
     metadata: SessionMetadata
     generated_outputs: List[GeneratedOutput] = field(default_factory=list)
+    artifacts: List[Artifact] = field(default_factory=list)
     input_assets: List[str] = field(default_factory=list)
     steps_summary: str = ""
     errors: List[str] = field(default_factory=list)
     message_history: Optional[List[Any]] = None
 
+    def add_artifact(self, path: str, artifact_type: str, description: str = "", url: str = "") -> None:
+        self.artifacts.append(Artifact(
+            path=path,
+            artifact_type=artifact_type,
+            description=description,
+            timestamp=datetime.now().isoformat(),
+            url=url,
+        ))
+
     def to_dict(self) -> Dict[str, Any]:
         return {
             "metadata": self.metadata.to_dict(),
             "generated_outputs": [o.to_dict() for o in self.generated_outputs],
+            "artifacts": [a.to_dict() for a in self.artifacts],
             "input_assets": self.input_assets,
             "steps_summary": self.steps_summary,
             "errors": self.errors,
@@ -87,9 +155,11 @@ class Session:
     @classmethod
     def from_dict(cls, data: Dict[str, Any]) -> "Session":
         outputs = [GeneratedOutput.from_dict(o) for o in data.get("generated_outputs", [])]
+        artifacts = [Artifact.from_dict(a) for a in data.get("artifacts", [])]
         return cls(
             metadata=SessionMetadata.from_dict(data["metadata"]),
             generated_outputs=outputs,
+            artifacts=artifacts,
             input_assets=data.get("input_assets", []),
             steps_summary=data.get("steps_summary", ""),
             errors=data.get("errors", []),
@@ -231,8 +301,52 @@ class SessionManager:
         self._write_index(index)
 
     def create_session_id(self) -> str:
-        """Generate a new session ID."""
-        return str(uuid.uuid4())
+        """Generate a new session ID: YYYY-MM-DD_shortUUID."""
+        date_prefix = datetime.now().strftime("%Y-%m-%d")
+        short_uuid = uuid.uuid4().hex[:8]
+        return f"{date_prefix}_{short_uuid}"
+
+    def _dir_name_for_session(self, session_id: str, title: str = "") -> str:
+        """Derive a directory name from session ID and optional title."""
+        if title:
+            slug = _slugify(title)
+            if slug:
+                date_part = session_id[:10] if len(session_id) > 10 else datetime.now().strftime("%Y-%m-%d")
+                return f"{date_part}_{slug}"
+        return session_id
+
+    def set_title(self, session_id: str, title: str) -> bool:
+        """Set a title for a session, renaming its directory."""
+        old_dir = self.get_session_dir(session_id)
+        if not old_dir.exists():
+            return False
+
+        new_dir_name = self._dir_name_for_session(session_id, title)
+        new_dir = self.storage_dir / new_dir_name
+
+        if new_dir.exists() and new_dir != old_dir:
+            return False
+
+        if old_dir != new_dir:
+            old_dir.rename(new_dir)
+
+        session_file = new_dir / "session.json"
+        if session_file.exists():
+            with open(session_file, "r") as f:
+                data = json.load(f)
+            data["metadata"]["title"] = title
+            data["metadata"]["dir_name"] = new_dir_name
+            with open(session_file, "w") as f:
+                json.dump(data, f, indent=2)
+
+        index = self._read_index()
+        for entry in index:
+            if entry["session_id"] == session_id:
+                entry["title"] = title
+                entry["dir_name"] = new_dir_name
+                break
+        self._write_index(index)
+        return True
 
     def create_session(self, task_input: str) -> Session:
         """Create a new session with initialized metadata.
@@ -256,25 +370,43 @@ class SessionManager:
     def get_session_dir(self, session_id: str) -> Path:
         """Get the directory path for a session.
 
-        Args:
-            session_id: ID of the session
-
-        Returns:
-            Path to the session directory
+        Checks the index for a dir_name first (supports titled/renamed dirs),
+        falls back to using session_id as the directory name.
         """
+        index = self._read_index()
+        for entry in index:
+            if entry["session_id"] == session_id and entry.get("dir_name"):
+                return self.storage_dir / entry["dir_name"]
         return self.storage_dir / session_id
+
+    def get_asset_dir(self, session_id: str, asset_type: str = "") -> Path:
+        """Get the asset subdirectory for a session, creating it if needed."""
+        session_dir = self.get_session_dir(session_id)
+        if asset_type:
+            d = session_dir / "assets" / asset_type
+        else:
+            d = session_dir / "assets"
+        d.mkdir(parents=True, exist_ok=True)
+        return d
+
+    def get_asset_path(self, session_id: str, filename: str) -> Path:
+        """Get the full path for an asset file, routed to the correct subdirectory."""
+        subdir = asset_subdir_for_file(filename)
+        return self.get_asset_dir(session_id, subdir) / filename
 
     def save_session(self, session: Session) -> None:
         """Save a session to disk.
 
         Writes session.json for metadata/outputs and messages.jsonl for
         the conversation history (one JSON object per message).
-
-        Args:
-            session: Session to save
         """
-        session_dir = self.get_session_dir(session.metadata.session_id)
+        sid = session.metadata.session_id
+        if not session.metadata.dir_name:
+            session.metadata.dir_name = self._dir_name_for_session(sid, session.metadata.title)
+
+        session_dir = self.storage_dir / session.metadata.dir_name
         session_dir.mkdir(parents=True, exist_ok=True)
+        (session_dir / "assets").mkdir(exist_ok=True)
         session_file = session_dir / "session.json"
 
         with open(session_file, "w") as f:
@@ -366,27 +498,99 @@ class SessionManager:
 
         return self.load_session(sessions[0].session_id)
 
+    def resolve_session(self, query: str) -> Optional[SessionMetadata]:
+        """Resolve a query to a session. Tries: exact ID, prefix, title, fuzzy."""
+        index = self._read_index()
+        q = query.strip()
+
+        for entry in index:
+            if entry["session_id"] == q:
+                return SessionMetadata.from_dict(entry)
+
+        for entry in index:
+            if entry["session_id"].startswith(q):
+                return SessionMetadata.from_dict(entry)
+
+        q_lower = q.lower()
+        for entry in index:
+            title = entry.get("title", "")
+            if title and q_lower in title.lower():
+                return SessionMetadata.from_dict(entry)
+
+        results = self.search_sessions(q, limit=1)
+        return results[0] if results else None
+
     def search_sessions(self, query: str, limit: Optional[int] = None) -> List[SessionMetadata]:
-        """Search sessions by task content.
+        """Search sessions by task content, session ID, title, or tools/models used."""
+        index = self._read_index()
+        words = query.lower().split()
+        if not words:
+            return []
+
+        scored: list[tuple[int, dict]] = []
+        for entry in index:
+            searchable = " ".join([
+                entry.get("session_id", ""),
+                entry.get("task_input", ""),
+                entry.get("title", ""),
+                " ".join(entry.get("tools_used", [])),
+                " ".join(entry.get("models_used", [])),
+            ]).lower()
+
+            if all(w in searchable for w in words):
+                score = sum(searchable.count(w) for w in words)
+                scored.append((score, entry))
+
+        scored.sort(key=lambda x: x[0], reverse=True)
+        results = [entry for _, entry in scored]
+
+        if limit:
+            results = results[:limit]
+
+        return [SessionMetadata.from_dict(entry) for entry in results]
+
+    def prune_empty_sessions(self, min_age_hours: int = 24) -> int:
+        """Delete sessions with no outputs, no artifacts, and no extra files.
 
         Args:
-            query: Search query string
-            limit: Maximum number of results to return
-
-        Returns:
-            List of matching session metadata
+            min_age_hours: Only prune sessions older than this (default 24h).
         """
         index = self._read_index()
+        cutoff = datetime.now() - timedelta(hours=min_age_hours)
+        to_delete = []
 
-        # Simple text search in task_input field
-        query_lower = query.lower()
-        matches = [entry for entry in index if query_lower in entry.get("task_input", "").lower()]
+        for entry in index:
+            if entry.get("num_outputs", 0) > 0 or entry.get("num_artifacts", 0) > 0:
+                continue
 
-        # Apply limit
-        if limit:
-            matches = matches[:limit]
+            created = entry.get("created_at", "")
+            if created:
+                try:
+                    if datetime.fromisoformat(created) > cutoff:
+                        continue
+                except ValueError:
+                    pass
 
-        return [SessionMetadata.from_dict(entry) for entry in matches]
+            session_dir = self.get_session_dir(entry["session_id"])
+            if not session_dir.exists():
+                to_delete.append(entry["session_id"])
+                continue
+            files = {f.name for f in session_dir.rglob("*") if f.is_file() and not f.name.startswith(".")}
+            files -= {"session.json", "messages.jsonl", "index.json.lock"}
+            if not files:
+                to_delete.append(entry["session_id"])
+
+        for sid in to_delete:
+            session_dir = self.get_session_dir(sid)
+            if session_dir.exists():
+                shutil.rmtree(session_dir)
+
+        if to_delete:
+            remaining = [e for e in index if e["session_id"] not in set(to_delete)]
+            self._write_index(remaining)
+            self._invalidate_cache()
+
+        return len(to_delete)
 
     def delete_session(self, session_id: str) -> bool:
         """Delete a session and all its artifacts.

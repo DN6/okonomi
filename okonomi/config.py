@@ -19,10 +19,10 @@ class AgentConfig:
 
 @dataclass
 class FalConfig:
-    text_to_image_model_id: str = "fal-ai/bytedance/seedream/v4.5/text-to-image"
+    text_to_image_model_id: str = "fal-ai/flux-2-pro"
     edit_image_model_id: str = "fal-ai/flux-2-pro/edit"
-    image_to_video_model_id: str = "fal-ai/ltx-2-19b/image-to-video"
-    first_last_frame_to_video_model_id: str = "fal-ai/ltx-2-19b/image-to-video"
+    image_to_video_model_id: str = "fal-ai/veo3.1/fast/image-to-video"
+    first_last_frame_to_video_model_id: str = "fal-ai/veo3.1/fast/first-last-frame-to-video"
 
 
 @dataclass
@@ -46,6 +46,7 @@ class ContextConfig:
     sessions: SessionConfig = field(default_factory=SessionConfig)
     context_length: int = 200_000
     compression_threshold: float = 0.85
+    prune_threshold: float = 0.65
 
 
 @dataclass

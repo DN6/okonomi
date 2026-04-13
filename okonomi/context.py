@@ -8,6 +8,7 @@ to work with pydantic-ai's ModelMessage types.
 """
 
 import logging
+import re
 from typing import Optional
 
 from pydantic_ai.messages import (
@@ -41,23 +42,45 @@ _SUMMARY_RATIO = 0.20
 _DEFAULT_TAIL_TOKEN_BUDGET = 20_000
 _PRUNED_PLACEHOLDER = "[Old tool output cleared to save context space]"
 
+_BASE64_PATTERN = re.compile(r"data:image/[^;]+;base64,[A-Za-z0-9+/=]{100,}")
+_HTML_PREFIX_PATTERN = re.compile(r"^\s*(<(!DOCTYPE|html)\b)", re.IGNORECASE)
+
+
+def _strip_base64(text: str) -> str:
+    """Replace base64 data URIs with a short placeholder."""
+    def _replace(m):
+        size_kb = len(m.group(0)) * 3 // 4 // 1024
+        return f"[embedded image, ~{size_kb}KB]"
+    return _BASE64_PATTERN.sub(_replace, text)
+
+
+def _strip_large_content(text: str) -> str:
+    """Strip base64 and large HTML from a string."""
+    text = _strip_base64(text)
+    if len(text) > 500 and _HTML_PREFIX_PATTERN.match(text):
+        return f"[HTML content, {len(text)} chars — saved to file]"
+    return text
+
 
 def estimate_tokens_rough(messages: list[ModelMessage]) -> int:
-    """Rough token estimate for a pydantic-ai message list."""
+    """Rough token estimate for a pydantic-ai message list.
+
+    Strips base64 data URIs before counting to avoid massively inflated estimates.
+    """
     total_chars = 0
     for msg in messages:
         if isinstance(msg, ModelRequest):
             for part in msg.parts:
                 if hasattr(part, "content"):
-                    total_chars += len(str(part.content))
+                    total_chars += len(_strip_base64(str(part.content)))
                 if isinstance(part, ToolReturnPart):
                     total_chars += len(part.tool_name) + 10
         elif isinstance(msg, ModelResponse):
             for part in msg.parts:
                 if isinstance(part, TextPart):
-                    total_chars += len(part.content)
+                    total_chars += len(_strip_base64(part.content))
                 elif isinstance(part, ToolCallPart):
-                    total_chars += len(part.tool_name) + len(str(part.args)) + 10
+                    total_chars += len(part.tool_name) + len(_strip_base64(str(part.args))) + 10
     return total_chars // _CHARS_PER_TOKEN
 
 
@@ -98,6 +121,8 @@ class ContextManager:
         self.context_length = config.context.context_length
         self.threshold_percent = config.context.compression_threshold
         self.threshold_tokens = int(self.context_length * self.threshold_percent)
+        self.prune_threshold = getattr(config.context, "prune_threshold", 0.65)
+        self.prune_threshold_tokens = int(self.context_length * self.prune_threshold)
         self.protect_first_n = protect_first_n
         self.protect_last_n = protect_last_n
         self.compression_count = 0
@@ -124,6 +149,21 @@ class ContextManager:
     def should_compress_preflight(self, messages: list[ModelMessage]) -> bool:
         return estimate_tokens_rough(messages) >= self.threshold_tokens
 
+    def prune_if_needed(self, messages: list[ModelMessage]) -> tuple[list[ModelMessage], bool]:
+        """Lightweight prune pass at the lower threshold (no LLM summary).
+
+        Strips base64, large HTML, and old tool results. Runs at 65% of context.
+        """
+        est = estimate_tokens_rough(messages)
+        if est < self.prune_threshold_tokens:
+            return messages, False
+
+        messages, pruned = self._prune_old_tool_results(messages, self.protect_last_n * 3)
+        if pruned:
+            logger.info("Lightweight prune: stripped %d items at %d tokens (threshold %d)",
+                        pruned, est, self.prune_threshold_tokens)
+        return messages, pruned > 0
+
     # ------------------------------------------------------------------
     # Tool output pruning
     # ------------------------------------------------------------------
@@ -133,7 +173,10 @@ class ContextManager:
         messages: list[ModelMessage],
         protect_tail_count: int,
     ) -> tuple[list[ModelMessage], int]:
-        """Replace old tool result contents with a short placeholder."""
+        """Replace old tool result contents with a short placeholder.
+
+        Also strips base64 and large HTML from ALL messages (including tail).
+        """
         if not messages:
             return messages, 0
 
@@ -141,7 +184,7 @@ class ContextManager:
         prune_boundary = len(messages) - protect_tail_count
         result = list(messages)
 
-        for i in range(max(prune_boundary, 0)):
+        for i in range(len(result)):
             msg = result[i]
             if not isinstance(msg, ModelRequest):
                 continue
@@ -150,16 +193,35 @@ class ContextManager:
             for part in msg.parts:
                 if isinstance(part, ToolReturnPart):
                     content = str(part.content)
-                    if len(content) > 200 and content != _PRUNED_PLACEHOLDER:
-                        new_parts.append(
-                            ToolReturnPart(
-                                tool_name=part.tool_name,
-                                content=_PRUNED_PLACEHOLDER,
-                                tool_call_id=part.tool_call_id,
-                                timestamp=part.timestamp,
-                            )
-                        )
+                    stripped = _strip_large_content(content)
+                    if stripped != content:
+                        new_parts.append(ToolReturnPart(
+                            tool_name=part.tool_name,
+                            content=stripped,
+                            tool_call_id=part.tool_call_id,
+                            timestamp=part.timestamp,
+                        ))
                         pruned += 1
+                        changed = True
+                        continue
+                    if i < prune_boundary and len(content) > 100 and content != _PRUNED_PLACEHOLDER:
+                        new_parts.append(ToolReturnPart(
+                            tool_name=part.tool_name,
+                            content=_PRUNED_PLACEHOLDER,
+                            tool_call_id=part.tool_call_id,
+                            timestamp=part.timestamp,
+                        ))
+                        pruned += 1
+                        changed = True
+                        continue
+                elif isinstance(part, (TextPart, UserPromptPart)):
+                    content = str(part.content)
+                    stripped = _strip_base64(content)
+                    if stripped != content:
+                        if isinstance(part, UserPromptPart):
+                            new_parts.append(UserPromptPart(content=stripped, timestamp=part.timestamp))
+                        else:
+                            new_parts.append(TextPart(content=stripped))
                         changed = True
                         continue
                 new_parts.append(part)
@@ -391,7 +453,52 @@ Write only the summary body."""
             display_tokens - new_estimate,
         )
 
+        if self.compression_count >= 3:
+            print(
+                "\033[33mSession context compressed "
+                f"{self.compression_count} times. "
+                "Consider /clear for a fresh start or /save to preserve this work.\033[0m"
+            )
+
         return compressed, True
+
+    def build_resume_context(
+        self,
+        session_id: str,
+        task: str,
+        steps_summary: str,
+        generated_outputs: list | None = None,
+        artifacts: list | None = None,
+    ) -> list[ModelMessage]:
+        """Build a lightweight message history for a resumed session.
+
+        Instead of restoring the full conversation, injects a single
+        summary message with outputs and artifacts inline.
+        """
+        parts = [f"[Resumed session {session_id[:8]}]"]
+        parts.append(f"\nPrevious task: {task}")
+        if steps_summary:
+            parts.append(f"\n## Summary of previous work\n{steps_summary}")
+        if generated_outputs:
+            parts.append("\n## Generated outputs")
+            for i, o in enumerate(generated_outputs, 1):
+                line = f"{i}. {o.asset_type}: {o.asset_url}"
+                if o.prompt:
+                    line += f"\n   Prompt: {o.prompt}"
+                if o.tool_name:
+                    line += f"\n   Tool: {o.tool_name}"
+                parts.append(line)
+        if artifacts:
+            non_output_artifacts = [a for a in artifacts if a.artifact_type not in ("image", "video")]
+            if non_output_artifacts:
+                parts.append("\n## Artifacts")
+                for a in non_output_artifacts:
+                    line = f"- [{a.artifact_type}] {a.path}"
+                    if a.description:
+                        line += f": {a.description}"
+                    parts.append(line)
+
+        return [ModelRequest(parts=[UserPromptPart(content="\n".join(parts))])]
 
     def generate_steps_summary(self, messages: list[ModelMessage]) -> str:
         """Generate LLM summary of session actions."""

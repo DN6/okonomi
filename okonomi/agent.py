@@ -21,10 +21,21 @@ from pydantic_ai import Agent, RunContext
 from pydantic_ai.messages import ModelMessage, ModelRequest, ModelResponse, TextPart, ToolCallPart, ToolReturnPart
 from pydantic_ai.models.openrouter import OpenRouterModel
 
+# Patch: OpenRouter returns service_tier="standard" which pydantic-ai doesn't accept.
+# Widen the field to accept any string until upstream fixes it.
+try:
+    from pydantic_ai.models.openrouter import _OpenRouterChatCompletionChunk
+    _OpenRouterChatCompletionChunk.model_fields["service_tier"].annotation = str | None  # type: ignore
+    _OpenRouterChatCompletionChunk.model_rebuild()
+except Exception:
+    pass
+
 from .config import OkonomiConfig
 from .context import ContextManager
 from .display import DIM, RST, RED, print_ansi_box, print_code_box
-from .session import GeneratedOutput, Session, SessionManager, SessionMetadata
+from .session import Artifact, GeneratedOutput, Session, SessionManager, SessionMetadata
+from .tools._browser_renderer import BrowserRendererTools
+from .tools._image_processing import EditingTools
 from .tools._image_generation import ImageGenerationTools
 from .tools._prompt import PromptTools
 from .tools._research import ResearchTools
@@ -96,6 +107,7 @@ class AgentDependencies:
     session_manager: SessionManager
     tools: dict[str, Any] = field(default_factory=dict)
     generated_outputs: list[GeneratedOutput] = field(default_factory=list)
+    artifacts: list[Artifact] = field(default_factory=list)
     input_assets: list[str] = field(default_factory=list)
     tools_used: set[str] = field(default_factory=set)
     models_used: set[str] = field(default_factory=set)
@@ -112,6 +124,16 @@ class AgentDependencies:
         if output.model_id:
             self.models_used.add(output.model_id)
 
+    def add_artifact(self, path: str, artifact_type: str, description: str = "", url: str = "") -> None:
+        """Track a created artifact (file, research report, skill, etc.)."""
+        self.artifacts.append(Artifact(
+            path=path,
+            artifact_type=artifact_type,
+            description=description,
+            timestamp=datetime.now().isoformat(),
+            url=url,
+        ))
+
     def add_input_asset(self, url: str) -> None:
         """Track an input asset (image/video URL)."""
         if url and url not in self.input_assets:
@@ -124,6 +146,14 @@ class AgentDependencies:
     def get_tool(self, namespace: str) -> Any:
         """Get a tool instance by namespace."""
         return self.tools.get(namespace)
+
+
+class ToolResult(dict):
+    """Dict subclass that shows available keys on KeyError."""
+
+    def __missing__(self, key):
+        available = ", ".join(repr(k) for k in self.keys())
+        raise KeyError(f"Key {key!r} not found. Available keys: {available}")
 
 
 class ToolWrapper:
@@ -174,10 +204,14 @@ class ToolWrapper:
         return str(session_dir)
 
     def _generate_output_path(self, method_name: str, extension: str = ".mp4") -> str:
-        """Generate an output path in the session directory."""
+        """Generate an output path in the session's asset subdirectory."""
+        from .session import asset_subdir_for_file
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
         filename = f"{method_name}_{timestamp}{extension}"
-        return f"{self.session_dir}/{filename}"
+        subdir = asset_subdir_for_file(filename)
+        asset_dir = Path(self.session_dir) / "assets" / subdir
+        asset_dir.mkdir(parents=True, exist_ok=True)
+        return str(asset_dir / filename)
 
     def __getattr__(self, name: str) -> Any:
         attr = getattr(self._tool_instance, name)
@@ -190,7 +224,11 @@ class ToolWrapper:
                 if "output_path" in kwargs and kwargs["output_path"] is None:
                     kwargs["output_path"] = self._generate_output_path(name)
 
-                result = attr(*args, **kwargs)
+                try:
+                    result = attr(*args, **kwargs)
+                except TypeError as e:
+                    sig = inspect.signature(attr)
+                    raise TypeError(f"{tool_name}() {e}. Expected signature: {name}{sig}") from None
 
                 self._deps.tools_used.add(tool_name)
 
@@ -200,6 +238,7 @@ class ToolWrapper:
 
                 if isinstance(result, dict):
                     self._track_outputs(result, name, kwargs)
+                    result = ToolResult(result)
 
                 return result
 
@@ -215,31 +254,47 @@ class ToolWrapper:
     def _track_outputs(self, result: dict, method_name: str, kwargs: dict) -> None:
         """Extract and track generated outputs from tool results."""
         now = datetime.now().isoformat()
+        tool_name = f"{self._namespace}.{method_name}"
+        prompt = kwargs.get("prompt", "")
 
-        # Handle images (always plural in results)
         if "images" in result:
             for img_url in result["images"]:
                 output = GeneratedOutput(
                     asset_url=img_url,
                     asset_type="image",
-                    prompt=kwargs.get("prompt", ""),
-                    tool_name=f"{self._namespace}.{method_name}",
+                    prompt=prompt,
+                    tool_name=tool_name,
                     model_id=result.get("model_id", ""),
                     timestamp=now,
                 )
                 self._deps.add_output(output)
+                self._deps.add_artifact(
+                    path=img_url, artifact_type="image",
+                    description=prompt[:200], url=img_url,
+                )
 
-        # Handle video (always singular in results)
         if "video" in result:
             output = GeneratedOutput(
                 asset_url=result["video"],
                 asset_type="video",
-                prompt=kwargs.get("prompt", ""),
-                tool_name=f"{self._namespace}.{method_name}",
+                prompt=prompt,
+                tool_name=tool_name,
                 model_id=result.get("model_id", ""),
                 timestamp=now,
             )
             self._deps.add_output(output)
+            self._deps.add_artifact(
+                path=result["video"], artifact_type="video",
+                description=prompt[:200], url=result["video"],
+            )
+
+        if "output_path" in result and result["output_path"]:
+            path = result["output_path"]
+            artifact_type = "video" if path.endswith((".mp4", ".webm")) else "download"
+            self._deps.add_artifact(
+                path=path, artifact_type=artifact_type,
+                description=prompt[:200],
+            )
 
 
 class OkonomiAgent:
@@ -272,8 +327,12 @@ class OkonomiAgent:
         self._was_interrupted: bool = False
         self._partial_output: str = ""
 
+        # Last executed code block (for expand-on-demand)
+        self._last_code: str = ""
+
         # Session tracking
         self.generated_outputs: list[GeneratedOutput] = []
+        self.artifacts: list[Artifact] = []
         self.input_assets: list[str] = []
         self.tools_used: set[str] = set()
         self.models_used: set[str] = set()
@@ -282,6 +341,17 @@ class OkonomiAgent:
         self.token_usage = TokenUsage()
         self.context = ContextManager(config)
         self.spinner_text: str = ""
+
+        # Approval callback for expensive operations.
+        # Signature: async (code: str) -> bool | str
+        # Returns True to proceed, False to skip, or a string with revised code.
+        # If None, all code runs without approval.
+        self.approval_callback: Any = None
+        self.auto_approve: bool = False
+
+        self._expensive_patterns = [
+            "image_generation.", "video.", "browser.render", "fal_client",
+        ]
 
         # Skill creation nudge: after N tool-calling turns without skill
         # management, append a reminder to consider saving as a skill.
@@ -301,6 +371,8 @@ class OkonomiAgent:
         """
         # Programmatic tools — called from inside execute_code
         self.programmatic_tools: dict[str, Any] = {
+            "browser": BrowserRendererTools(self.config),
+            "image_processing": EditingTools(self.config),
             "image_generation": ImageGenerationTools(self.config),
             "prompt": PromptTools(self.config),
             "research": ResearchTools(self.config),
@@ -425,22 +497,15 @@ Example structured prompts:
 
 1. Use `execute_code` to run Python code for image/video generation tools
 2. Use `print()` to see results from code execution
-3. Variables persist between executions
+3. Variables persist between executions — if code fails, prior variables are still available
 4. All methods are synchronous - do NOT use `await`
-5. For tools with `[detailed docs]`, call `get_tool_documentation('tool.method')` first.
-6. **Saving files**: All tools have a `session_dir` property (e.g., `video.session_dir`) for the current session folder.
+5. **Never re-run expensive operations** (image/video generation) to fix a parsing error. If a KeyError or similar occurs after a generation call, use `print(result)` to inspect the existing result variable and fix the key access
+6. For tools with `[detailed docs]`, call `get_tool_documentation('tool.method')` first.
+7. **Saving files**: All tools have a `session_dir` property (e.g., `video.session_dir`) for the current session folder.
    Methods with `output_path` parameters auto-save to session directory when passed `output_path=None`.
-7. **Standalone tools** (call directly, NOT through `execute_code`):
-   - Terminal: `run`, `run_background`, `search`
-   - Skills: `load_skill`, `create_skill`, `edit_skill`, `list_skills`
-8. **Programmatic tools** (use inside `execute_code` only):
-   - `image_generation`, `prompt`, `research`, `sessions`, `video`
-9. **Session history**: Past sessions are stored in `~/.okonomi/sessions/` as JSON and JSONL files.
-   Use `search(pattern="<keyword>", path="~/.okonomi/sessions/")` to grep through past session
-   data, concept research, prompts, and outputs. Always prefer `search` for finding sessions —
-   it's faster and doesn't require code execution. Only use programmatic session tools
-   (`sessions.list_sessions()`, `sessions.get_session_details()`, etc.) when you need
-   structured access to a specific session you've already identified.
+8. **Standalone tools** (`run`, `run_background`, `search`, `load_skill`, `create_skill`, `edit_skill`, `list_skills`) — call directly, NOT through `execute_code`.
+9. **Programmatic tools** (`browser`, `image_processing`, `image_generation`, `prompt`, `research`, `video`) — use inside `execute_code` only.
+10. **Session history**: Use `search(pattern="<keyword>", path="~/.okonomi/sessions/")` to find past sessions.
 
 Be creative and help users generate stunning images and videos."""
 
@@ -476,10 +541,12 @@ Be creative and help users generate stunning images and videos."""
             """Execute Python code with access to all tool objects.
 
             The code runs in an environment with these tool objects available:
+            - browser: Headless browser rendering (screenshot and video capture of HTML/JS)
+            - image_processing: Image loading, segmentation, layer decomposition
             - image_generation: Text-to-image, image-to-image, editing
             - prompt: Prompt creation and optimization
             - research: Web search
-            - sessions: List, load, and inspect past sessions and their outputs
+            - sessions: Inspect past sessions by ID (get_session_details, get_session_summary, get_session_images, get_session_videos)
             - video: Video generation
 
             Args:
@@ -601,32 +668,64 @@ Signature: `{method_name}{sig}`
                 ctx.deps.execution_globals["get_tool_method_documentation"] = get_tool_method_documentation
                 ctx.deps.execution_globals["get_session_dir"] = get_session_dir
 
-            stdout_capture = io.StringIO()
-            stderr_capture = io.StringIO()
-            self.spinner_text = "Running"
+            if (
+                self.approval_callback
+                and not self.auto_approve
+                and any(p in code for p in self._expensive_patterns)
+            ):
+                self.spinner_text = ""
+                decision = await self.approval_callback(code)
+                if decision is False:
+                    return "Code execution skipped by user."
+                if decision == "__auto_approve__":
+                    self.auto_approve = True
+                elif isinstance(decision, str):
+                    return f"User feedback before execution: {decision}\n\nRevise the code and try again."
+
+            self.spinner_text = "Running..."
+
+            def _exec_in_thread():
+                stdout_capture = io.StringIO()
+                stderr_capture = io.StringIO()
+                try:
+                    with redirect_stdout(stdout_capture), redirect_stderr(stderr_capture):
+                        exec(code, ctx.deps.execution_globals)
+
+                    stdout_output = stdout_capture.getvalue()
+                    stderr_output = stderr_capture.getvalue()
+
+                    result = ""
+                    if stdout_output:
+                        result += stdout_output
+                    if stderr_output:
+                        result += f"\nStderr:\n{stderr_output}"
+                    return result.strip() if result.strip() else None, None
+                except Exception:
+                    return None, traceback.format_exc()
 
             try:
-                with redirect_stdout(stdout_capture), redirect_stderr(stderr_capture):
-                    exec(code, ctx.deps.execution_globals)
+                output, error = await asyncio.to_thread(_exec_in_thread)
 
-                stdout_output = stdout_capture.getvalue()
-                stderr_output = stderr_capture.getvalue()
+                if error:
+                    if self.verbose:
+                        print_ansi_box(f"Error executing code:\n{error}", label="error", color="31")
+                    return f"Error executing code:\n{error}"
 
-                result = ""
-                if stdout_output:
-                    result += stdout_output
-                if stderr_output:
-                    result += f"\nStderr:\n{stderr_output}"
+                if self.verbose and output:
+                    print_ansi_box(output, label="output")
 
-                output_text = result.strip() if result.strip() else "Code executed successfully"
-                print_ansi_box(output_text, label="output")
+                if output:
+                    from .context import _strip_large_content
+                    cleaned = _strip_large_content(output)
+                    if len(cleaned) > 10_000:
+                        cleaned = cleaned[:8_000] + "\n...[truncated]...\n" + cleaned[-1_500:]
+                    return cleaned
 
-                return result.strip() if result.strip() else "Code executed successfully (no output)"
+                return "Code executed successfully (no output)"
 
-            except Exception:
-                error_msg = f"Error executing code:\n{traceback.format_exc()}"
-                print_ansi_box(error_msg, label="error", color="31")
-                return error_msg
+            except asyncio.CancelledError:
+                self.spinner_text = ""
+                raise
             finally:
                 self.spinner_text = ""
 
@@ -654,9 +753,13 @@ Signature: `{method_name}{sig}`
             tool_name = rename.get(name, name)
             sig = inspect.signature(method)
 
-            def make_wrapper(m, s, tn):
+            def make_wrapper(m, s, tn, agent_self=self):
                 def wrapper(*args, **kwargs):
-                    return m(*args, **kwargs)
+                    agent_self.spinner_text = f"Running {tn}..."
+                    try:
+                        return m(*args, **kwargs)
+                    finally:
+                        agent_self.spinner_text = ""
 
                 wrapper.__name__ = tn
                 wrapper.__qualname__ = tn
@@ -679,6 +782,7 @@ Signature: `{method_name}{sig}`
             session_manager=self.session_manager,
             tools=self.programmatic_tools,
             generated_outputs=self.generated_outputs,
+            artifacts=self.artifacts,
             input_assets=self.input_assets,
             tools_used=self.tools_used,
             models_used=self.models_used,
@@ -716,27 +820,38 @@ Signature: `{method_name}{sig}`
             break
         return trimmed
 
+    def _extract_code(self, part: ToolCallPart) -> str:
+        """Extract code string from an execute_code tool call."""
+        args = part.args
+        if isinstance(args, dict):
+            return args.get("code", "")
+        if isinstance(args, str):
+            import json
+            try:
+                parsed = json.loads(args)
+                return parsed.get("code", "") if isinstance(parsed, dict) else ""
+            except json.JSONDecodeError:
+                return args
+        if hasattr(args, "code"):
+            return args.code
+        return str(args)
+
     def _display_tool_call(self, part: ToolCallPart) -> None:
         """Display a tool call with appropriate formatting."""
         if part.tool_name == "execute_code":
-            args = part.args
-            if isinstance(args, dict):
-                code = args.get("code", "")
-            elif isinstance(args, str):
-                import json
-
-                try:
-                    parsed = json.loads(args)
-                    code = parsed.get("code", "") if isinstance(parsed, dict) else ""
-                except json.JSONDecodeError:
-                    code = args
-            elif hasattr(args, "code"):
-                code = args.code
-            else:
-                code = str(args)
-
-            if code:
+            code = self._extract_code(part)
+            if not code:
+                return
+            self._last_code = code
+            if self.verbose or self.approval_callback and any(
+                p in code for p in self._expensive_patterns
+            ):
+                print()
                 print_code_box(code)
+                print()
+            else:
+                line_count = code.count("\n") + 1
+                print(f"\n{DIM}▶ execute_code ({line_count} lines) — Ctrl+O to view{RST}\n")
         elif part.tool_name == "load_skill":
             import json
 
@@ -747,9 +862,12 @@ Signature: `{method_name}{sig}`
                 except json.JSONDecodeError:
                     pass
             name = args.get("name", args) if isinstance(args, dict) else args
-            print(f"{DIM}Loading skill: {name}{RST}")
+            print(f"\n{DIM}Loading skill: {name}{RST}\n")
         else:
-            print(f"{DIM}{part.tool_name}({part.args}){RST}")
+            if self.verbose:
+                print(f"\n{DIM}{part.tool_name}({part.args}){RST}\n")
+            else:
+                print(f"\n{DIM}▶ {part.tool_name}{RST}\n")
 
     async def run_async(self, user_message: str, reset: bool = False) -> str:
         """Run the agent asynchronously with a user message.
@@ -768,6 +886,7 @@ Signature: `{method_name}{sig}`
             self.message_history = []
             self.execution_globals = {}
             self.generated_outputs = []
+            self.artifacts = []
             self.input_assets = []
             self.tools_used = set()
             self.models_used = set()
@@ -783,13 +902,35 @@ Signature: `{method_name}{sig}`
         if self.message_history:
             self.message_history = self._sanitize_history(self.message_history)
 
+            # After interruption, strip the cancelled turn's partial model
+            # response so the new instruction starts from a clean state.
+            if self._was_interrupted:
+                while (
+                    self.message_history
+                    and isinstance(self.message_history[-1], ModelResponse)
+                ):
+                    self.message_history.pop()
+
+            self.message_history, was_pruned = self.context.prune_if_needed(self.message_history)
+            if was_pruned:
+                print(f"{DIM}Context pruned (stripped large content){RST}")
+
             if self.context.should_compress_preflight(self.message_history):
                 compressed, was_compressed = self.context.compress(self.message_history)
                 if was_compressed:
                     print(
-                        f"{DIM}Context compressed: {len(self.message_history)} → " f"{len(compressed)} messages{RST}"
+                        f"{DIM}Context compressed: {len(self.message_history)} → {len(compressed)} messages{RST}"
                     )
                     self.message_history = compressed
+
+        # When resuming after an interruption, prepend a priority marker
+        # so the model treats the new message as a course correction.
+        if self._was_interrupted and self.message_history:
+            user_message = (
+                "[The user interrupted the previous response to give new instructions. "
+                "Stop what you were doing and focus on this message.]\n\n"
+                + user_message
+            )
 
         # Append skill creation nudge when threshold is reached
         if self._skill_nudge_interval > 0 and self._turns_since_skill >= self._skill_nudge_interval:
@@ -809,7 +950,7 @@ Signature: `{method_name}{sig}`
                 try:
                     async for node in agent_run:
                         if Agent.is_model_request_node(node):
-                            self.spinner_text = "Thinking"
+                            self.spinner_text = "Thinking..."
                             async with node.stream(agent_run.ctx) as stream:
                                 accumulated_text = ""
                                 line_buf = ""
@@ -842,6 +983,7 @@ Signature: `{method_name}{sig}`
                     self._partial_output = final_output
                     self.message_history = self._sanitize_history(agent_run.all_messages())
                     self.generated_outputs = deps.generated_outputs
+                    self.artifacts = deps.artifacts
                     usage = agent_run.usage()
                     self.token_usage.add(
                         input_tokens=usage.request_tokens or 0,
@@ -863,6 +1005,7 @@ Signature: `{method_name}{sig}`
             # Update message history for conversation continuity
             self.message_history = result.all_messages()
             self.generated_outputs = deps.generated_outputs
+            self.artifacts = deps.artifacts
 
             # Skill creation nudge: track tool-calling turns and remind
             # the model to consider saving approaches as skills.
@@ -904,44 +1047,30 @@ Signature: `{method_name}{sig}`
         return self.context.generate_steps_summary(self.message_history)
 
     def _download_asset(self, url: str, session_dir: Path, asset_type: str) -> str:
-        """Download an asset from URL to the session directory.
-
-        Args:
-            url: URL to download from
-            session_dir: Directory to save the asset
-            asset_type: "image" or "video"
-
-        Returns:
-            Local file path, or empty string if download failed
-        """
+        """Download an asset from URL to the session's asset subdirectory."""
         try:
-            # Extract filename from URL path (e.g., "1Bq5pfalxttyXEHIrNcNX.jpg")
+            from .session import asset_subdir_for_file
+
             parsed = urlparse(url)
             url_filename = Path(parsed.path).name
 
-            # Use the URL filename if it has an extension, otherwise add default
-            if Path(url_filename).suffix.lower() in [
-                ".jpg",
-                ".jpeg",
-                ".png",
-                ".webp",
-                ".gif",
-                ".mp4",
-                ".webm",
-                ".mov",
-            ]:
+            if Path(url_filename).suffix.lower() in {
+                ".jpg", ".jpeg", ".png", ".webp", ".gif",
+                ".mp4", ".webm", ".mov",
+            }:
                 filename = url_filename
             else:
                 ext = ".jpg" if asset_type == "image" else ".mp4"
                 filename = f"{url_filename}{ext}"
 
-            local_path = session_dir / filename
+            subdir = asset_subdir_for_file(filename)
+            asset_dir = session_dir / "assets" / subdir
+            asset_dir.mkdir(parents=True, exist_ok=True)
+            local_path = asset_dir / filename
 
-            # Download the file
             with httpx.Client(timeout=60.0) as client:
                 response = client.get(url, follow_redirects=True)
                 response.raise_for_status()
-
                 with open(local_path, "wb") as f:
                     f.write(response.content)
 
@@ -981,6 +1110,7 @@ Signature: `{method_name}{sig}`
             created_at=now,
             updated_at=now,
             num_outputs=len(self.generated_outputs),
+            num_artifacts=len(self.artifacts),
             tools_used=list(self.tools_used),
             models_used=list(self.models_used),
             has_input_assets=len(self.input_assets) > 0,
@@ -995,16 +1125,27 @@ Signature: `{method_name}{sig}`
         session = Session(
             metadata=metadata,
             generated_outputs=self.generated_outputs,
+            artifacts=self.artifacts,
             input_assets=self.input_assets,
             steps_summary=self._generate_steps_summary(),
             errors=self.errors,
             message_history=self.message_history if self.message_history else None,
         )
 
+        if not metadata.title and self.task:
+            from .utils import generate_title
+            title = generate_title(self.task)
+            if title:
+                metadata.title = title
+
         self.session_manager.save_session(session)
 
     def load_session(self, session_id: str) -> bool:
         """Load agent state from a saved session.
+
+        Restores outputs, metadata, and injects a summary as context
+        rather than restoring the full message history (saves tokens).
+        The system prompt includes generated outputs via _build_session_context().
 
         Args:
             session_id: ID of the session to load
@@ -1020,13 +1161,19 @@ Signature: `{method_name}{sig}`
         self.session_id = session_id
         self.task = session.metadata.task_input
         self.generated_outputs = session.generated_outputs
+        self.artifacts = session.artifacts
         self.input_assets = session.input_assets
         self.tools_used = set(session.metadata.tools_used)
         self.models_used = set(session.metadata.models_used)
         self.errors = session.errors
 
-        if session.message_history:
-            self.message_history = session.message_history
+        self.message_history = self.context.build_resume_context(
+            session_id=session_id,
+            task=session.metadata.task_input,
+            steps_summary=session.steps_summary,
+            generated_outputs=session.generated_outputs,
+            artifacts=session.artifacts,
+        )
 
         if session.metadata.token_usage:
             tu = session.metadata.token_usage
