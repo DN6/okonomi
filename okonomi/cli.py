@@ -26,7 +26,7 @@ from prompt_toolkit.history import FileHistory
 from prompt_toolkit.completion import Completer, Completion
 from prompt_toolkit.filters import has_completions
 from prompt_toolkit.key_binding import KeyBindings
-from prompt_toolkit.layout import FormattedTextControl, HSplit, Layout, Window
+from prompt_toolkit.layout import FormattedTextControl, HSplit, Layout, VSplit, Window
 from prompt_toolkit.layout.dimension import Dimension
 from prompt_toolkit.layout.menus import CompletionsMenu
 from prompt_toolkit.patch_stdout import patch_stdout as pt_patch_stdout
@@ -44,6 +44,42 @@ from .display import (
 
 logging.getLogger("httpx").setLevel(logging.WARNING)
 logging.getLogger("httpcore").setLevel(logging.WARNING)
+
+
+import re
+
+_MENTION_RE = re.compile(r"(?:^|(?<=\s))@(\S+)")
+
+
+def _expand_mentions(text: str) -> str:
+    """Expand @path mentions into inline file contents."""
+    mentions = _MENTION_RE.findall(text)
+    if not mentions:
+        return text
+
+    attachments = []
+    for path_str in mentions:
+        expanded = os.path.expanduser(path_str)
+        p = Path(expanded)
+        if not p.exists():
+            continue
+        if p.is_dir():
+            entries = sorted(str(e.relative_to(p)) for e in p.iterdir() if not e.name.startswith("."))
+            content = "\n".join(entries)
+            attachments.append(f"<file path=\"{path_str}\" type=\"directory\">\n{content}\n</file>")
+        else:
+            try:
+                content = p.read_text(errors="replace")
+                if len(content) > 50_000:
+                    content = content[:50_000] + "\n... (truncated)"
+                attachments.append(f"<file path=\"{path_str}\">\n{content}\n</file>")
+            except Exception:
+                continue
+
+    if not attachments:
+        return text
+
+    return text + "\n\n" + "\n\n".join(attachments)
 
 
 def _print_welcome() -> None:
@@ -172,6 +208,7 @@ Examples:
 
 SLASH_COMMANDS: list[tuple[str, str]] = [
     ("/help", "Show available commands"),
+    ("/assets", "List generated assets in this session"),
     ("/bg", "Run a task in the background"),
     ("/clear", "Clear conversation history"),
     ("/reset", "Clear conversation history"),
@@ -188,14 +225,26 @@ SLASH_COMMANDS: list[tuple[str, str]] = [
 
 
 class SlashCommandCompleter(Completer):
-    """Completer that shows a dropdown for slash commands."""
+    """Completer that shows a dropdown for slash commands and @ file mentions."""
 
     def __init__(self, skill_provider=None):
         self._skill_provider = skill_provider
 
     def get_completions(self, document, complete_event):
-        text = document.text_before_cursor.lstrip()
+        text_before = document.text_before_cursor
 
+        # @ file mention: find the latest @ token and complete file paths
+        at_idx = text_before.rfind("@")
+        if at_idx >= 0:
+            before_at = text_before[:at_idx]
+            after_at = text_before[at_idx + 1:]
+            # Only trigger if @ is at start or preceded by whitespace,
+            # and there's no whitespace in the partial path
+            if (not before_at or before_at[-1].isspace()) and " " not in after_at and "\t" not in after_at:
+                yield from self._file_completions(after_at)
+                return
+
+        text = text_before.lstrip()
         if not text.startswith("/"):
             return
 
@@ -225,6 +274,43 @@ class SlashCommandCompleter(Completer):
             except Exception:
                 pass
 
+    def _file_completions(self, partial: str):
+        """Yield file path completions relative to cwd for @ mentions."""
+        import os
+
+        partial_expanded = os.path.expanduser(partial)
+        if os.path.isabs(partial_expanded):
+            base_dir, prefix = os.path.split(partial_expanded)
+            if not base_dir:
+                base_dir = "/"
+        elif "/" in partial:
+            base_dir, prefix = os.path.split(partial)
+        else:
+            base_dir = "."
+            prefix = partial
+
+        try:
+            entries = sorted(os.listdir(base_dir or "."))
+        except (OSError, PermissionError):
+            return
+
+        for entry in entries:
+            if entry.startswith(".") and not prefix.startswith("."):
+                continue
+            if not entry.lower().startswith(prefix.lower()):
+                continue
+            full = os.path.join(base_dir, entry) if base_dir and base_dir != "." else entry
+            is_dir = os.path.isdir(os.path.join(base_dir or ".", entry))
+            completion_text = full + ("/" if is_dir else "")
+            display = f"{entry}/" if is_dir else entry
+            meta = "dir" if is_dir else "file"
+            yield Completion(
+                completion_text,
+                start_position=-len(partial),
+                display=display,
+                display_meta=meta,
+            )
+
 
 COMPLETION_STYLE = PTStyle.from_dict(
     {
@@ -233,6 +319,8 @@ COMPLETION_STYLE = PTStyle.from_dict(
         "completion-menu.completion.current": "bg:#333355 #d787af",
         "completion-menu.meta.completion": "bg:#1a1a2e #888888",
         "completion-menu.meta.completion.current": "bg:#333355 #d787af",
+        "input-frame frame.border": "#d787af",
+        "input-frame frame.label": "#d787af bold",
     }
 )
 
@@ -247,8 +335,11 @@ def _handle_fav(agent: OkonomiAgent) -> bool:
     last = outputs[-1]
     local = last.local_path
     if not local or not os.path.exists(local):
-        print(f"{DIM}Last output has no local file yet. Try /save first.{RST}")
-        return True
+        if last.asset_url and os.path.exists(last.asset_url):
+            local = last.asset_url
+        else:
+            print(f"{DIM}Last output has no local file yet. Try /save first.{RST}")
+            return True
 
     session_dir = agent.session_manager.get_session_dir(agent.session_id)
     favs = session_dir / "favourites"
@@ -294,7 +385,22 @@ def _handle_command(command: str, agent: OkonomiAgent) -> str | bool:
     or False if unrecognized.
     """
     cmd = command.lower().strip()
-    if cmd in ["/clear", "/reset"]:
+    if cmd == "/assets":
+        outputs = agent.generated_outputs
+        if not outputs:
+            print(f"{DIM}No assets generated yet.{RST}")
+        else:
+            print(f"\n{DIM}Assets ({len(outputs)}):{RST}")
+            for i, o in enumerate(outputs, 1):
+                icon = "🖼" if o.asset_type == "image" else "🎬" if o.asset_type == "video" else "📄"
+                path = o.local_path or o.asset_url or ""
+                prompt = o.prompt[:60] + "..." if o.prompt and len(o.prompt) > 60 else o.prompt or ""
+                print(f"  {icon} {BOLD}{i}.{RST} {path}")
+                if prompt:
+                    print(f"     {DIM}{prompt}{RST}")
+            print()
+        return True
+    elif cmd in ["/clear", "/reset"]:
         print(f"{DIM}Conversation cleared.{RST}")
         agent.message_history = []
         return True
@@ -415,9 +521,42 @@ class InteractiveSession:
         self._awaiting_approval = False
         self._show_code_panel = False
         self.agent.approval_callback = self._approval_callback
+        self.agent.on_bg_complete = self._on_bg_exec_complete
 
         self._bg_tasks: dict[str, threading.Thread] = {}
         self._bg_counter = 0
+
+    def _on_bg_exec_complete(
+        self,
+        *,
+        bg_id: str,
+        error: str | None,
+        output: str | None,
+        new_outputs: int,
+        new_artifacts: int,
+    ) -> None:
+        """Called from the agent's bg-exec coroutine when a background code block finishes.
+
+        Injects a synthetic user turn so the agent can react (e.g. surface the
+        media to the user). Mirrors hermes-agent's notify_on_complete.
+        """
+        if error:
+            msg = (
+                f"[system] Background task {bg_id} failed. Review the error and "
+                f"decide whether to retry or inform the user:\n{error}"
+            )
+        else:
+            parts = []
+            if new_outputs:
+                parts.append(f"{new_outputs} output{'s' if new_outputs != 1 else ''}")
+            if new_artifacts:
+                parts.append(f"{new_artifacts} artifact{'s' if new_artifacts != 1 else ''}")
+            tail = f" ({', '.join(parts)})" if parts else ""
+            msg = (
+                f"[system] Background task {bg_id} completed{tail}. The generated "
+                "media is now in the session. Present it to the user concisely."
+            )
+        self._input_queue.put(msg)
 
     async def _approval_callback(self, code: str) -> bool | str:
         """Called by the agent before running expensive code. Blocks until user responds.
@@ -533,7 +672,7 @@ class InteractiveSession:
             completer=completer,
             complete_while_typing=True,
             style="class:input-area",
-            height=Dimension(min=1, max=6),
+            height=Dimension(min=1, max=2),
             history=self._history,
             scrollbar=False,
         )
@@ -546,11 +685,10 @@ class InteractiveSession:
             code = session.agent._last_code
             if not code:
                 return [("#888888", "  (no code executed yet)\n")]
-            highlighted = highlight_code(code)
-            lines = highlighted.split("\n")
+            lines = code.split("\n")
             result = [("#888888", " code preview "), ("#888888", "─" * 30 + "\n")]
             for line in lines:
-                result.append(("", f" {line}\n"))
+                result.append(("#e8e8e8", f" {line}\n"))
             result.append(("#888888", "─" * 40 + " Ctrl+O to close\n"))
             return result
 
@@ -590,13 +728,49 @@ class InteractiveSession:
 
         status_bar = Window(FormattedTextControl(_status_text), height=1)
 
+        def _border(char: str, **kw):
+            return Window(char=char, style="class:input-frame,frame.border", **kw)
+
+        def _pad(width: int = 1):
+            return Window(char=" ", style="class:input-frame", width=width)
+
+        input_frame = HSplit(
+            [
+                VSplit(
+                    [
+                        _border("┌", width=1, height=1),
+                        _border("─", height=1),
+                        _border("┐", width=1, height=1),
+                    ],
+                    height=1,
+                ),
+                VSplit(
+                    [
+                        _border("│", width=1),
+                        _pad(1),
+                        input_area,
+                        _pad(1),
+                        _border("│", width=1),
+                    ],
+                ),
+                VSplit(
+                    [
+                        _border("└", width=1, height=1),
+                        _border("─", height=1),
+                        _border("┘", width=1, height=1),
+                    ],
+                    height=1,
+                ),
+            ]
+        )
+
         layout = Layout(
             HSplit(
                 [
                     spinner_widget,
                     code_panel,
                     rule,
-                    input_area,
+                    input_frame,
                     CompletionsMenu(max_height=8),
                     status_bar,
                 ]
@@ -706,16 +880,18 @@ class InteractiveSession:
                 if isinstance(cmd_result, str):
                     text = cmd_result
 
+            expanded = _expand_mentions(text)
+
             if session._agent_running.is_set():
                 session._cancel_agent()
                 print_interrupt()
                 print_user_message(text)
                 print(f"{DIM}(queued — waiting for current operation to stop){RST}")
-                session._input_queue.put(text)
+                session._input_queue.put(expanded)
                 return
 
             print_user_message(text)
-            session._input_queue.put(text)
+            session._input_queue.put(expanded)
 
         @kb.add("c-c")
         def _ctrl_c(event):
@@ -773,13 +949,15 @@ class InteractiveSession:
 
         print(f"{DIM}Background task started: {title}{RST}")
 
+        approval_callback = parent_agent.approval_callback
+
         def _run():
             try:
                 bg_agent = OkonomiAgent(
                     parent_agent.config,
                     session_id=parent_agent.session_id,
                 )
-                bg_agent.auto_approve = True
+                bg_agent.approval_callback = approval_callback
 
                 loop = asyncio.new_event_loop()
                 asyncio.set_event_loop(loop)

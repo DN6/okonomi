@@ -32,8 +32,9 @@ except Exception:
 
 from .config import OkonomiConfig
 from .context import ContextManager
-from .display import DIM, RST, RED, print_ansi_box, print_code_box
+from .display import DIM, LLM, RST, RED, GREEN, print_ansi_box, print_code_box
 from .session import Artifact, GeneratedOutput, Session, SessionManager, SessionMetadata
+from .tools.agents import AgentTools
 from .tools._browser_renderer import BrowserRendererTools
 from .tools._image_processing import EditingTools
 from .tools._image_generation import ImageGenerationTools
@@ -86,6 +87,7 @@ class TokenUsage:
     output_tokens: int = 0
     total_tokens: int = 0
     requests: int = 0
+    last_request_tokens: int = 0
 
     def add(self, input_tokens: int, output_tokens: int, requests: int = 1) -> None:
         """Add usage from a single run."""
@@ -93,9 +95,11 @@ class TokenUsage:
         self.output_tokens += output_tokens
         self.total_tokens += input_tokens + output_tokens
         self.requests += requests
+        self.last_request_tokens = input_tokens
 
     def __str__(self) -> str:
-        return f"tokens: {self.total_tokens:,} (in: {self.input_tokens:,}, out: {self.output_tokens:,}) | requests: {self.requests}"
+        ctx = f" | context: {self.last_request_tokens:,}" if self.last_request_tokens else ""
+        return f"tokens: {self.total_tokens:,} (in: {self.input_tokens:,}, out: {self.output_tokens:,}) | requests: {self.requests}{ctx}"
 
 
 @dataclass
@@ -257,8 +261,11 @@ class ToolWrapper:
         tool_name = f"{self._namespace}.{method_name}"
         prompt = kwargs.get("prompt", "")
 
+        output_path = result.get("output_path", "")
+
         if "images" in result:
             for img_url in result["images"]:
+                local = output_path if output_path and Path(output_path).exists() else ""
                 output = GeneratedOutput(
                     asset_url=img_url,
                     asset_type="image",
@@ -266,14 +273,16 @@ class ToolWrapper:
                     tool_name=tool_name,
                     model_id=result.get("model_id", ""),
                     timestamp=now,
+                    local_path=local,
                 )
                 self._deps.add_output(output)
                 self._deps.add_artifact(
-                    path=img_url, artifact_type="image",
+                    path=local or img_url, artifact_type="image",
                     description=prompt[:200], url=img_url,
                 )
 
         if "video" in result:
+            local = output_path if output_path and Path(output_path).exists() else ""
             output = GeneratedOutput(
                 asset_url=result["video"],
                 asset_type="video",
@@ -281,18 +290,27 @@ class ToolWrapper:
                 tool_name=tool_name,
                 model_id=result.get("model_id", ""),
                 timestamp=now,
+                local_path=local,
             )
             self._deps.add_output(output)
             self._deps.add_artifact(
-                path=result["video"], artifact_type="video",
+                path=local or result["video"], artifact_type="video",
                 description=prompt[:200], url=result["video"],
             )
 
-        if "output_path" in result and result["output_path"]:
-            path = result["output_path"]
-            artifact_type = "video" if path.endswith((".mp4", ".webm")) else "download"
+        if "screenshot" in result:
+            local = output_path if output_path and Path(output_path).exists() else ""
+            output = GeneratedOutput(
+                asset_url=result["screenshot"],
+                asset_type="image",
+                prompt=prompt,
+                tool_name=tool_name,
+                timestamp=now,
+                local_path=local,
+            )
+            self._deps.add_output(output)
             self._deps.add_artifact(
-                path=path, artifact_type=artifact_type,
+                path=local or result["screenshot"], artifact_type="image",
                 description=prompt[:200],
             )
 
@@ -353,6 +371,18 @@ class OkonomiAgent:
             "image_generation.", "video.", "browser.render", "fal_client",
         ]
 
+        self._bg_exec_counter = 0
+        # Background execute_code jobs keyed by bg_id. Plain threads (not asyncio
+        # tasks) so they survive the per-turn event loop teardown in the CLI.
+        import threading as _threading_mod
+        self._bg_execs: dict[str, _threading_mod.Thread] = {}
+        # Optional notification hook invoked from the bg-exec coroutine when a
+        # background code block finishes. Signature:
+        #   on_bg_complete(*, bg_id, error, output, new_outputs, new_artifacts)
+        # The CLI uses this to inject a synthetic user turn so the agent can
+        # react to the completed media.
+        self.on_bg_complete: Any = None
+
         # Skill creation nudge: after N tool-calling turns without skill
         # management, append a reminder to consider saving as a skill.
         self._turns_since_skill = 0
@@ -382,6 +412,7 @@ class OkonomiAgent:
 
         # Standalone tools — direct agent tools (one call per round-trip)
         self.terminal = TerminalTools(self.config)
+        self.agents = AgentTools(self.config)
         self.skills = SkillTools(
             self.config,
             available_tools=set(self.programmatic_tools.keys()) | {"terminal", "skills"},
@@ -400,6 +431,8 @@ class OkonomiAgent:
         # Standalone tools
         self._register_tool(agent, self.skills)
         self._register_tool(agent, self.terminal)
+        self.agents._bind(self)
+        self._register_tool(agent, self.agents, rename={"launch": "launch_agent", "list_agents": "list_agents"})
 
         # Programmatic tools (available inside execute_code)
         self._register_code_execution_tool(agent)
@@ -503,8 +536,10 @@ Example structured prompts:
 6. For tools with `[detailed docs]`, call `get_tool_documentation('tool.method')` first.
 7. **Saving files**: All tools have a `session_dir` property (e.g., `video.session_dir`) for the current session folder.
    Methods with `output_path` parameters auto-save to session directory when passed `output_path=None`.
-8. **Standalone tools** (`run`, `run_background`, `search`, `load_skill`, `create_skill`, `edit_skill`, `list_skills`) — call directly, NOT through `execute_code`.
+8. **Standalone tools** (`run`, `run_background`, `search`, `load_skill`, `create_skill`, `edit_skill`, `list_skills`, `launch_agent`, `list_agents`) — call directly, NOT through `execute_code`.
 9. **Programmatic tools** (`browser`, `image_processing`, `image_generation`, `prompt`, `research`, `video`) — use inside `execute_code` only.
+11. **Background agents**: Use `launch_agent(task, description)` to delegate independent work (e.g., generating multiple images in parallel). Check progress with `list_agents()`. Outputs are automatically merged back into the session.
+12. **Media/expensive code always runs in the background after approval.** Any `execute_code` block touching `image_generation.`, `video.`, `browser.render`, or `fal_client` is auto-dispatched as a background task (returns a `bg-exec-N` handle, no stdout, no `result` variable). Do NOT claim the media is ready in that turn. You'll be re-invoked with a completion notice when it finishes; the artifact will already be in the session. You may also pass `background=True` explicitly for other long-running code.
 10. **Session history**: Use `search(pattern="<keyword>", path="~/.okonomi/sessions/")` to find past sessions.
 
 Be creative and help users generate stunning images and videos."""
@@ -537,7 +572,11 @@ Be creative and help users generate stunning images and videos."""
         """Register the code execution tool with the agent."""
 
         @agent.tool
-        async def execute_code(ctx: RunContext[AgentDependencies], code: str) -> str:
+        async def execute_code(
+            ctx: RunContext[AgentDependencies],
+            code: str,
+            background: bool = False,
+        ) -> str:
             """Execute Python code with access to all tool objects.
 
             The code runs in an environment with these tool objects available:
@@ -551,9 +590,15 @@ Be creative and help users generate stunning images and videos."""
 
             Args:
                 code: Python code to execute. Use print() for output.
+                background: When True, approval (if required) still happens in the foreground,
+                    but execution is dispatched as a background task and the tool returns
+                    immediately. A completion notification is injected as a new turn when the
+                    task finishes. Use for long media generations when you don't need the
+                    result to chain into the next code block. Defaults to False.
 
             Returns:
                 The stdout output from the code execution, or error message.
+                When background=True, returns a handle like "Dispatched as bg-exec-N ..."
             """
             # Initialize execution globals with tool wrappers if not already done
             if not ctx.deps.execution_globals:
@@ -579,6 +624,7 @@ Be creative and help users generate stunning images and videos."""
                                 readme += f"- `{ns}.{sig}` - {desc}\n"
                             readme += "\n"
                     return readme
+
 
                 def get_tool_documentation(method_path: str) -> str:
                     """Get detailed documentation for a specific tool method.
@@ -668,10 +714,12 @@ Signature: `{method_name}{sig}`
                 ctx.deps.execution_globals["get_tool_method_documentation"] = get_tool_method_documentation
                 ctx.deps.execution_globals["get_session_dir"] = get_session_dir
 
+            is_expensive = any(p in code for p in self._expensive_patterns)
+
             if (
                 self.approval_callback
                 and not self.auto_approve
-                and any(p in code for p in self._expensive_patterns)
+                and is_expensive
             ):
                 self.spinner_text = ""
                 decision = await self.approval_callback(code)
@@ -681,6 +729,10 @@ Signature: `{method_name}{sig}`
                     self.auto_approve = True
                 elif isinstance(decision, str):
                     return f"User feedback before execution: {decision}\n\nRevise the code and try again."
+
+            # Media/expensive code always backgrounds after approval passes.
+            if is_expensive:
+                background = True
 
             self.spinner_text = "Running..."
 
@@ -702,6 +754,62 @@ Signature: `{method_name}{sig}`
                     return result.strip() if result.strip() else None, None
                 except Exception:
                     return None, traceback.format_exc()
+
+            if background:
+                import threading
+
+                self._bg_exec_counter += 1
+                bg_id = f"bg-exec-{self._bg_exec_counter}"
+                before_outputs = len(ctx.deps.generated_outputs)
+                before_artifacts = len(ctx.deps.artifacts)
+
+                def _run_bg():
+                    error: str | None = None
+                    output: str | None = None
+                    new_outputs = 0
+                    new_artifacts = 0
+                    try:
+                        output, error = _exec_in_thread()
+                        new_outputs = len(ctx.deps.generated_outputs) - before_outputs
+                        new_artifacts = len(ctx.deps.artifacts) - before_artifacts
+                        if error:
+                            print(f"\n{RED}✗ {bg_id} failed:\n{error}{RST}")
+                        else:
+                            summary = []
+                            if new_outputs:
+                                summary.append(f"{new_outputs} output{'s' if new_outputs != 1 else ''}")
+                            if new_artifacts:
+                                summary.append(f"{new_artifacts} artifact{'s' if new_artifacts != 1 else ''}")
+                            tail = f" — {', '.join(summary)}" if summary else ""
+                            print(f"\n{GREEN}✓ {bg_id} done{tail}{RST}")
+                            if output and self.verbose:
+                                print_ansi_box(output, label=f"{bg_id} output")
+                    finally:
+                        self._bg_execs.pop(bg_id, None)
+                        if self.on_bg_complete is not None:
+                            try:
+                                self.on_bg_complete(
+                                    bg_id=bg_id,
+                                    error=error,
+                                    output=output,
+                                    new_outputs=new_outputs,
+                                    new_artifacts=new_artifacts,
+                                )
+                            except Exception as cb_err:
+                                print(f"{RED}on_bg_complete callback failed: {cb_err}{RST}")
+
+                thread = threading.Thread(
+                    target=_run_bg, daemon=True, name=f"okonomi-{bg_id}"
+                )
+                self._bg_execs[bg_id] = thread
+                thread.start()
+                self.spinner_text = ""
+                return (
+                    f"Dispatched to background as {bg_id}. Execution is in flight — "
+                    "do NOT claim the media is ready yet. You will be notified on "
+                    "completion via a new turn; any generated outputs are merged "
+                    "into the session automatically."
+                )
 
             try:
                 output, error = await asyncio.to_thread(_exec_in_thread)
@@ -846,12 +954,10 @@ Signature: `{method_name}{sig}`
             if self.verbose or self.approval_callback and any(
                 p in code for p in self._expensive_patterns
             ):
-                print()
                 print_code_box(code)
-                print()
             else:
                 line_count = code.count("\n") + 1
-                print(f"\n{DIM}▶ execute_code ({line_count} lines) — Ctrl+O to view{RST}\n")
+                print(f"{DIM}▶ execute_code ({line_count} lines) — Ctrl+O to view{RST}")
         elif part.tool_name == "load_skill":
             import json
 
@@ -862,12 +968,12 @@ Signature: `{method_name}{sig}`
                 except json.JSONDecodeError:
                     pass
             name = args.get("name", args) if isinstance(args, dict) else args
-            print(f"\n{DIM}Loading skill: {name}{RST}\n")
+            print(f"{DIM}Loading skill: {name}{RST}")
         else:
             if self.verbose:
-                print(f"\n{DIM}{part.tool_name}({part.args}){RST}\n")
+                print(f"{DIM}{part.tool_name}({part.args}){RST}")
             else:
-                print(f"\n{DIM}▶ {part.tool_name}{RST}\n")
+                print(f"{DIM}▶ {part.tool_name}{RST}")
 
     async def run_async(self, user_message: str, reset: bool = False) -> str:
         """Run the agent asynchronously with a user message.
@@ -962,12 +1068,15 @@ Signature: `{method_name}{sig}`
                                     line_buf += text
                                     while "\n" in line_buf:
                                         line, line_buf = line_buf.split("\n", 1)
-                                        print(f"{DIM}{line}{RST}")
+                                        print(f"{LLM}{line}{RST}")
 
                                 self.spinner_text = ""
 
                                 if line_buf.strip():
-                                    print(f"{DIM}{line_buf}{RST}")
+                                    print(f"{LLM}{line_buf}{RST}")
+
+                                if accumulated_text.strip():
+                                    print()
 
                                 if accumulated_text.strip():
                                     final_output = accumulated_text

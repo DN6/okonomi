@@ -409,8 +409,14 @@ class SessionManager:
         (session_dir / "assets").mkdir(exist_ok=True)
         session_file = session_dir / "session.json"
 
+        def _safe_default(obj):
+            try:
+                return str(obj)
+            except Exception:
+                return f"<{type(obj).__name__}>"
+
         with open(session_file, "w") as f:
-            json.dump(session.to_dict(), f, indent=2)
+            json.dump(session.to_dict(), f, indent=2, default=_safe_default)
 
         if session.message_history:
             from pydantic_ai.messages import ModelMessagesTypeAdapter
