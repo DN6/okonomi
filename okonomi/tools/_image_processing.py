@@ -11,6 +11,13 @@ import httpx
 from PIL import Image
 
 from okonomi.tools._metadata import ToolMetadataMixin
+from okonomi.tools._returns import (
+    GetImageLayersResult,
+    LoadImagesResult,
+    LoadVideoFramesResult,
+    SegmentImageResult,
+    UpscaleImageResult,
+)
 from okonomi.utils import image_to_uri
 
 
@@ -34,7 +41,7 @@ class EditingTools(ToolMetadataMixin):
         """
         self.config = config
 
-    def load_images(self, uris: str | List[str]) -> dict:
+    def load_images(self, uris: str | List[str]) -> LoadImagesResult:
         """Load images from URIs (URLs or file paths) and return them as PIL Images.
 
         Args:
@@ -68,7 +75,7 @@ class EditingTools(ToolMetadataMixin):
     def get_image_layers(
         self,
         image: str,
-    ) -> dict:
+    ) -> GetImageLayersResult:
         """Decompose an image into semantic layers using AI.
 
         Splits an image into separate layers (e.g., foreground subjects, background,
@@ -98,11 +105,72 @@ class EditingTools(ToolMetadataMixin):
         except Exception as e:
             return {"error": str(e)}
 
+    def upscale_image(
+        self,
+        image: str,
+        upscale_factor: int = 2,
+        seed: int = 42,
+    ) -> UpscaleImageResult:
+        """Upscale an image using SeedVR (fal-ai/seedvr/upscale/image).
+
+        Restores detail and sharpens edges while preserving the original
+        composition. Best for cleaning up low-resolution generations or
+        prepping assets for print / large displays.
+
+        Args:
+            image: URI to the source image (URL or local file path —
+                local paths are auto-converted to a data URI).
+            upscale_factor: Multiplier for output resolution. Typical
+                values: 2 (2×, default), 3, 4. Higher factors increase
+                runtime and cost roughly quadratically.
+            seed: Random seed for the restoration model. Same input +
+                same seed produces the same output.
+
+        Returns:
+            On success: {"images": [<upscaled URL>]}.
+            On failure: {"error": <message>}.
+
+        Usage:
+            result = image_processing.upscale_image(
+                image="https://fal.media/.../small.png",
+                upscale_factor=4,
+            )
+            print(result["images"][0])
+        """
+        try:
+            kwargs = {
+                "image_url": image_to_uri(image),
+                "upscale_factor": upscale_factor,
+                "seed": seed,
+            }
+            result = fal_client.subscribe(
+                "fal-ai/seedvr/upscale/image",
+                arguments=kwargs,
+            )
+            # SeedVR returns either {"image": {"url": ...}} (single) or
+            # {"images": [{"url": ...}, ...]} depending on the variant.
+            # Normalize to a list[str].
+            urls: list[str] = []
+            if "image" in result and isinstance(result["image"], dict):
+                url = result["image"].get("url")
+                if url:
+                    urls.append(url)
+            if "images" in result:
+                for item in result["images"]:
+                    if isinstance(item, dict) and item.get("url"):
+                        urls.append(item["url"])
+                    elif isinstance(item, str):
+                        urls.append(item)
+            return {"images": urls}
+
+        except Exception as e:
+            return {"error": str(e)}
+
     def segment_image(
         self,
         image: str,
         prompt: str = "",
-    ) -> dict:
+    ) -> SegmentImageResult:
         """Segment objects in an image using SAM 3.1.
 
         Detects and segments objects matching the text prompt, returning
@@ -136,7 +204,7 @@ class EditingTools(ToolMetadataMixin):
         uri: str,
         max_frames: int = 16,
         sample_rate: int = 1,
-    ) -> dict:
+    ) -> LoadVideoFramesResult:
         """Load a video from a URI (URL or file path) and extract frames as PIL Images.
 
         Downloads the video (if URL) and extracts frames at the specified sample rate.

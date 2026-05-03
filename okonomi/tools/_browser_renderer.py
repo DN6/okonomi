@@ -16,6 +16,7 @@ from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 from okonomi.tools._metadata import ToolMetadataMixin
+from okonomi.tools._returns import CaptureVideoResult, ScreenshotResult
 
 
 logger = logging.getLogger(__name__)
@@ -124,7 +125,7 @@ class BrowserRendererTools(ToolMetadataMixin):
         wait_ms: int = 1000,
         full_page: bool = False,
         device_scale_factor: float = 2.0,
-    ) -> dict:
+    ) -> ScreenshotResult:
         """Render HTML in a headless browser and capture a screenshot.
 
         Supports any web technology: Three.js, P5.js, D3.js, CSS animations, SVG, Canvas, WebGL.
@@ -173,7 +174,7 @@ class BrowserRendererTools(ToolMetadataMixin):
         duration_s: float = 5.0,
         fps: int = 30,
         wait_before_record_ms: int = 500,
-    ) -> dict:
+    ) -> CaptureVideoResult:
         """Render HTML in a headless browser and capture video of the page.
 
         Records the browser viewport for the specified duration, capturing animations,

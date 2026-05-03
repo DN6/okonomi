@@ -1,6 +1,7 @@
 import json
 
 from okonomi.tools._metadata import ToolMetadataMixin
+from okonomi.tools._returns import DescribeImageResult, GeneratePromptResult
 from okonomi.utils import create_chat_client, image_to_uri
 
 
@@ -33,7 +34,7 @@ class PromptTools(ToolMetadataMixin):
         )
         return response.choices[0].message.content
 
-    def create_prompt(self, context: str) -> dict:
+    def create_prompt(self, context: str) -> GeneratePromptResult:
         """Generate an optimized text-to-image prompt.
 
         This tool transforms context information into highly effective image generation prompts
@@ -124,7 +125,7 @@ class PromptTools(ToolMetadataMixin):
         except Exception as e:
             return {"error": str(e)}
 
-    def describe_image(self, image_url: str) -> dict:
+    def describe_image(self, image_url: str) -> DescribeImageResult:
         """Generate a detailed description of an image from its URI.
 
         This tool analyzes an image and provides a comprehensive description that can be used
@@ -147,7 +148,6 @@ class PromptTools(ToolMetadataMixin):
         """
 
         system_prompt = """You are an expert at analyzing images and creating detailed descriptions for image generation.
-
         Analyze the provided image and create a comprehensive description that includes:
 
         1. SUBJECT & CONTENT:
@@ -202,7 +202,7 @@ class PromptTools(ToolMetadataMixin):
                 model=self.config.agent.vision_model_id,
                 messages=[{"role": "system", "content": system_prompt}, user_message],
                 temperature=0.3,
-                max_tokens=1024,
+                max_tokens=256,
             )
 
             description = completion.choices[0].message.content

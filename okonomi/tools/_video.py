@@ -6,6 +6,7 @@ Provides tools for converting images to videos using AI models.
 import fal_client
 
 from okonomi.tools._metadata import ToolMetadataMixin
+from okonomi.tools._returns import VideoResult
 from okonomi.utils import image_to_uri
 
 
@@ -25,7 +26,7 @@ class VideoTools(ToolMetadataMixin):
         self,
         prompt: str,
         image: str,
-    ) -> dict:
+    ) -> VideoResult:
         """Convert an image to a video with motion based on the prompt.
 
         This tool generates a video from a static image, animating it based on the provided
@@ -71,7 +72,7 @@ class VideoTools(ToolMetadataMixin):
         first_frame: str,
         last_frame: str,
         prompt: str,
-    ) -> dict:
+    ) -> VideoResult:
         """Generate a video transitioning between two images using AI.
 
         This tool creates a video that smoothly transitions from a first frame to a last frame,

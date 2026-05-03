@@ -1,6 +1,6 @@
 ---
 name: p5js
-description: "Production pipeline for generative visual art and creative coding using p5.js. Creates browser-based sketches exported as PNG, GIF, MP4, or SVG via okonomi's headless browser renderer. Covers: 2D/3D rendering, noise and particle systems, flow fields, shaders (GLSL), pixel manipulation, kinetic typography, WebGL scenes, and motion graphics. Trigger when users request: p5.js sketches, creative coding, generative art, canvas animations, browser-based visual art, data visualizations, shader effects, or any p5.js project."
+description: "Production pipeline for generative visual art and creative coding using p5.js. Default deliverable is a self-contained HTML file the user opens in a browser to see the live, animated, interactive sketch — not a baked image or video. Static PNG / MP4 / GIF / SVG exports are available on request via the headless browser renderer. Covers: 2D/3D rendering, noise and particle systems, flow fields, shaders (GLSL), pixel manipulation, kinetic typography, WebGL scenes, and motion graphics. Trigger when users request: p5.js sketches, creative coding, generative art, canvas animations, browser-based visual art, data visualizations, shader effects, or any p5.js project."
 metadata:
   tags: [creative-coding, generative-art, p5js, canvas, webgl, shaders, animation]
   related_skills: [video-generation, concept-research]
@@ -54,15 +54,14 @@ Single self-contained HTML file per project. No build step required.
 ## Pipeline
 
 ```
-CONCEPT → DESIGN → CODE → PREVIEW → EXPORT → VERIFY
+CONCEPT → DESIGN → CODE → PREVIEW → DELIVER
 ```
 
 1. **CONCEPT** — Articulate the creative vision: mood, color world, motion vocabulary, what makes this unique
-2. **DESIGN** — Choose mode, canvas size, color system, export format
-3. **CODE** — Write single HTML file with inline p5.js
-4. **PREVIEW** — Capture a screenshot with `browser.render_screenshot()` to verify
-5. **EXPORT** — Capture final output: screenshot for PNG, `browser.render_video()` for MP4
-6. **VERIFY** — Does the output match the concept? Is it visually striking?
+2. **DESIGN** — Choose mode, canvas size, color system
+3. **CODE** — Write single HTML file with inline p5.js, save to the session dir
+4. **PREVIEW** — Capture one screenshot with `browser.render_screenshot()` to verify the first frame looks right
+5. **DELIVER** — **The HTML file IS the deliverable.** Print its path and share it with the user. They open it in a browser to see the live, interactive sketch — far better than a baked PNG/MP4. Render video only when the user explicitly asks for an MP4.
 
 ## Creative Direction
 
@@ -167,7 +166,22 @@ result = browser.render_screenshot(
 print(result)
 ```
 
-### Step 4: Export
+### Step 4: Deliver the HTML file
+
+Default delivery is the HTML file itself, not a baked render. The user opens
+it in a browser and sees the live, animated, interactive sketch. Print the
+path and surface it to the user:
+
+```python
+print(f"Sketch ready: file://{html_path}")
+```
+
+Only render to PNG / MP4 when the user explicitly asks for a static image,
+GIF, or video file (e.g. "give me a still", "export as mp4", "I want to share
+a video on Twitter"). Don't bake to video by default — it's slower, the user
+loses interactivity, and the file is much larger than the source HTML.
+
+When export *is* requested:
 
 | Format | Method |
 |--------|--------|
@@ -178,7 +192,7 @@ See `references/export-pipeline.md` for full export details including multi-scen
 
 ### Step 5: Iterate
 
-Edit the HTML, re-capture. Adjust parameters until the visual matches the concept.
+Edit the HTML, re-capture a preview. Adjust parameters until the visual matches the concept.
 
 ## Critical Implementation Notes
 

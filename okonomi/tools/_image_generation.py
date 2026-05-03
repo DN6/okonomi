@@ -3,6 +3,7 @@
 import fal_client
 
 from okonomi.tools._metadata import ToolMetadataMixin
+from okonomi.tools._returns import ImageGenResult
 from okonomi.utils import image_to_uri
 
 
@@ -23,7 +24,7 @@ class ImageGenerationTools(ToolMetadataMixin):
         prompt: str,
         image_size: str = "portrait_16_9",
         seed: int = 42,
-    ) -> dict:
+    ) -> ImageGenResult:
         """Generate images using FLUX text-to-image model.
 
         Args:
@@ -62,7 +63,7 @@ class ImageGenerationTools(ToolMetadataMixin):
         self,
         prompt: str,
         image: str,
-    ) -> dict:
+    ) -> ImageGenResult:
         """Tool to edit the contents of an image. Supports object changes, style transfer, and text edits.
 
         Key techniques:
@@ -102,7 +103,7 @@ class ImageGenerationTools(ToolMetadataMixin):
         images: str | list[str],
         image_size: str = "portrait_16_9",
         seed: int = 42,
-    ) -> dict:
+    ) -> ImageGenResult:
         """Generate images using one or more reference images for style transfer, character consistency, or compositing.
 
         Multi-Reference Image Editing allows combining multiple input images to influence

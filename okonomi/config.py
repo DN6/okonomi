@@ -20,9 +20,9 @@ class AgentConfig:
 @dataclass
 class FalConfig:
     text_to_image_model_id: str = "openai/gpt-image-2"
-    edit_image_model_id: str = "openai/gpt-image-2/edit"
-    image_to_video_model_id: str = "bytedance/seedance-2.0/image-to-video"
-    first_last_frame_to_video_model_id: str = "fal-ai/veo3.1/fast/first-last-frame-to-video"
+    edit_image_model_id: str = "fal-ai/flux-2-pro/edit"
+    image_to_video_model_id: str = "bytedance/seedance-2.0/fast/image-to-video"
+    first_last_frame_to_video_model_id: str = "bytedance/seedance-2.0/fast/image-to-video"
 
 
 @dataclass

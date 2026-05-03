@@ -8,9 +8,6 @@ import argparse
 import shutil
 import textwrap
 
-from prompt_toolkit import prompt
-from prompt_toolkit.key_binding import KeyBindings
-
 from pygments import highlight as _highlight
 from pygments.formatters import TerminalTrueColorFormatter
 from pygments.lexers import PythonLexer, get_lexer_by_name
@@ -288,50 +285,10 @@ def print_rule() -> None:
     print(f"{PINK}{h * w}{RST}")
 
 
-def _basic_key_bindings() -> KeyBindings:
-    bindings = KeyBindings()
-
-    @bindings.add("escape", "enter")
-    def _newline(event):
-        event.current_buffer.insert_text("\n")
-
-    return bindings
-
-
-def get_multiline_input() -> str:
-    """Get input with bordered prompt (Alt+Enter for newline)."""
-    try:
-        print_rule()
-        user_input = prompt(
-            [("#d787af bold", "> ")],
-            key_bindings=_basic_key_bindings(),
-            multiline=False,
-        ).strip()
-        if user_input:
-            print_rule()
-        return user_input
-    except EOFError:
-        return ""
-    except KeyboardInterrupt:
-        print(f"\n{DIM}Cancelled{RST}")
-        raise
-
-
 def get_task_input(args: argparse.Namespace) -> str:
-    """Get task input either from CLI arguments or interactive prompt."""
-    task = args.task or args.task_flag
+    """Return the task string provided via positional arg or --task flag.
 
-    if task:
-        return task
-
-    print()
-    w = shutil.get_terminal_size().columns
-    label = "What's on your mind?"
-    pad = (w - len(label)) // 2
-    print(f"{PINK}{' ' * pad}{label}{RST}")
-    print()
-
-    try:
-        return get_multiline_input()
-    except KeyboardInterrupt:
-        exit(0)
+    The Textual TUI handles interactive input; this helper is only used by
+    the one-shot non-interactive code path.
+    """
+    return (args.task or args.task_flag or "").strip()

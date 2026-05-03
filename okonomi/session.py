@@ -134,13 +134,15 @@ class Session:
     message_history: Optional[List[Any]] = None
 
     def add_artifact(self, path: str, artifact_type: str, description: str = "", url: str = "") -> None:
-        self.artifacts.append(Artifact(
-            path=path,
-            artifact_type=artifact_type,
-            description=description,
-            timestamp=datetime.now().isoformat(),
-            url=url,
-        ))
+        self.artifacts.append(
+            Artifact(
+                path=path,
+                artifact_type=artifact_type,
+                description=description,
+                timestamp=datetime.now().isoformat(),
+                url=url,
+            )
+        )
 
     def to_dict(self) -> Dict[str, Any]:
         return {
@@ -535,13 +537,15 @@ class SessionManager:
 
         scored: list[tuple[int, dict]] = []
         for entry in index:
-            searchable = " ".join([
-                entry.get("session_id", ""),
-                entry.get("task_input", ""),
-                entry.get("title", ""),
-                " ".join(entry.get("tools_used", [])),
-                " ".join(entry.get("models_used", [])),
-            ]).lower()
+            searchable = " ".join(
+                [
+                    entry.get("session_id", ""),
+                    entry.get("task_input", ""),
+                    entry.get("title", ""),
+                    " ".join(entry.get("tools_used", [])),
+                    " ".join(entry.get("models_used", [])),
+                ]
+            ).lower()
 
             if all(w in searchable for w in words):
                 score = sum(searchable.count(w) for w in words)
@@ -558,8 +562,13 @@ class SessionManager:
     def prune_empty_sessions(self, min_age_hours: int = 24) -> int:
         """Delete sessions with no outputs, no artifacts, and no extra files.
 
-        Args:
-            min_age_hours: Only prune sessions older than this (default 24h).
+        Two prune criteria:
+          - **Truly empty** (no outputs, no artifacts, no task_input, no
+            title): pruned regardless of age. These are sessions that
+            never got started — typically Ctrl+D'd before typing.
+          - **No outputs/artifacts** but had a task: pruned only if older
+            than ``min_age_hours`` (default 24h) so we don't kill a
+            session whose generation is still in flight.
         """
         index = self._read_index()
         cutoff = datetime.now() - timedelta(hours=min_age_hours)
@@ -569,13 +578,18 @@ class SessionManager:
             if entry.get("num_outputs", 0) > 0 or entry.get("num_artifacts", 0) > 0:
                 continue
 
-            created = entry.get("created_at", "")
-            if created:
-                try:
-                    if datetime.fromisoformat(created) > cutoff:
-                        continue
-                except ValueError:
-                    pass
+            has_content = bool((entry.get("task_input") or "").strip() or (entry.get("title") or "").strip())
+
+            if has_content:
+                # Had something to say — give it 24h to produce results
+                # before we prune.
+                created = entry.get("created_at", "")
+                if created:
+                    try:
+                        if datetime.fromisoformat(created) > cutoff:
+                            continue
+                    except ValueError:
+                        pass
 
             session_dir = self.get_session_dir(entry["session_id"])
             if not session_dir.exists():

@@ -4,6 +4,7 @@ from typing import Optional
 from tavily import TavilyClient
 
 from okonomi.tools._metadata import ToolMetadataMixin
+from okonomi.tools._returns import WebSearchResult
 from okonomi.utils import create_chat_client
 
 
@@ -50,7 +51,7 @@ class ResearchTools(ToolMetadataMixin):
         include_images: bool = True,
         include_domains: Optional[list[str]] = None,
         exclude_domains: Optional[list[str]] = None,
-    ) -> dict:
+    ) -> WebSearchResult:
         """Search the web using Tavily API for research and context gathering.
 
         Args:

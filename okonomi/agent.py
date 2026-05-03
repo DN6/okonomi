@@ -25,6 +25,7 @@ from pydantic_ai.models.openrouter import OpenRouterModel
 # Widen the field to accept any string until upstream fixes it.
 try:
     from pydantic_ai.models.openrouter import _OpenRouterChatCompletionChunk
+
     _OpenRouterChatCompletionChunk.model_fields["service_tier"].annotation = str | None  # type: ignore
     _OpenRouterChatCompletionChunk.model_rebuild()
 except Exception:
@@ -40,7 +41,6 @@ from .tools._image_processing import EditingTools
 from .tools._image_generation import ImageGenerationTools
 from .tools._prompt import PromptTools
 from .tools._research import ResearchTools
-from .tools._sessions import SessionTools
 from .tools.skills import SkillTools
 from .tools._video import VideoTools
 from .tools.terminal import TerminalTools
@@ -87,19 +87,37 @@ class TokenUsage:
     output_tokens: int = 0
     total_tokens: int = 0
     requests: int = 0
-    last_request_tokens: int = 0
+    last_turn_input: int = 0
+    history_tokens: int = 0  # estimated size of the persistent message_history
 
     def add(self, input_tokens: int, output_tokens: int, requests: int = 1) -> None:
-        """Add usage from a single run."""
+        """Add usage from a single run.
+
+        ``input_tokens`` is the *cumulative* input across every model
+        round-trip in the agent turn (pydantic-ai's
+        ``usage.request_tokens``). It is NOT the size of the persisted
+        message history — see ``history_tokens`` for that, set by
+        ``OkonomiAgent.run_async`` after pruning/compression.
+        """
         self.input_tokens += input_tokens
         self.output_tokens += output_tokens
         self.total_tokens += input_tokens + output_tokens
         self.requests += requests
-        self.last_request_tokens = input_tokens
+        self.last_turn_input = input_tokens
 
     def __str__(self) -> str:
-        ctx = f" | context: {self.last_request_tokens:,}" if self.last_request_tokens else ""
-        return f"tokens: {self.total_tokens:,} (in: {self.input_tokens:,}, out: {self.output_tokens:,}) | requests: {self.requests}{ctx}"
+        parts = [
+            f"tokens: {self.total_tokens:,}",
+            f"in: {self.input_tokens:,}",
+            f"out: {self.output_tokens:,}",
+            f"requests: {self.requests}",
+        ]
+        line = parts[0] + f" ({parts[1]}, {parts[2]}) | " + parts[3]
+        if self.history_tokens:
+            line += f" | history: ~{self.history_tokens:,}"
+        if self.last_turn_input:
+            line += f" | last turn: {self.last_turn_input:,}"
+        return line
 
 
 @dataclass
@@ -119,24 +137,35 @@ class AgentDependencies:
     verbose: bool = False
     # Persistent state for code execution across multiple calls
     execution_globals: dict[str, Any] = field(default_factory=dict)
+    # Optional hook called from add_output so the agent can kick off an
+    # eager background download of the asset. Set by OkonomiAgent in
+    # _get_dependencies. Signature: (output) -> None, must not raise.
+    on_output_added: Optional[Any] = None
 
     def add_output(self, output: GeneratedOutput) -> None:
-        """Track a generated output."""
+        """Track a generated output. Triggers eager bg download via hook."""
         self.generated_outputs.append(output)
         if output.tool_name:
             self.tools_used.add(output.tool_name)
         if output.model_id:
             self.models_used.add(output.model_id)
+        if self.on_output_added is not None:
+            try:
+                self.on_output_added(output)
+            except Exception:
+                pass
 
     def add_artifact(self, path: str, artifact_type: str, description: str = "", url: str = "") -> None:
         """Track a created artifact (file, research report, skill, etc.)."""
-        self.artifacts.append(Artifact(
-            path=path,
-            artifact_type=artifact_type,
-            description=description,
-            timestamp=datetime.now().isoformat(),
-            url=url,
-        ))
+        self.artifacts.append(
+            Artifact(
+                path=path,
+                artifact_type=artifact_type,
+                description=description,
+                timestamp=datetime.now().isoformat(),
+                url=url,
+            )
+        )
 
     def add_input_asset(self, url: str) -> None:
         """Track an input asset (image/video URL)."""
@@ -158,6 +187,52 @@ class ToolResult(dict):
     def __missing__(self, key):
         available = ", ".join(repr(k) for k in self.keys())
         raise KeyError(f"Key {key!r} not found. Available keys: {available}")
+
+
+def _extract_bg_label(code: str) -> str:
+    """First identifiable expensive call in the code, used as a human label.
+
+    Order matters: prefer a `genmedia run <model-id>` match over a generic
+    namespace match, since the model id is a far more useful label than
+    "run". Falls back to "code block" when nothing recognisable is found.
+    """
+    import re
+
+    # `genmedia run fal-ai/flux/dev …` → label = `fal-ai/flux/dev`
+    gm = re.search(r"\bgenmedia\s+run\s+(\S+)", code)
+    if gm:
+        return gm.group(1)
+
+    match = re.search(
+        r"\b(image_generation|video|browser|image_processing|prompt|research|sessions)\.(\w+)",
+        code,
+    )
+    if match:
+        return f"{match.group(1)}.{match.group(2)}"
+    return "code block"
+
+
+def _short_repr(obj: Any, limit: int = 2000) -> str:
+    """Compact repr for tool return values shown in the UI.
+
+    Tools commonly return dicts with URLs, IDs, and sometimes large payloads.
+    Keep the dict shape readable but avoid multi-megabyte strings landing in
+    the history pane.
+    """
+    try:
+        import json
+
+        if isinstance(obj, (dict, list, tuple)):
+            s = json.dumps(obj, indent=2, default=str)
+        else:
+            s = str(obj)
+    except Exception:
+        s = repr(obj)
+    if len(s) > limit:
+        head = int(limit * 0.7)
+        tail = limit - head
+        s = f"{s[:head]}\n...[truncated {len(s):,} chars]...\n{s[-tail:]}"
+    return s
 
 
 class ToolWrapper:
@@ -210,6 +285,7 @@ class ToolWrapper:
     def _generate_output_path(self, method_name: str, extension: str = ".mp4") -> str:
         """Generate an output path in the session's asset subdirectory."""
         from .session import asset_subdir_for_file
+
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
         filename = f"{method_name}_{timestamp}{extension}"
         subdir = asset_subdir_for_file(filename)
@@ -277,8 +353,10 @@ class ToolWrapper:
                 )
                 self._deps.add_output(output)
                 self._deps.add_artifact(
-                    path=local or img_url, artifact_type="image",
-                    description=prompt[:200], url=img_url,
+                    path=local or img_url,
+                    artifact_type="image",
+                    description=prompt[:200],
+                    url=img_url,
                 )
 
         if "video" in result:
@@ -294,8 +372,10 @@ class ToolWrapper:
             )
             self._deps.add_output(output)
             self._deps.add_artifact(
-                path=local or result["video"], artifact_type="video",
-                description=prompt[:200], url=result["video"],
+                path=local or result["video"],
+                artifact_type="video",
+                description=prompt[:200],
+                url=result["video"],
             )
 
         if "screenshot" in result:
@@ -310,7 +390,8 @@ class ToolWrapper:
             )
             self._deps.add_output(output)
             self._deps.add_artifact(
-                path=local or result["screenshot"], artifact_type="image",
+                path=local or result["screenshot"],
+                artifact_type="image",
                 description=prompt[:200],
             )
 
@@ -337,6 +418,18 @@ class OkonomiAgent:
         self.message_history: list[ModelMessage] = []
         self.task: str = ""
         self.verbose = verbose
+
+        # Background pool for eager asset downloads. Each generated output
+        # is downloaded to the session dir as soon as it's tracked, so
+        # save_session is fast even with many large videos. Daemon
+        # threads — they don't block process exit. Cap concurrency at 4
+        # so a burst of generations doesn't saturate bandwidth.
+        from concurrent.futures import Future, ThreadPoolExecutor
+
+        self._asset_dl_pool = ThreadPoolExecutor(max_workers=4, thread_name_prefix="okonomi-dl")
+        # Tracked so quit can bounded-wait for in-flight downloads instead
+        # of either dropping them silently or blocking forever.
+        self._asset_dl_futures: list[Future] = []
 
         # Persistent REPL state across turns
         self.execution_globals: dict[str, Any] = {}
@@ -368,19 +461,44 @@ class OkonomiAgent:
         self.auto_approve: bool = False
 
         self._expensive_patterns = [
-            "image_generation.", "video.", "browser.render", "fal_client",
+            "image_generation.",
+            "video.",
+            "browser.render",
+            "fal_client",
+            # genmedia is a CLI front-end for fal — invoking
+            # `genmedia run <id>` triggers the same approval +
+            # bg-exec auto-dispatch as a direct fal call.
+            "genmedia run",
         ]
 
         self._bg_exec_counter = 0
         # Background execute_code jobs keyed by bg_id. Plain threads (not asyncio
         # tasks) so they survive the per-turn event loop teardown in the CLI.
         import threading as _threading_mod
+
         self._bg_execs: dict[str, _threading_mod.Thread] = {}
+        # bg_id → short human description (first tool-method called in the code
+        # block, e.g. "image_generation.text_to_image") so the UI can show
+        # something more useful than "bg-exec-1".
+        self._bg_exec_meta: dict[str, str] = {}
+
+        # Optional event emitter. When set (e.g. by the Textual TUI), the agent
+        # emits typed events instead of printing to stdout. None → legacy
+        # prompt_toolkit CLI path which relies on print() + patch_stdout.
+        self.emitter: Any = None
+        self._current_stream: Any = None
+        # Tracks the ToolCall event for the in-flight execute_code so we can
+        # attach its output/error back to the UI when the tool returns.
+        self._pending_tool_call: Any = None
         # Optional notification hook invoked from the bg-exec coroutine when a
         # background code block finishes. Signature:
-        #   on_bg_complete(*, bg_id, error, output, new_outputs, new_artifacts)
-        # The CLI uses this to inject a synthetic user turn so the agent can
-        # react to the completed media.
+        #   on_bg_complete(*, bg_id, error, output,
+        #                  new_outputs, new_artifacts,
+        #                  produced_outputs, produced_artifacts)
+        # produced_outputs/artifacts are the *actual* objects appended by
+        # this bg run (sliced from ctx.deps.* between before/after) so the
+        # callback can reference them by URL/path instead of asking the
+        # agent to scan session-wide state.
         self.on_bg_complete: Any = None
 
         # Skill creation nudge: after N tool-calling turns without skill
@@ -406,7 +524,6 @@ class OkonomiAgent:
             "image_generation": ImageGenerationTools(self.config),
             "prompt": PromptTools(self.config),
             "research": ResearchTools(self.config),
-            "sessions": SessionTools(self.config),
             "video": VideoTools(self.config),
         }
 
@@ -442,8 +559,21 @@ class OkonomiAgent:
     def _create_model(self) -> CachedOpenRouterModel:
         return CachedOpenRouterModel(self.config.agent.model_id)
 
+    # Skills inlined into the system prompt instead of being load-on-demand.
+    # Use this for skills the agent ALWAYS needs in scope (e.g. genmedia is
+    # the only path to media generation now that the fal wrappers are
+    # being retired). Listed by skill name; resolution goes through the
+    # SkillTools loader so user-overridden versions win over bundled ones.
+    _CORE_SKILLS = ("genmedia",)
+
     def _build_skills_index(self) -> str:
-        """Build a skills index from discovered skills for the system prompt."""
+        """Build a skills index from discovered skills for the system prompt.
+
+        Core skills (always-active, content inlined elsewhere via
+        ``_build_core_skill_blocks``) are excluded from the index — listing
+        them as load-on-demand would mislead the model into round-tripping
+        through `load_skill` for content that's already in scope.
+        """
         result = self.skills.list_skills()
         skills = result.get("skills", [])
         if not skills:
@@ -451,6 +581,8 @@ class OkonomiAgent:
 
         by_category: dict[str, list[dict]] = {}
         for skill in skills:
+            if skill.get("name") in self._CORE_SKILLS:
+                continue
             cat = skill.get("category", "") or "general"
             by_category.setdefault(cat, []).append(skill)
 
@@ -464,16 +596,150 @@ class OkonomiAgent:
                     lines.append(f"    - {skill['name']}")
         return "\n".join(lines)
 
+    def _build_core_skill_blocks(self) -> str:
+        """Inline the full SKILL.md content of every core skill.
+
+        These skills are mandatory and always-active — the model treats
+        them as built-in capabilities, not load-on-demand recipes.
+        """
+        blocks: list[str] = []
+        for name in self._CORE_SKILLS:
+            try:
+                loaded = self.skills.load_skill(name)
+            except Exception:
+                continue
+            content = loaded.get("instructions") or loaded.get("content") or ""
+            if not content:
+                continue
+            blocks.append(
+                f"## Core skill: `{name}` (always active)\n\n{content.strip()}"
+            )
+        return "\n\n".join(blocks)
+
+    def _build_namespace_list(self) -> str:
+        """Comma-separated namespace names. Used by callers that want a
+        compact one-liner. Auto-syncs when programmatic_tools changes."""
+        return ", ".join(f"`{ns}`" for ns in self.programmatic_tools.keys())
+
+    def _build_tool_index(self) -> str:
+        """Per-namespace method index for the system prompt.
+
+        Eager full disclosure: each method gets its signature (with param
+        types + defaults), one-line description, and the literal
+        return-dict shape pulled from its TypedDict annotation. Cheap
+        for our ~14-method surface and means the model never has to
+        introspect to use a tool correctly.
+        """
+        import inspect as _inspect
+
+        def _pretty_type(annotation: Any) -> str:
+            """Strip noisy <class 'foo'> wrappers; preserve generics."""
+            if annotation is _inspect.Parameter.empty:
+                return "Any"
+            if isinstance(annotation, type):
+                return annotation.__name__
+            text = str(annotation)
+            if text.startswith("<class '") and text.endswith("'>"):
+                text = text[len("<class '"):-len("'>")]
+                if "." in text:
+                    text = text.rsplit(".", 1)[-1]
+            text = text.replace("typing.", "")
+            return text
+
+        def _render_signature(method: Any, name: str) -> str:
+            sig = _inspect.signature(method)
+            parts: list[str] = []
+            for pname, param in sig.parameters.items():
+                if pname == "self":
+                    continue
+                p = f"{pname}: {_pretty_type(param.annotation)}"
+                if param.default is not _inspect.Parameter.empty:
+                    p += f" = {param.default!r}"
+                parts.append(p)
+            ret = _pretty_type(sig.return_annotation)
+            return f"{name}({', '.join(parts)}) -> {ret}"
+
+        def _render_return_shape(method: Any) -> str:
+            """If the return is a TypedDict, render its key:type pairs.
+            Falls back to empty string for plain types so we don't pollute
+            the prompt for methods that don't have a structured return."""
+            sig = _inspect.signature(method)
+            ret = sig.return_annotation
+            ann = getattr(ret, "__annotations__", None)
+            if not ann:
+                return ""
+            keys = ", ".join(f'"{k}": {_pretty_type(v)}' for k, v in ann.items())
+            return f"{{{keys}}}"
+
+        sections: list[str] = []
+        for namespace, tool_instance in self.programmatic_tools.items():
+            if not hasattr(tool_instance, "__get_metadata__"):
+                continue
+            meta = tool_instance.__get_metadata__()
+            ns_desc = (meta.get("description") or "").strip()
+            sections.append(f"### `{namespace}` — {ns_desc}")
+            for method_name in (meta.get("methods") or {}).keys():
+                method = getattr(tool_instance, method_name, None)
+                if method is None:
+                    continue
+                method_info = meta["methods"][method_name]
+                method_desc = (method_info.get("description") or "").strip()
+                sig_str = _render_signature(method, method_name)
+                ret_shape = _render_return_shape(method)
+                sections.append(f"- `{namespace}.{sig_str}`")
+                sections.append(f"  {method_desc}")
+                if ret_shape:
+                    sections.append(f"  Returns: `{ret_shape}`")
+            sections.append("")
+        return "\n".join(sections).rstrip()
+
+    def _build_storage_paths(self) -> dict[str, str]:
+        """Resolve the storage directories the agent should know about.
+
+        Honors $OKONOMI_HOME and any session-storage override in config.
+        The model reads these paths, so they must reflect the user's
+        actual filesystem layout — not the documented defaults.
+        """
+        import os
+
+        okonomi_home = Path(os.getenv("OKONOMI_HOME", str(Path.home() / ".okonomi")))
+        # SessionManager already resolved its own storage_dir using the
+        # config override. Reuse that string so the prompt always matches
+        # where sessions are *actually* being written.
+        sessions_dir = str(self.session_manager.storage_dir)
+        return {
+            "sessions": sessions_dir,
+            "research": str(okonomi_home / "research"),
+            "skills": str(okonomi_home / "skills"),
+            "favourites": str(okonomi_home / "favourites"),
+        }
+
     def _get_system_prompt(self) -> str:
         """Get the system prompt for the agent."""
-        tool_docs = self._build_tool_documentation()
+        tool_index = self._build_tool_index()
         skills_index = self._build_skills_index()
+        core_skills = self._build_core_skill_blocks()
+        paths = self._build_storage_paths()
+        # f-string can't subscript with bare keys (`{paths[sessions]}` is
+        # a NameError), so bind each path to its own local.
+        sessions_dir = paths["sessions"]
+        research_dir = paths["research"]
+        skills_dir = paths["skills"]
+        favourites_dir = paths["favourites"]
 
         return f"""You are an expert creative assistant for generating images and videos using code.
 
-## Available Tools
+{core_skills}
 
-{tool_docs}
+## Programmatic Tools (used inside `execute_code`)
+
+These namespaces are pre-imported as Python objects in the `execute_code`
+sandbox. Methods are listed by name + one-line description so you know
+*which* method to reach for. Parameter signatures and return-dict shapes
+are NOT shown here — load them via Python introspection (rule 6) *before*
+calling.
+
+{tool_index}
 
 ## Skills (mandatory)
 
@@ -532,41 +798,37 @@ Example structured prompts:
 2. Use `print()` to see results from code execution
 3. Variables persist between executions — if code fails, prior variables are still available
 4. All methods are synchronous - do NOT use `await`
-5. **Never re-run expensive operations** (image/video generation) to fix a parsing error. If a KeyError or similar occurs after a generation call, use `print(result)` to inspect the existing result variable and fix the key access
-6. For tools with `[detailed docs]`, call `get_tool_documentation('tool.method')` first.
+5. **NEVER re-run `image_generation.*`, `video.*`, `browser.render`, or `fal_client` calls to recover from an error.** These calls are expensive, slow, and cost money. The generation result is still sitting in your previous `result` variable — globals persist across `execute_code` calls. If the previous call failed with a `KeyError` / `AttributeError` / `TypeError` after the generation, write a *new* `execute_code` block that does `print(result)` and fixes the access pattern. If the generation call itself raised (network error, 500), inform the user and ask before retrying — do not silently re-run. Re-running a successful generation because of a parsing bug is the single most wasteful mistake you can make.
+6. **The Programmatic Tools section above has every method's signature, parameter types, and return-dict shape.** Read it before writing code that calls a tool. Never guess `image_url` / `videos` / `url` — the literal return keys are right there. Use `inspect.getdoc(method)` only when you need the prose docstring (longer explanations, examples, edge-case notes); for signatures and return shapes the prompt is authoritative.
 7. **Saving files**: All tools have a `session_dir` property (e.g., `video.session_dir`) for the current session folder.
    Methods with `output_path` parameters auto-save to session directory when passed `output_path=None`.
 8. **Standalone tools** (`run`, `run_background`, `search`, `load_skill`, `create_skill`, `edit_skill`, `list_skills`, `launch_agent`, `list_agents`) — call directly, NOT through `execute_code`.
 9. **Programmatic tools** (`browser`, `image_processing`, `image_generation`, `prompt`, `research`, `video`) — use inside `execute_code` only.
 11. **Background agents**: Use `launch_agent(task, description)` to delegate independent work (e.g., generating multiple images in parallel). Check progress with `list_agents()`. Outputs are automatically merged back into the session.
 12. **Media/expensive code always runs in the background after approval.** Any `execute_code` block touching `image_generation.`, `video.`, `browser.render`, or `fal_client` is auto-dispatched as a background task (returns a `bg-exec-N` handle, no stdout, no `result` variable). Do NOT claim the media is ready in that turn. You'll be re-invoked with a completion notice when it finishes; the artifact will already be in the session. You may also pass `background=True` explicitly for other long-running code.
-10. **Session history**: Use `search(pattern="<keyword>", path="~/.okonomi/sessions/")` to find past sessions.
+10. **Local storage layout** — when asked to find or summarize prior work, search the right directory. These paths reflect the user's *actual* configuration (honoring `$OKONOMI_HOME` / session-storage override):
+   - `{sessions_dir}` — full conversation logs and session metadata. Use this for "what did we discuss in past sessions".
+   - `{research_dir}` — saved research reports (markdown files like `digital-decay-concept-brief.md`). Use this for "summarize my research" / "what concepts have I explored". The `concept_research` skill writes here.
+   - `{skills_dir}` — reusable skill definitions. Use this for "what skills exist".
+   - `{favourites_dir}` — user-favourited assets.
+
+   Examples (use the literal paths above, not `~/.okonomi/...`):
+   ```
+   search(pattern="<keyword>", path="{research_dir}", file_glob="*.md")
+   run(command="ls {research_dir}")
+   ```
+
+## Response Style
+
+Keep replies short. Default to 1–3 sentences of plain prose. Skip
+preambles ("Great question!", "I'll start by…"), restating the task,
+and play-by-play of what you're about to do — the user can see your
+tool calls in the UI. Don't bullet-list more than 4 items. Don't
+explain the obvious result of a successful generation; just present
+the asset URL and a one-line caption. Long replies belong only when
+the user explicitly asks for an explanation, a walkthrough, or a list.
 
 Be creative and help users generate stunning images and videos."""
-
-    def _build_tool_documentation(self) -> str:
-        """Build documentation for all available tools."""
-        docs = []
-
-        for namespace, tool_instance in self.programmatic_tools.items():
-            if hasattr(tool_instance, "__get_metadata__"):
-                metadata = tool_instance.__get_metadata__()
-                docs.append(f"### {namespace}")
-                docs.append(f"{metadata.get('description', '')}")
-                docs.append("")
-
-                for method_name, method_info in metadata.get("methods", {}).items():
-                    signature = method_info.get("signature", f"{method_name}(...)")
-                    description = method_info.get("description", "")
-                    # Mark methods with detailed documentation (docstring > 500 chars)
-                    docstring = method_info.get("docstring", "")
-                    has_detailed_docs = len(docstring) > 500
-                    doc_marker = " [detailed docs]" if has_detailed_docs else ""
-                    docs.append(f"- `{namespace}.{signature}` - {description}{doc_marker}")
-
-                docs.append("")
-
-        return "\n".join(docs)
 
     def _register_code_execution_tool(self, agent: Agent) -> None:
         """Register the code execution tool with the agent."""
@@ -585,8 +847,11 @@ Be creative and help users generate stunning images and videos."""
             - image_generation: Text-to-image, image-to-image, editing
             - prompt: Prompt creation and optimization
             - research: Web search
-            - sessions: Inspect past sessions by ID (get_session_details, get_session_summary, get_session_images, get_session_videos)
             - video: Video generation
+
+            For past-session info, use the `search` tool (not a programmatic
+            namespace) — e.g. `search(pattern="<keyword>", path="~/.okonomi/sessions/")`
+            — instead of any sessions.* methods, which no longer exist.
 
             Args:
                 code: Python code to execute. Use print() for output.
@@ -610,88 +875,6 @@ Be creative and help users generate stunning images and videos."""
                 for namespace, tool_instance in ctx.deps.tools.items():
                     ctx.deps.execution_globals[namespace] = ToolWrapper(tool_instance, ctx.deps, namespace)
 
-                # Add helper functions for tool discovery
-                def get_tools_readme() -> str:
-                    """Get a summary of all available tools and their methods."""
-                    readme = "# Available Tools\n\n"
-                    for ns, tool in ctx.deps.tools.items():
-                        if hasattr(tool, "__get_metadata__"):
-                            meta = tool.__get_metadata__()
-                            readme += f"## {ns}\n{meta.get('description', '')}\n\n"
-                            for method_name, method_info in meta.get("methods", {}).items():
-                                sig = method_info.get("signature", f"{method_name}(...)")
-                                desc = method_info.get("description", "")
-                                readme += f"- `{ns}.{sig}` - {desc}\n"
-                            readme += "\n"
-                    return readme
-
-
-                def get_tool_documentation(method_path: str) -> str:
-                    """Get detailed documentation for a specific tool method.
-
-                    IMPORTANT: Use this function before calling tools with complex parameters
-                    or specific instructions. Many tools (especially reference_image, text_to_image,
-                    edit_image) have detailed usage guides in their documentation.
-
-                    Args:
-                        method_path: The path to the method, e.g., 'image_generation.reference_image'
-
-                    Returns:
-                        Full documentation including signature, parameters, and usage examples.
-
-                    Example:
-                        docs = get_tool_documentation('image_generation.reference_image')
-                        print(docs)
-                    """
-                    parts = method_path.split(".")
-                    if len(parts) != 2:
-                        return f"Invalid method path: {method_path}. Use format 'tool_name.method_name'"
-
-                    namespace, method_name = parts
-                    tool = ctx.deps.tools.get(namespace)
-                    if not tool:
-                        available = ", ".join(ctx.deps.tools.keys())
-                        return f"Tool '{namespace}' not found. Available tools: {available}"
-
-                    method = getattr(tool, method_name, None)
-                    if not method:
-                        # List available methods
-                        methods = [m for m in dir(tool) if not m.startswith("_") and callable(getattr(tool, m))]
-                        return f"Method '{method_name}' not found in '{namespace}'. Available: {', '.join(methods)}"
-
-                    import inspect
-
-                    doc = inspect.getdoc(method) or "No documentation available"
-                    sig = inspect.signature(method)
-
-                    # Build parameter details
-                    params_doc = []
-                    for param_name, param in sig.parameters.items():
-                        if param_name == "self":
-                            continue
-                        param_type = str(param.annotation) if param.annotation != inspect.Parameter.empty else "Any"
-                        default = ""
-                        if param.default != inspect.Parameter.empty:
-                            default = f" = {param.default!r}"
-                        params_doc.append(f"  - {param_name}: {param_type}{default}")
-
-                    params_section = "\n".join(params_doc) if params_doc else "  (no parameters)"
-
-                    return f"""# {namespace}.{method_name}
-
-Signature: `{method_name}{sig}`
-
-## Parameters:
-{params_section}
-
-## Documentation:
-{doc}"""
-
-                # Alias for backward compatibility
-                def get_tool_method_documentation(method_path: str) -> str:
-                    """Alias for get_tool_documentation."""
-                    return get_tool_documentation(method_path)
-
                 def get_session_dir() -> str:
                     """Get the current session's directory path.
 
@@ -709,21 +892,88 @@ Signature: `{method_name}{sig}`
                     session_dir.mkdir(parents=True, exist_ok=True)
                     return str(session_dir)
 
-                ctx.deps.execution_globals["get_tools_readme"] = get_tools_readme
-                ctx.deps.execution_globals["get_tool_documentation"] = get_tool_documentation
-                ctx.deps.execution_globals["get_tool_method_documentation"] = get_tool_method_documentation
+                def track_output(
+                    url: str,
+                    asset_type: str,
+                    prompt: str = "",
+                    model_id: str = "",
+                    tool_name: str = "genmedia",
+                ) -> None:
+                    """Register a generated asset URL with the session.
+
+                    Use after every successful media generation (e.g.
+                    `genmedia run` or any other path that produces a
+                    URL). Triggers eager background download into the
+                    session directory, surfaces in `/assets`, and
+                    counts toward bg-exec completion summaries.
+
+                    Args:
+                        url: The remote URL of the generated asset
+                            (https://fal.media/..., …).
+                        asset_type: One of "image", "video", "audio",
+                            "3d", "other".
+                        prompt: The prompt or input that produced this
+                            asset (helps identify it in /assets).
+                        model_id: The model that generated it (e.g.
+                            "fal-ai/flux/dev"). Optional but useful.
+                        tool_name: Defaults to "genmedia". Override
+                            when calling from a different code path.
+
+                    Call once per produced URL. Call multiple times if
+                    a single generation returned several assets.
+                    """
+                    if not url:
+                        return
+                    output = GeneratedOutput(
+                        asset_url=url,
+                        asset_type=asset_type or "other",
+                        prompt=prompt or "",
+                        tool_name=tool_name or "",
+                        model_id=model_id or "",
+                        timestamp=datetime.now().isoformat(),
+                    )
+                    ctx.deps.add_output(output)
+
+                def track_artifact(
+                    path: str,
+                    artifact_type: str = "other",
+                    description: str = "",
+                    url: str = "",
+                ) -> None:
+                    """Register a local file artifact with the session.
+
+                    Use for local files the agent created (HTML
+                    sketches, stitched videos, downloaded sources)
+                    that should appear in session metadata.
+                    """
+                    if not path:
+                        return
+                    ctx.deps.add_artifact(
+                        path=path,
+                        artifact_type=artifact_type or "other",
+                        description=description or "",
+                        url=url or "",
+                    )
+
                 ctx.deps.execution_globals["get_session_dir"] = get_session_dir
+                ctx.deps.execution_globals["track_output"] = track_output
+                ctx.deps.execution_globals["track_artifact"] = track_artifact
 
             is_expensive = any(p in code for p in self._expensive_patterns)
 
-            if (
-                self.approval_callback
-                and not self.auto_approve
-                and is_expensive
-            ):
+            if self.approval_callback and not self.auto_approve and is_expensive:
                 self.spinner_text = ""
                 decision = await self.approval_callback(code)
                 if decision is False:
+                    if self._pending_tool_call is not None and self.emitter is not None:
+                        try:
+                            self.emitter.tool_finish(
+                                self._pending_tool_call,
+                                error="skipped by user",
+                            )
+                        except Exception:
+                            pass
+                        self._pending_tool_call = None
                     return "Code execution skipped by user."
                 if decision == "__auto_approve__":
                     self.auto_approve = True
@@ -763,6 +1013,19 @@ Signature: `{method_name}{sig}`
                 before_outputs = len(ctx.deps.generated_outputs)
                 before_artifacts = len(ctx.deps.artifacts)
 
+                # Hand the ToolCall event from _display_tool_call to the bg
+                # thread so it can resolve (ok/error + output) in-place when
+                # the code finishes. This gives the user a single foreground
+                # widget that represents the bg job throughout its lifetime.
+                bound_tool_call = self._pending_tool_call
+                self._pending_tool_call = None
+                if bound_tool_call is not None and self.emitter is not None:
+                    try:
+                        bound_tool_call.args = f"{bound_tool_call.args} → {bg_id} running"
+                        self.emitter.update(bound_tool_call)
+                    except Exception:
+                        pass
+
                 def _run_bg():
                     error: str | None = None
                     output: str | None = None
@@ -784,8 +1047,32 @@ Signature: `{method_name}{sig}`
                             print(f"\n{GREEN}✓ {bg_id} done{tail}{RST}")
                             if output and self.verbose:
                                 print_ansi_box(output, label=f"{bg_id} output")
+                        # Update the original ToolCall event so the user
+                        # sees the bg job's result in-place in history.
+                        if bound_tool_call is not None and self.emitter is not None:
+                            try:
+                                parts = []
+                                if new_outputs:
+                                    parts.append(f"{new_outputs} output{'s' if new_outputs != 1 else ''}")
+                                if new_artifacts:
+                                    parts.append(f"{new_artifacts} artifact{'s' if new_artifacts != 1 else ''}")
+                                summary_str = ", ".join(parts) if parts else "done"
+                                merged_output = f"{bg_id} {summary_str}" + (f"\n\n{output}" if output else "")
+                                self.emitter.tool_finish(
+                                    bound_tool_call,
+                                    output=merged_output,
+                                    error=error,
+                                )
+                            except Exception:
+                                pass
                     finally:
                         self._bg_execs.pop(bg_id, None)
+                        self._bg_exec_meta.pop(bg_id, None)
+                        # Snapshot the actual entries appended by this bg run
+                        # so the callback can name them precisely instead of
+                        # leaving the agent to guess from session-wide state.
+                        produced_outputs = list(ctx.deps.generated_outputs[before_outputs:])
+                        produced_artifacts = list(ctx.deps.artifacts[before_artifacts:])
                         if self.on_bg_complete is not None:
                             try:
                                 self.on_bg_complete(
@@ -794,14 +1081,17 @@ Signature: `{method_name}{sig}`
                                     output=output,
                                     new_outputs=new_outputs,
                                     new_artifacts=new_artifacts,
+                                    produced_outputs=produced_outputs,
+                                    produced_artifacts=produced_artifacts,
                                 )
                             except Exception as cb_err:
                                 print(f"{RED}on_bg_complete callback failed: {cb_err}{RST}")
 
-                thread = threading.Thread(
-                    target=_run_bg, daemon=True, name=f"okonomi-{bg_id}"
-                )
+                thread = threading.Thread(target=_run_bg, daemon=True, name=f"okonomi-{bg_id}")
                 self._bg_execs[bg_id] = thread
+                # Scrape a short label for the UI ("image_generation.text_to_image",
+                # "video.generate", etc.) so running bg work is identifiable.
+                self._bg_exec_meta[bg_id] = _extract_bg_label(code)
                 thread.start()
                 self.spinner_text = ""
                 return (
@@ -814,16 +1104,42 @@ Signature: `{method_name}{sig}`
             try:
                 output, error = await asyncio.to_thread(_exec_in_thread)
 
+                # Attach output/error back to the UI's ToolCall event so the
+                # user sees failures without having to ask the model what
+                # happened. The widget auto-expands on error status.
+                if self._pending_tool_call is not None and self.emitter is not None:
+                    pending = self._pending_tool_call
+                    self._pending_tool_call = None
+                    try:
+                        self.emitter.tool_finish(pending, output=output or "", error=error)
+                    except Exception:
+                        pass
+
                 if error:
                     if self.verbose:
                         print_ansi_box(f"Error executing code:\n{error}", label="error", color="31")
-                    return f"Error executing code:\n{error}"
+                    hint = ""
+                    # If the code hit a parsing error *after* touching an
+                    # expensive tool, remind the model that globals persist
+                    # and it should NOT re-run the expensive call.
+                    if any(p in code for p in self._expensive_patterns) and any(
+                        kind in error for kind in ("KeyError", "AttributeError", "TypeError", "IndexError")
+                    ):
+                        hint = (
+                            "\n\nHINT: The generation call likely succeeded — "
+                            "the `result` variable is still in globals. DO NOT "
+                            "re-run image_generation/video/fal_client. Write a new "
+                            "execute_code block with `print(result)` to inspect "
+                            "its shape, then fix the access pattern."
+                        )
+                    return f"Error executing code:\n{error}{hint}"
 
                 if self.verbose and output:
                     print_ansi_box(output, label="output")
 
                 if output:
                     from .context import _strip_large_content
+
                     cleaned = _strip_large_content(output)
                     if len(cleaned) > 10_000:
                         cleaned = cleaned[:8_000] + "\n...[truncated]...\n" + cleaned[-1_500:]
@@ -864,8 +1180,38 @@ Signature: `{method_name}{sig}`
             def make_wrapper(m, s, tn, agent_self=self):
                 def wrapper(*args, **kwargs):
                     agent_self.spinner_text = f"Running {tn}..."
+                    pending = agent_self._pending_tool_call
+                    agent_self._pending_tool_call = None
                     try:
-                        return m(*args, **kwargs)
+                        result = m(*args, **kwargs)
+                        # Surface the return value back onto the UI event.
+                        if pending is not None and agent_self.emitter is not None:
+                            error_msg = None
+                            output = ""
+                            if isinstance(result, dict) and result.get("error"):
+                                # Tools often return {"error": "..."} on failure
+                                # instead of raising — treat as an error visibly.
+                                error_msg = str(result["error"])
+                            else:
+                                try:
+                                    output = _short_repr(result)
+                                except Exception:  # noqa: BLE001
+                                    output = repr(result)
+                            try:
+                                agent_self.emitter.tool_finish(pending, output=output, error=error_msg)
+                            except Exception:  # noqa: BLE001
+                                pass
+                        return result
+                    except Exception as exc:
+                        # Tool raised — surface traceback to the UI so the
+                        # user sees what went wrong before the model
+                        # confabulates a recovery.
+                        if pending is not None and agent_self.emitter is not None:
+                            try:
+                                agent_self.emitter.tool_finish(pending, error=f"{type(exc).__name__}: {exc}")
+                            except Exception:  # noqa: BLE001
+                                pass
+                        raise
                     finally:
                         agent_self.spinner_text = ""
 
@@ -897,7 +1243,38 @@ Signature: `{method_name}{sig}`
             errors=self.errors,
             verbose=self.verbose,
             execution_globals=self.execution_globals,
+            on_output_added=self._eager_download_output,
         )
+
+    def _eager_download_output(self, output: GeneratedOutput) -> None:
+        """Submit a background download for a generated output.
+
+        Fires from AgentDependencies.add_output the moment a tool tracks an
+        asset. By the time save_session runs, most assets are already on
+        disk and `_download_session_assets` is a fast no-op. Idempotent —
+        already-downloaded outputs are skipped.
+        """
+        if not output.asset_url or output.local_path:
+            return
+
+        def _run() -> None:
+            try:
+                session_dir = self.session_manager.get_session_dir(self.session_id)
+                session_dir.mkdir(parents=True, exist_ok=True)
+                local_path = self._download_asset(output.asset_url, session_dir, output.asset_type)
+                # Mutating from a worker thread is safe: GeneratedOutput is
+                # a plain dataclass with no other writers for local_path.
+                output.local_path = local_path
+            except Exception:
+                # Leave local_path empty so save_session retries later.
+                pass
+
+        try:
+            future = self._asset_dl_pool.submit(_run)
+            self._asset_dl_futures.append(future)
+        except RuntimeError:
+            # Pool was shut down (process exiting) — fall back to sync.
+            _run()
 
     def _sanitize_history(self, messages: list[ModelMessage]) -> list[ModelMessage]:
         """Remove trailing messages with unprocessed tool calls.
@@ -935,6 +1312,7 @@ Signature: `{method_name}{sig}`
             return args.get("code", "")
         if isinstance(args, str):
             import json
+
             try:
                 parsed = json.loads(args)
                 return parsed.get("code", "") if isinstance(parsed, dict) else ""
@@ -951,13 +1329,33 @@ Signature: `{method_name}{sig}`
             if not code:
                 return
             self._last_code = code
-            if self.verbose or self.approval_callback and any(
+            needs_approval = self.approval_callback is not None and any(
                 p in code for p in self._expensive_patterns
-            ):
-                print_code_box(code)
+            )
+            if self.verbose or needs_approval:
+                if self.emitter is not None:
+                    line_count = code.count("\n") + 1
+                    # Code that triggers approval is shown expanded by default
+                    # so the user can read what they're about to authorize
+                    # without needing to press Ctrl+O.
+                    self._pending_tool_call = self.emitter.tool_call(
+                        "execute_code",
+                        args=f"{line_count} lines",
+                        details=code,
+                        expanded=needs_approval,
+                    )
+                else:
+                    print_code_box(code)
             else:
                 line_count = code.count("\n") + 1
-                print(f"{DIM}▶ execute_code ({line_count} lines) — Ctrl+O to view{RST}")
+                if self.emitter is not None:
+                    self._pending_tool_call = self.emitter.tool_call(
+                        "execute_code",
+                        args=f"{line_count} lines",
+                        details=code,
+                    )
+                else:
+                    print(f"{DIM}▶ execute_code ({line_count} lines) — Ctrl+O to view{RST}")
         elif part.tool_name == "load_skill":
             import json
 
@@ -968,9 +1366,18 @@ Signature: `{method_name}{sig}`
                 except json.JSONDecodeError:
                     pass
             name = args.get("name", args) if isinstance(args, dict) else args
-            print(f"{DIM}Loading skill: {name}{RST}")
+            if self.emitter is not None:
+                self._pending_tool_call = self.emitter.tool_call("load_skill", args=str(name), details=str(args))
+            else:
+                print(f"{DIM}Loading skill: {name}{RST}")
         else:
-            if self.verbose:
+            if self.emitter is not None:
+                self._pending_tool_call = self.emitter.tool_call(
+                    part.tool_name,
+                    args=str(part.args) if part.args else "",
+                    details=str(part.args) if part.args else "",
+                )
+            elif self.verbose:
                 print(f"{DIM}{part.tool_name}({part.args}){RST}")
             else:
                 print(f"{DIM}▶ {part.tool_name}{RST}")
@@ -1011,10 +1418,7 @@ Signature: `{method_name}{sig}`
             # After interruption, strip the cancelled turn's partial model
             # response so the new instruction starts from a clean state.
             if self._was_interrupted:
-                while (
-                    self.message_history
-                    and isinstance(self.message_history[-1], ModelResponse)
-                ):
+                while self.message_history and isinstance(self.message_history[-1], ModelResponse):
                     self.message_history.pop()
 
             self.message_history, was_pruned = self.context.prune_if_needed(self.message_history)
@@ -1024,9 +1428,7 @@ Signature: `{method_name}{sig}`
             if self.context.should_compress_preflight(self.message_history):
                 compressed, was_compressed = self.context.compress(self.message_history)
                 if was_compressed:
-                    print(
-                        f"{DIM}Context compressed: {len(self.message_history)} → {len(compressed)} messages{RST}"
-                    )
+                    print(f"{DIM}Context compressed: {len(self.message_history)} → {len(compressed)} messages{RST}")
                     self.message_history = compressed
 
         # When resuming after an interruption, prepend a priority marker
@@ -1034,8 +1436,7 @@ Signature: `{method_name}{sig}`
         if self._was_interrupted and self.message_history:
             user_message = (
                 "[The user interrupted the previous response to give new instructions. "
-                "Stop what you were doing and focus on this message.]\n\n"
-                + user_message
+                "Stop what you were doing and focus on this message.]\n\n" + user_message
             )
 
         # Append skill creation nudge when threshold is reached
@@ -1055,37 +1456,47 @@ Signature: `{method_name}{sig}`
             ) as agent_run:
                 try:
                     async for node in agent_run:
-                        if Agent.is_model_request_node(node):
-                            self.spinner_text = "Thinking..."
-                            async with node.stream(agent_run.ctx) as stream:
-                                accumulated_text = ""
-                                line_buf = ""
+                        if not Agent.is_model_request_node(node):
+                            continue
+                        self.spinner_text = "Thinking..."
+                        async with node.stream(agent_run.ctx) as stream:
+                            accumulated_text = ""
+                            line_buf = ""
 
-                                async for text in stream.stream_text(delta=True, debounce_by=None):
-                                    if self.spinner_text:
-                                        self.spinner_text = ""
-                                    accumulated_text += text
+                            async for text in stream.stream_text(delta=True, debounce_by=None):
+                                if self.spinner_text:
+                                    self.spinner_text = ""
+                                accumulated_text += text
+                                if self.emitter is not None:
+                                    if self._current_stream is None:
+                                        self._current_stream = self.emitter.assistant_start()
+                                    self.emitter.assistant_append(self._current_stream, text)
+                                else:
                                     line_buf += text
                                     while "\n" in line_buf:
                                         line, line_buf = line_buf.split("\n", 1)
                                         print(f"{LLM}{line}{RST}")
 
-                                self.spinner_text = ""
+                            self.spinner_text = ""
 
+                            if self.emitter is not None:
+                                if self._current_stream is not None:
+                                    self.emitter.assistant_done(self._current_stream)
+                                    self._current_stream = None
+                            else:
                                 if line_buf.strip():
                                     print(f"{LLM}{line_buf}{RST}")
-
                                 if accumulated_text.strip():
                                     print()
 
-                                if accumulated_text.strip():
-                                    final_output = accumulated_text
+                            if accumulated_text.strip():
+                                final_output = accumulated_text
 
-                                response = stream.response
-                                if response and response.parts:
-                                    for part in response.parts:
-                                        if isinstance(part, ToolCallPart):
-                                            self._display_tool_call(part)
+                            response = stream.response
+                            if response and response.parts:
+                                for part in response.parts:
+                                    if isinstance(part, ToolCallPart):
+                                        self._display_tool_call(part)
 
                 except asyncio.CancelledError:
                     self._was_interrupted = True
@@ -1113,6 +1524,15 @@ Signature: `{method_name}{sig}`
 
             # Update message history for conversation continuity
             self.message_history = result.all_messages()
+            # Refresh the estimated history size so the status bar shows
+            # the true persistent context — what will be sent on the
+            # NEXT turn — rather than the cumulative input across the
+            # round-trips of the last turn.
+            from .context import estimate_tokens_rough
+            try:
+                self.token_usage.history_tokens = estimate_tokens_rough(self.message_history)
+            except Exception:
+                pass
             self.generated_outputs = deps.generated_outputs
             self.artifacts = deps.artifacts
 
@@ -1164,8 +1584,14 @@ Signature: `{method_name}{sig}`
             url_filename = Path(parsed.path).name
 
             if Path(url_filename).suffix.lower() in {
-                ".jpg", ".jpeg", ".png", ".webp", ".gif",
-                ".mp4", ".webm", ".mov",
+                ".jpg",
+                ".jpeg",
+                ".png",
+                ".webp",
+                ".gif",
+                ".mp4",
+                ".webm",
+                ".mov",
             }:
                 filename = url_filename
             else:
@@ -1190,26 +1616,38 @@ Signature: `{method_name}{sig}`
     def _download_session_assets(self, session_dir: Path) -> None:
         """Download all generated outputs to the session directory.
 
-        Args:
-            session_dir: Directory to save assets
+        Crash-resistant: a failed download (network blip, fal expiry,
+        etc.) does not abort the save. The output keeps its remote URL;
+        the next save will retry the download.
         """
         for output in self.generated_outputs:
-            if output.asset_url and not output.local_path:
+            if not output.asset_url or output.local_path:
+                continue
+            try:
                 local_path = self._download_asset(output.asset_url, session_dir, output.asset_type)
                 output.local_path = local_path
+            except Exception:
+                # Swallow — preserve URL for retry, keep iterating.
+                continue
 
-    def save_session(self, status: str = "completed") -> None:
+    def save_session(self, status: str = "completed", download_assets: bool = True) -> None:
         """Save the current session state.
 
         Args:
             status: Status of the session (completed, error, abandoned)
+            download_assets: When True (default), synchronously download
+                any tracked outputs that don't yet have a ``local_path``.
+                Set False on shutdown / atexit paths so quitting doesn't
+                wait on slow network downloads — the eager bg pool has
+                been pulling these all along, and any still-missing files
+                will be retried on the next session resume.
         """
         # Get session directory and ensure it exists
         session_dir = self.session_manager.get_session_dir(self.session_id)
         session_dir.mkdir(parents=True, exist_ok=True)
 
-        # Download all assets to the session directory
-        self._download_session_assets(session_dir)
+        if download_assets:
+            self._download_session_assets(session_dir)
 
         now = datetime.now().isoformat()
         metadata = SessionMetadata(
@@ -1243,6 +1681,7 @@ Signature: `{method_name}{sig}`
 
         if not metadata.title and self.task:
             from .utils import generate_title
+
             title = generate_title(self.task)
             if title:
                 metadata.title = title

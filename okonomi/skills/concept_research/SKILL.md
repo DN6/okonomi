@@ -1,6 +1,6 @@
 ---
 name: concept-research
-description: "Deep creative research and conceptual exploration upstream of image/video creation. Develops rich, well-researched visual concepts before any pixels are made — for AI image gen, photography, illustration, concept art, or video. Covers: brainstorming visual ideas, mood boards, style/movement exploration, reference mapping, concept briefs, prompt packages, palette/composition analysis, and art history deep dives. Trigger when users want to: brainstorm visuals, explore a style, build a mood board, develop a concept brief, craft image prompts, plan a photoshoot, flesh out a vague idea, or when they say 'I want something that looks like X.'"
+description: "Deep creative research and conceptual exploration upstream of media creation. Develops rich, well-researched visual concepts before any pixels are made — for AI image gen, photography, illustration, concept art, or video. Covers: brainstorming visual ideas, mood boards, style/movement exploration, reference mapping, concept briefs, prompt packages, palette/composition analysis, and art history deep dives. Trigger when users want to: brainstorm visuals, explore a style, build a mood board, develop a concept brief, craft image prompts, plan a photoshoot, flesh out a vague idea, or when they say 'I want something that looks like X.'"
 metadata:
   tags: [concept, research, ideation, visual-language, prompt-crafting, mood-board, art-direction]
   related_skills: [video-generation]
