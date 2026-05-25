@@ -38,11 +38,11 @@ class AgentSession:
 
     async def run(self, message: str, reset: bool = False) -> str:
         async with self.lock:
-            self._prev_output_count = len(self.agent.generated_outputs)
+            self._prev_output_count = len(self.agent.artifacts)
             return await self.agent.run_async(message, reset=reset)
 
     def new_outputs(self) -> list:
-        return self.agent.generated_outputs[self._prev_output_count:]
+        return self.agent.artifacts[self._prev_output_count :]
 
 
 class OkonomiBot(discord.Client):
@@ -126,7 +126,7 @@ class OkonomiBot(discord.Client):
             lines = [
                 f"**Session:** `{agent.session_id[:8]}`",
                 f"**Task:** {agent.task or 'N/A'}",
-                f"**Outputs:** {len(agent.generated_outputs)}",
+                f"**Artifacts:** {len(agent.artifacts)}",
                 f"**Tokens:** {usage.total_tokens:,} ({usage.requests} requests)",
             ]
             await interaction.response.send_message("\n".join(lines), ephemeral=True)
@@ -211,9 +211,11 @@ class OkonomiBot(discord.Client):
 
     async def _collect_media(self, session: AgentSession) -> list[discord.File]:
         files = []
-        for output in session.new_outputs():
-            path = output.local_path
-            url = output.asset_url
+        for artifact in session.new_outputs():
+            if artifact.artifact_type not in ("image", "video", "audio", "3d"):
+                continue
+            path = artifact.path
+            url = artifact.url
 
             if path and Path(path).exists() and Path(path).stat().st_size < DISCORD_MAX_FILE_SIZE:
                 try:
@@ -224,8 +226,8 @@ class OkonomiBot(discord.Client):
                 try:
                     data = await self._download_url(url)
                     if data and len(data) < DISCORD_MAX_FILE_SIZE:
-                        ext = ".jpg" if output.asset_type == "image" else ".mp4"
-                        filename = f"{output.asset_type}_{len(files)}{ext}"
+                        ext = ".jpg" if artifact.artifact_type == "image" else ".mp4"
+                        filename = f"{artifact.artifact_type}_{len(files)}{ext}"
                         files.append(discord.File(io.BytesIO(data), filename=filename))
                 except Exception:
                     pass
@@ -322,9 +324,7 @@ def run_discord_bot() -> None:
     """Entry point for launching the Discord bot."""
     token = os.getenv("DISCORD_BOT_TOKEN")
     if not token:
-        raise EnvironmentError(
-            "DISCORD_BOT_TOKEN not set. Set it in your .env file or environment."
-        )
+        raise EnvironmentError("DISCORD_BOT_TOKEN not set. Set it in your .env file or environment.")
 
     logging.basicConfig(
         level=logging.INFO,

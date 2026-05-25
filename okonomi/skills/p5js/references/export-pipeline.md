@@ -133,7 +133,7 @@ function draw() {
 Then stitch with ffmpeg:
 
 ```
-run(command="ffmpeg -framerate 30 -i frame-%04d.png -c:v libx264 -pix_fmt yuv420p output.mp4")
+bash(command="ffmpeg -framerate 30 -i frame-%04d.png -c:v libx264 -pix_fmt yuv420p output.mp4")
 ```
 
 ### Multi-Scene Video
@@ -164,7 +164,7 @@ with open(filelist, "w") as f:
 
 Then stitch:
 ```
-run(command="ffmpeg -y -f concat -safe 0 -i {session_dir}/filelist.txt -c copy {session_dir}/final.mp4")
+bash(command="ffmpeg -y -f concat -safe 0 -i {session_dir}/filelist.txt -c copy {session_dir}/final.mp4")
 ```
 
 ## Video Export Gotchas

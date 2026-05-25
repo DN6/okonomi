@@ -7,7 +7,7 @@ the session directory for outputs.
 
 import asyncio
 import threading
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from datetime import datetime
 
 from okonomi.config import OkonomiConfig
@@ -71,9 +71,36 @@ class AgentTools:
 
         approval_callback = parent.approval_callback
 
+        # Register in the parent agent's shared bg-log registry so /jobs
+        # and /logs see launched agents alongside bg-exec-N and term-N.
+        # The reader snapshots the BackgroundTask record (status, error,
+        # artifact count) — full transcript capture would require routing
+        # the bg agent's emitter through here, which the launch site
+        # currently doesn't have set up. Status summary is enough to
+        # answer "is it still running, did it crash, how much did it
+        # produce" — the bulk of /logs queries.
+        def _reader(bg=bg_task) -> str:
+            parts = [
+                f"task: {bg.description}",
+                f"started: {bg.started_at}",
+                f"status: {bg.status}",
+            ]
+            if bg.outputs:
+                parts.append(f"artifacts produced: {bg.outputs}")
+            if bg.error:
+                parts.append(f"error: {bg.error}")
+            return "\n".join(parts)
+
+        if hasattr(parent, "_register_bg_log"):
+            try:
+                parent._register_bg_log(task_id=task_id, label=label, reader=_reader)
+            except Exception:
+                pass
+
         def _run():
             from okonomi.agent import OkonomiAgent
 
+            final_status = "ok"
             try:
                 agent = OkonomiAgent(
                     parent.config,
@@ -85,17 +112,17 @@ class AgentTools:
                 asyncio.set_event_loop(loop)
                 try:
                     loop.run_until_complete(agent.run_async(task, reset=True))
-                    parent.generated_outputs.extend(agent.generated_outputs)
                     parent.artifacts.extend(agent.artifacts)
                     parent.tools_used.update(agent.tools_used)
-                    bg_task.outputs = len(agent.generated_outputs)
+                    bg_task.outputs = len(agent.artifacts)
                     bg_task.status = "done"
                     print(
-                        f"\n{GREEN}✓ Agent done: {label} — {bg_task.outputs} output{'s' if bg_task.outputs != 1 else ''}{RST}"
+                        f"\n{GREEN}✓ Agent done: {label} — {bg_task.outputs} artifact{'s' if bg_task.outputs != 1 else ''}{RST}"
                     )
                 except Exception as e:
                     bg_task.status = "failed"
                     bg_task.error = str(e)
+                    final_status = "error"
                     print(f"\n{RED}✗ Agent failed: {label} — {e}{RST}")
                 finally:
                     from okonomi.cli import _shutdown_loop
@@ -104,7 +131,14 @@ class AgentTools:
             except Exception as e:
                 bg_task.status = "failed"
                 bg_task.error = str(e)
+                final_status = "error"
                 print(f"\n{RED}✗ Agent error: {label} — {e}{RST}")
+            finally:
+                if hasattr(parent, "_mark_bg_log_done"):
+                    try:
+                        parent._mark_bg_log_done(task_id=task_id, status=final_status)
+                    except Exception:
+                        pass
 
         t = threading.Thread(target=_run, daemon=True, name=f"okonomi-{task_id}")
         t.start()

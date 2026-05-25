@@ -1,4 +1,5 @@
 """Per-event widget classes rendered in the history pane."""
+
 from __future__ import annotations
 
 from rich.syntax import Syntax
@@ -66,15 +67,27 @@ class UserMessageWidget(Static):
 class AssistantStreamWidget(Static):
     """Streaming assistant text — muted LLM gray, matches the prompt_toolkit palette.
 
-    Decouples the emit rate from the render rate: the emitter mutates
-    ``event.text`` as fast as tokens arrive (could be 100+/sec), but the
-    widget redraws on a fixed-cadence timer (~30 Hz) and only when the
-    event has actually grown. That gives a smooth typewriter feel without
-    a re-render storm during bursty streams. When the event is marked
-    done, the timer stops and a final sync flushes whatever is left.
+    Three ideas combine to make the reveal feel calm rather than chunky:
+
+    1. *Decoupled rates.* ``event.text`` grows in bursts (network
+       chunks); the widget keeps a cursor and reveals at a steady tick.
+
+    2. *Word-boundary snapping.* Each tick advances toward a target
+       step-size in chars but lands on the nearest whitespace. Words
+       pop in whole — no "back" → "backgr" → "background" stagger.
+
+    3. *Hard ceiling on per-frame advance.* Big bursts don't translate
+       to big visual blobs; instead the cursor catches up over many
+       frames at a capped rate. Lag may temporarily exceed ``MAX_LAG_S``
+       during very large bursts, which is fine — better than a thump.
     """
 
-    REFRESH_INTERVAL_S = 0.033  # ~30 Hz
+    REFRESH_INTERVAL_S = 0.016  # ~60 Hz
+    CHARS_PER_SEC_BASE = 180  # steady-state read pace
+    CHARS_PER_SEC_MAX = 480  # absolute ceiling — keeps frames blob-free
+    MAX_LAG_S = 1.5  # target catch-up window before we hit the ceiling
+    WORD_LOOKAHEAD = 12  # chars to scan past target for the next whitespace
+    DONE_DRAIN_CHARS_PER_SEC = 720  # faster reveal once producer is done
 
     DEFAULT_CSS = """
     AssistantStreamWidget {
@@ -86,36 +99,95 @@ class AssistantStreamWidget(Static):
     def __init__(self, event: AssistantStream) -> None:
         super().__init__(Text(event.text))
         self.event = event
-        self._last_rendered_len: int = 0
+        self._displayed_chars: int = 0
         self._refresh_timer = None
 
     def on_mount(self) -> None:
-        self._render_now()
-        self._refresh_timer = self.set_interval(
-            self.REFRESH_INTERVAL_S, self._tick
-        )
+        self._tick()
+        self._refresh_timer = self.set_interval(self.REFRESH_INTERVAL_S, self._tick)
 
-    def _render_now(self) -> None:
-        if not self.is_mounted:
-            return
-        self.update(Text(self.event.text))
-        self._last_rendered_len = len(self.event.text)
+    def _stop_timer(self) -> None:
+        if self._refresh_timer is not None:
+            self._refresh_timer.stop()
+            self._refresh_timer = None
 
     def _tick(self) -> None:
-        # Cheap length compare — skip the full update() if nothing arrived.
-        if len(self.event.text) != self._last_rendered_len:
-            self._render_now()
-
-    def sync_from_event(self) -> None:
-        """Mid-stream: do nothing (the timer covers it). On done: flush
-        the final state immediately and stop the timer."""
         if not self.is_mounted:
             return
+        text = self.event.text
+        total = len(text)
+        pos = self._displayed_chars
+        backlog = total - pos
+        if backlog <= 0:
+            if self.event.done:
+                self._stop_timer()
+            return
+
+        # Target chars-per-second: base, scaled up if we'd otherwise lag
+        # more than MAX_LAG_S; capped at CHARS_PER_SEC_MAX so even huge
+        # bursts can't translate into blob jumps.
+        rate = max(self.CHARS_PER_SEC_BASE, backlog / self.MAX_LAG_S)
         if self.event.done:
-            self._render_now()
-            if self._refresh_timer is not None:
-                self._refresh_timer.stop()
-                self._refresh_timer = None
+            rate = max(rate, self.DONE_DRAIN_CHARS_PER_SEC)
+        rate = min(rate, self.CHARS_PER_SEC_MAX)
+        step = max(1, int(rate * self.REFRESH_INTERVAL_S))
+
+        target = min(pos + step, total)
+        new_pos = self._snap_to_word_boundary(text, pos, target, total)
+
+        if new_pos > pos:
+            self._displayed_chars = new_pos
+            self.update(Text(text[:new_pos]))
+
+        if self.event.done and self._displayed_chars >= total:
+            self._stop_timer()
+
+    def _snap_to_word_boundary(self, text: str, pos: int, target: int, total: int) -> int:
+        """Pick a reveal endpoint that lands on a word boundary.
+
+        Strategy:
+        - If ``target`` already lands at end-of-text (and stream is
+          done), just return target.
+        - Look at chars [target, target+lookahead) for whitespace —
+          if found, advance to *just past* that whitespace.
+        - Otherwise look back from ``target`` to ``pos`` for the last
+          whitespace — advance there.
+        - If neither (truly mid-word), wait unless stream is done.
+        """
+        if target >= total:
+            # Buffer end. Only safe to land here if no more chars are coming.
+            if self.event.done:
+                return total
+            # Otherwise look back so we don't reveal a partial word.
+            last_ws = -1
+            for i in range(target - 1, pos - 1, -1):
+                if text[i].isspace():
+                    last_ws = i + 1
+                    break
+            return last_ws if last_ws > pos else pos
+
+        # Look forward for whitespace within lookahead.
+        end_search = min(total, target + self.WORD_LOOKAHEAD)
+        for i in range(target, end_search):
+            if text[i].isspace():
+                return i + 1
+
+        # Fall back: look backward for the last whitespace in [pos, target).
+        for i in range(target - 1, pos - 1, -1):
+            if text[i].isspace():
+                return i + 1
+
+        # No boundaries anywhere in the window. If stream is done, just
+        # land at target — partial word is OK at the very end. Otherwise
+        # wait for more text rather than reveal mid-word.
+        if self.event.done:
+            return target
+        return pos
+
+    def sync_from_event(self) -> None:
+        """Mid-stream: no-op (timer handles it). Done is observed by
+        the next tick which then drains and stops itself."""
+        return
 
 
 class SystemNoteWidget(Static):
@@ -222,7 +294,7 @@ def render_welcome_banner(label: str = "okonomi") -> Text:
 
     def _wave_line(content_w: int, offset: int = 0) -> str:
         wave = "~^~"
-        shifted = wave[offset % 3:] + wave[: offset % 3]
+        shifted = wave[offset % 3 :] + wave[: offset % 3]
         return (shifted * (content_w // 3 + 2))[offset % 3 : offset % 3 + content_w]
 
     text = Text()

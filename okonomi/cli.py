@@ -6,22 +6,10 @@ argparse + one-shot task runner + session resolution.
 
 import argparse
 import asyncio
-import logging
-import os
 
 from .agent import OkonomiAgent
 from .config import config
 from .display import BOLD, CYAN, DIM, GREEN, PINK, RED, RST, YELLOW, get_task_input
-
-
-# =============================================================================
-# Observability
-# =============================================================================
-
-
-def setup_observability() -> None:
-    if os.getenv("LOG_CREATE_AGENT_TRACES", "false").lower() not in ["true", "1"]:
-        return
 
 
 # =============================================================================
@@ -40,12 +28,12 @@ def handle_list_sessions() -> None:
         return
 
     print(f"\n{BOLD}{CYAN}Past Sessions:{RST}\n")
-    for session in sessions:
-        print(f"{BOLD}{session.session_id}{RST}")
-        print(f"  Task: {session.task_input}")
-        print(f"  Time: {session.created_at}")
-        print(f"  Status: {session.status}")
-        print(f"  Outputs: {session.num_outputs}")
+    for s in sessions:
+        print(f"{BOLD}{s.session_id}{RST}")
+        print(f"  Task: {s.task_input}")
+        print(f"  Time: {s.created_at}")
+        print(f"  Status: {s.status}")
+        print(f"  Artifacts: {s.num_artifacts}")
         print()
 
 
@@ -53,19 +41,20 @@ def handle_search_outputs(query: str) -> None:
     from .session import SessionManager
 
     manager = SessionManager()
-    results = manager.search_outputs(query=query, limit=20)
+    hits = manager.search_artifacts(query, limit=20)
 
-    if not results:
+    if not hits:
         print(f"{YELLOW}No outputs found matching '{query}'.{RST}")
         return
 
     print(f"\n{BOLD}{CYAN}Outputs matching '{query}':{RST}\n")
-    for result in results:
-        output = result["output"]
-        print(f"{BOLD}Session:{RST} {result['session_id'][:8]}...")
-        print(f"  Task: {result['task_input']}")
-        print(f"  Type: {output['asset_type']}")
-        print(f"  URL: {output['asset_url']}")
+    for h in hits:
+        print(f"{BOLD}Session:{RST} {h['session_id'][:8]}...")
+        print(f"  Title: {h.get('title', '')}")
+        print(f"  Type:  {h.get('artifact_type', '')}")
+        print(f"  URL:   {h.get('url') or h.get('path', '')}")
+        if h.get("prompt"):
+            print(f"  Prompt: {h['prompt']}")
         print()
 
 
@@ -78,16 +67,16 @@ def resolve_session(args: argparse.Namespace) -> str | None:
     manager = SessionManager()
 
     if args.resume:
-        latest = manager.get_latest_session()
-        if latest:
-            print(f"{BOLD}{GREEN}Resuming: {latest.metadata.display_name}{RST}\n")
-            return latest.metadata.session_id
+        recent = manager.list_sessions(limit=1)
+        if recent:
+            print(f"{BOLD}{GREEN}Resuming: {recent[0].display_name}{RST}\n")
+            return recent[0].session_id
         print(f"{YELLOW}No previous sessions found. Starting new session.{RST}\n")
         return None
 
     session = manager.load_session(args.session)
     if session:
-        print(f"{BOLD}{GREEN}Loaded: {session.metadata.display_name}{RST}\n")
+        print(f"{BOLD}{GREEN}Loaded: {session.display_name}{RST}\n")
         return args.session
 
     print(f"{RED}Session {args.session} not found. Starting new session.{RST}\n")

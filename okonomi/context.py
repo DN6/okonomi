@@ -24,6 +24,7 @@ from pydantic_ai.messages import (
 from .config import OkonomiConfig
 from .utils import create_chat_client
 
+
 logger = logging.getLogger(__name__)
 
 SUMMARY_PREFIX = (
@@ -48,9 +49,11 @@ _HTML_PREFIX_PATTERN = re.compile(r"^\s*(<(!DOCTYPE|html)\b)", re.IGNORECASE)
 
 def _strip_base64(text: str) -> str:
     """Replace base64 data URIs with a short placeholder."""
+
     def _replace(m):
         size_kb = len(m.group(0)) * 3 // 4 // 1024
         return f"[embedded image, ~{size_kb}KB]"
+
     return _BASE64_PATTERN.sub(_replace, text)
 
 
@@ -121,7 +124,7 @@ class ContextManager:
         self.context_length = config.context.context_length
         self.threshold_percent = config.context.compression_threshold
         self.threshold_tokens = int(self.context_length * self.threshold_percent)
-        self.prune_threshold = getattr(config.context, "prune_threshold", 0.65)
+        self.prune_threshold = config.context.prune_threshold
         self.prune_threshold_tokens = int(self.context_length * self.prune_threshold)
         self.protect_first_n = protect_first_n
         self.protect_last_n = protect_last_n
@@ -130,21 +133,12 @@ class ContextManager:
         self._client = create_chat_client()
         self._previous_summary: Optional[str] = None
 
-        self.last_prompt_tokens = 0
-
         logger.info(
             "Context manager: context_length=%d threshold=%d (%.0f%%)",
             self.context_length,
             self.threshold_tokens,
             self.threshold_percent * 100,
         )
-
-    def update_token_usage(self, prompt_tokens: int) -> None:
-        self.last_prompt_tokens = prompt_tokens
-
-    def should_compress(self, prompt_tokens: int | None = None) -> bool:
-        tokens = prompt_tokens if prompt_tokens is not None else self.last_prompt_tokens
-        return tokens >= self.threshold_tokens
 
     def should_compress_preflight(self, messages: list[ModelMessage]) -> bool:
         return estimate_tokens_rough(messages) >= self.threshold_tokens
@@ -160,8 +154,12 @@ class ContextManager:
 
         messages, pruned = self._prune_old_tool_results(messages, self.protect_last_n * 3)
         if pruned:
-            logger.info("Lightweight prune: stripped %d items at %d tokens (threshold %d)",
-                        pruned, est, self.prune_threshold_tokens)
+            logger.info(
+                "Lightweight prune: stripped %d items at %d tokens (threshold %d)",
+                pruned,
+                est,
+                self.prune_threshold_tokens,
+            )
         return messages, pruned > 0
 
     # ------------------------------------------------------------------
@@ -195,22 +193,26 @@ class ContextManager:
                     content = str(part.content)
                     stripped = _strip_large_content(content)
                     if stripped != content:
-                        new_parts.append(ToolReturnPart(
-                            tool_name=part.tool_name,
-                            content=stripped,
-                            tool_call_id=part.tool_call_id,
-                            timestamp=part.timestamp,
-                        ))
+                        new_parts.append(
+                            ToolReturnPart(
+                                tool_name=part.tool_name,
+                                content=stripped,
+                                tool_call_id=part.tool_call_id,
+                                timestamp=part.timestamp,
+                            )
+                        )
                         pruned += 1
                         changed = True
                         continue
                     if i < prune_boundary and len(content) > 100 and content != _PRUNED_PLACEHOLDER:
-                        new_parts.append(ToolReturnPart(
-                            tool_name=part.tool_name,
-                            content=_PRUNED_PLACEHOLDER,
-                            tool_call_id=part.tool_call_id,
-                            timestamp=part.timestamp,
-                        ))
+                        new_parts.append(
+                            ToolReturnPart(
+                                tool_name=part.tool_name,
+                                content=_PRUNED_PLACEHOLDER,
+                                tool_call_id=part.tool_call_id,
+                                timestamp=part.timestamp,
+                            )
+                        )
                         pruned += 1
                         changed = True
                         continue
@@ -409,7 +411,7 @@ Write only the summary body."""
             logger.warning("Cannot compress: only %d messages", n)
             return messages, False
 
-        display_tokens = current_tokens or self.last_prompt_tokens or estimate_tokens_rough(messages)
+        display_tokens = current_tokens or estimate_tokens_rough(messages)
 
         messages, pruned = self._prune_old_tool_results(
             messages,
@@ -467,33 +469,34 @@ Write only the summary body."""
         session_id: str,
         task: str,
         steps_summary: str,
-        generated_outputs: list | None = None,
         artifacts: list | None = None,
     ) -> list[ModelMessage]:
         """Build a lightweight message history for a resumed session.
 
         Instead of restoring the full conversation, injects a single
-        summary message with outputs and artifacts inline.
+        summary message with artifacts inline.
         """
         parts = [f"[Resumed session {session_id[:8]}]"]
         parts.append(f"\nPrevious task: {task}")
         if steps_summary:
             parts.append(f"\n## Summary of previous work\n{steps_summary}")
-        if generated_outputs:
-            parts.append("\n## Generated outputs")
-            for i, o in enumerate(generated_outputs, 1):
-                line = f"{i}. {o.asset_type}: {o.asset_url}"
-                if o.prompt:
-                    line += f"\n   Prompt: {o.prompt}"
-                if o.tool_name:
-                    line += f"\n   Tool: {o.tool_name}"
-                parts.append(line)
         if artifacts:
-            non_output_artifacts = [a for a in artifacts if a.artifact_type not in ("image", "video")]
-            if non_output_artifacts:
+            media = [a for a in artifacts if a.artifact_type in ("image", "video", "audio", "3d")]
+            other = [a for a in artifacts if a.artifact_type not in ("image", "video", "audio", "3d")]
+            if media:
+                parts.append("\n## Generated media")
+                for i, a in enumerate(media, 1):
+                    target = a.path or a.url
+                    line = f"{i}. {a.artifact_type}: {target}"
+                    if a.prompt:
+                        line += f"\n   Prompt: {a.prompt}"
+                    if a.tool_name:
+                        line += f"\n   Tool: {a.tool_name}"
+                    parts.append(line)
+            if other:
                 parts.append("\n## Artifacts")
-                for a in non_output_artifacts:
-                    line = f"- [{a.artifact_type}] {a.path}"
+                for a in other:
+                    line = f"- [{a.artifact_type}] {a.path or a.url}"
                     if a.description:
                         line += f": {a.description}"
                     parts.append(line)

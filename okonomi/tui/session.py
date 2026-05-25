@@ -7,6 +7,7 @@ Replaces InteractiveSession (prompt_toolkit). Responsibilities:
   - Bridge approval requests from the agent → Textual modal → decision back to agent.
   - Save session on exit, handle Ctrl+C interrupt, Ctrl+D quit.
 """
+
 from __future__ import annotations
 
 import asyncio
@@ -15,6 +16,7 @@ from queue import Queue
 from typing import Any
 
 from ..agent import OkonomiAgent
+from ..session import SessionStatus
 from .app import OkonomiApp
 from .events import Banner, EventEmitter
 
@@ -56,6 +58,7 @@ class TuiSession:
         self._approval_queue: Queue[Any] = Queue()
         self.agent.approval_callback = self._approval_callback
         self.agent.on_bg_complete = self._on_bg_exec_complete
+        self.agent.terminal._on_bg_complete = self._on_bg_exec_complete
 
         self._app: OkonomiApp | None = None
         self._worker: threading.Thread | None = None
@@ -101,6 +104,7 @@ class TuiSession:
             self.emitter.note("Interrupted. History preserved.", level="warn")
         except Exception as e:  # noqa: BLE001
             import traceback
+
             tb = traceback.format_exc()
             # Keep the first line (summary) visible; stash full traceback
             # as an expandable tool-call-style event. Users can report a
@@ -127,7 +131,7 @@ class TuiSession:
             # before the once-on-exit save is unacceptable.
             self._safe_save_session(status="completed")
 
-    def _safe_save_session(self, *, status: str, download_assets: bool = False) -> None:
+    def _safe_save_session(self, *, status: SessionStatus, download_assets: bool = False) -> None:
         """Save the session swallowing any exception.
 
         Called from multiple places (per-turn finally, app exit, atexit)
@@ -176,10 +180,10 @@ class TuiSession:
                     self._app.show_session_picker(self._resume_session)
                 return
             if result.startswith("__bg__:"):
-                self._spawn_bg_task(result[len("__bg__:"):])
+                self._spawn_bg_task(result[len("__bg__:") :])
                 return
             if result.startswith("__btw__:"):
-                self._inject_side_question(result[len("__btw__:"):])
+                self._inject_side_question(result[len("__btw__:") :])
                 return
             # Command returned follow-on text — forward to the agent.
             text = result
@@ -235,13 +239,10 @@ class TuiSession:
             asyncio.set_event_loop(loop)
             try:
                 loop.run_until_complete(bg_agent.run_async(task_input, reset=True))
-                parent.generated_outputs.extend(bg_agent.generated_outputs)
                 parent.artifacts.extend(bg_agent.artifacts)
                 parent.tools_used.update(bg_agent.tools_used)
-                n = len(bg_agent.generated_outputs)
-                self.emitter.note(
-                    f"Background task {task_id} done — {n} output{'s' if n != 1 else ''}"
-                )
+                n = len(bg_agent.artifacts)
+                self.emitter.note(f"Background task {task_id} done — {n} artifact{'s' if n != 1 else ''}")
             except Exception as e:  # noqa: BLE001
                 self.emitter.note(f"Background task {task_id} failed: {e}", level="error")
             finally:
@@ -251,17 +252,100 @@ class TuiSession:
 
         thread = threading.Thread(target=_run, daemon=True, name=f"okonomi-{task_id}")
         self._bg_tasks[task_id] = thread
-        self._bg_task_meta[task_id] = (
-            task_input[:50] + "…" if len(task_input) > 50 else task_input
-        )
+        self._bg_task_meta[task_id] = task_input[:50] + "…" if len(task_input) > 50 else task_input
         thread.start()
 
     def _resume_session(self, session_id: str) -> None:
-        """Callback from the session picker. Loads a past session."""
-        if self.agent.load_session(session_id):
-            self.emitter.note(f"Resumed session: {session_id}")
-        else:
+        """Callback from the session picker. Loads a past session and
+        replays its conversation into the chat view so the user can
+        actually see where they left off (otherwise the scrollback is
+        empty even though the model has full context)."""
+        if not self.agent.load_session(session_id):
             self.emitter.note(f"Failed to load session: {session_id}", level="error")
+            return
+
+        self._replay_message_history()
+        meta = self.agent.session_manager.load_session(session_id, with_history=False)
+        title = (meta.title if meta else "") or ""
+        label = f"{session_id[:10]} · {title}" if title else session_id
+        self.emitter.note(f"↑ Resumed: {label}")
+
+    def _replay_message_history(self) -> None:
+        """Re-emit the saved conversation as visible chat events.
+
+        Walks ``agent.message_history`` and emits one ``UserMessage`` per
+        user prompt, one ``AssistantStream`` per model response (plus
+        any tool calls), and attaches tool returns to the corresponding
+        widget. Synthetic injections (resume markers, `[system]` notes,
+        interruption markers) are skipped — they're scaffolding, not
+        user-visible turns.
+        """
+        history = getattr(self.agent, "message_history", None) or []
+        if not history:
+            return
+
+        try:
+            from pydantic_ai.messages import (
+                ModelRequest,
+                ModelResponse,
+                TextPart,
+                ToolCallPart,
+                ToolReturnPart,
+                UserPromptPart,
+            )
+        except Exception:
+            return
+
+        SYNTHETIC_PREFIXES = (
+            "[Resumed",
+            "[system]",
+            "[The user interrupted",
+        )
+        pending_tool_calls: dict[str, Any] = {}
+        any_emitted = False
+
+        for msg in history:
+            if isinstance(msg, ModelRequest):
+                for part in msg.parts:
+                    if isinstance(part, UserPromptPart):
+                        text = part.content if isinstance(part.content, str) else str(part.content)
+                        if text.strip().startswith(SYNTHETIC_PREFIXES):
+                            continue
+                        if any_emitted:
+                            self.emitter.divider()
+                        self.emitter.user(text)
+                        any_emitted = True
+                    elif isinstance(part, ToolReturnPart):
+                        tc = pending_tool_calls.pop(getattr(part, "tool_call_id", ""), None)
+                        if tc is None:
+                            continue
+                        content = part.content if isinstance(part.content, str) else str(part.content)
+                        try:
+                            self.emitter.tool_finish(tc, output=content[:2000])
+                        except Exception:
+                            pass
+            elif isinstance(msg, ModelResponse):
+                stream = None
+                for part in msg.parts:
+                    if isinstance(part, TextPart):
+                        chunk = part.content
+                        if not chunk or not chunk.strip():
+                            continue
+                        if stream is None:
+                            stream = self.emitter.assistant_start()
+                        self.emitter.assistant_append(stream, chunk)
+                        any_emitted = True
+                    elif isinstance(part, ToolCallPart):
+                        args_repr = repr(part.args) if not isinstance(part.args, str) else part.args
+                        tc = self.emitter.tool_call(
+                            tool_name=part.tool_name,
+                            args=args_repr[:80],
+                            details=args_repr[:5000],
+                        )
+                        pending_tool_calls[getattr(part, "tool_call_id", "")] = tc
+                        any_emitted = True
+                if stream is not None:
+                    self.emitter.assistant_done(stream)
 
     async def _approval_callback(self, code: str) -> bool | str:
         """Agent asks: is this expensive code ok to run?
@@ -286,9 +370,7 @@ class TuiSession:
         bg_id: str,
         error: str | None,
         output: str | None,
-        new_outputs: int,
         new_artifacts: int,
-        produced_outputs: list | None = None,
         produced_artifacts: list | None = None,
     ) -> None:
         """Inject a synthetic turn so the agent can surface completed media.
@@ -299,8 +381,8 @@ class TuiSession:
         if error:
             msg = (
                 f"[system] Background task {bg_id} failed:\n{error}\n\n"
-                "DO NOT re-run image_generation.*, video.*, browser.render, "
-                "or any other expensive generation call to recover. If this "
+                "DO NOT re-run genmedia.run, browser.render, or any "
+                "other expensive generation call to recover. If this "
                 "is a parsing error (KeyError / AttributeError / TypeError "
                 "after the generation line), the generation already "
                 "succeeded — the `result` variable is still in globals from "
@@ -312,20 +394,14 @@ class TuiSession:
             self._input_queue.put(msg)
             return
 
-        # Build an explicit list of the URLs/paths this run produced.
         asset_lines: list[str] = []
-        for o in (produced_outputs or []):
-            url = getattr(o, "asset_url", "") or ""
-            local = getattr(o, "local_path", "") or ""
-            kind = getattr(o, "asset_type", "") or "asset"
-            ref = url or local
+        for a in produced_artifacts or []:
+            path = getattr(a, "path", "") or ""
+            url = getattr(a, "url", "") or ""
+            kind = getattr(a, "artifact_type", "") or "artifact"
+            ref = path or url
             if ref:
                 asset_lines.append(f"  - {kind}: {ref}")
-        for a in (produced_artifacts or []):
-            path = getattr(a, "path", "") or ""
-            kind = getattr(a, "artifact_type", "") or "artifact"
-            if path:
-                asset_lines.append(f"  - {kind}: {path}")
         produced_block = "\n".join(asset_lines) if asset_lines else "  (none)"
 
         msg = (
@@ -345,11 +421,10 @@ class TuiSession:
         # uncaught exception / Textual hang, atexit fires before the
         # interpreter exits.
         import atexit
+
         atexit.register(self._safe_save_session, status="abandoned")
 
-        self._worker = threading.Thread(
-            target=self._worker_loop, daemon=True, name="okonomi-agent"
-        )
+        self._worker = threading.Thread(target=self._worker_loop, daemon=True, name="okonomi-agent")
         self._worker.start()
 
         # Silently prune empty sessions left over from previous runs.
@@ -361,8 +436,7 @@ class TuiSession:
         # Sakura wave banner + one-line welcome.
         self.emitter.emit(Banner())
         self.emitter.note(
-            "type a message or /help. Ctrl+D to exit, Ctrl+O to expand "
-            "the latest tool call.",
+            "type a message or /help. Ctrl+D to exit, Ctrl+O to expand the latest tool call.",
         )
 
         # Surface a one-time install hint when the genmedia CLI isn't on
@@ -414,12 +488,15 @@ class TuiSession:
             from the dicts (race around thread.is_alive during shutdown).
             """
             out: list[tuple[str, str]] = []
-            # Agent-level bg-exec threads (expensive execute_code blocks)
+            # Agent-level bg-exec threads (expensive execute_code blocks).
+            # Label comes from the shared _bg_logs registry — same source
+            # of truth /jobs uses, so the bottom bar matches the slash command.
             execs = getattr(self.agent, "_bg_execs", {}) or {}
-            meta = getattr(self.agent, "_bg_exec_meta", {}) or {}
+            logs = getattr(self.agent, "_bg_logs", {}) or {}
             for bg_id, thread in list(execs.items()):
                 if thread and thread.is_alive():
-                    out.append((bg_id, meta.get(bg_id, "")))
+                    label = (logs.get(bg_id) or {}).get("label", "")
+                    out.append((bg_id, label))
             # Session-level /bg full-agent tasks
             for task_id, thread in list(self._bg_tasks.items()):
                 if thread and thread.is_alive():
@@ -454,24 +531,11 @@ class TuiSession:
             if self._agent_running.is_set():
                 self.cancel_current_turn()
 
-        # Final save on clean exit. Bounded-wait for the eager bg pool
-        # so we don't lose assets that are mid-download — but cap at a
-        # few seconds so a stalled download can't hold up quit. URLs
-        # are persisted in session.json regardless, so anything we miss
-        # gets retried on resume.
-        from concurrent.futures import wait as _wait_futures
-
-        try:
-            futures = list(self.agent._asset_dl_futures)
-            if futures:
-                _wait_futures(futures, timeout=5.0)
-        except Exception:  # noqa: BLE001
-            pass
+        # Drop in-flight downloads on the floor — URLs are persisted in
+        # the DB, resume retries anything missing. Then save metadata
+        # only (no synchronous download sweep) so quit returns instantly.
         try:
             self.agent._asset_dl_pool.shutdown(wait=False, cancel_futures=True)
         except Exception:  # noqa: BLE001
             pass
-        # Save with download_assets=True for a final synchronous sweep
-        # of anything the bg pool didn't get to (or failed on earlier).
-        # Most assets are already on disk so this is fast.
-        self._safe_save_session(status="completed", download_assets=True)
+        self._safe_save_session(status="completed", download_assets=False)

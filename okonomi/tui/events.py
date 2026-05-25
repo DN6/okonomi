@@ -5,6 +5,7 @@ materializes them as widgets. This replaces the raw ``print()`` flow that
 the prompt_toolkit CLI used — by making every user-visible artifact a
 structured record, we can render it with per-item expansion state.
 """
+
 from __future__ import annotations
 
 import itertools
@@ -25,6 +26,7 @@ def _next_id() -> str:
 @dataclass
 class Event:
     """Base event. All events carry a unique id for addressing."""
+
     id: str = field(default_factory=_next_id)
 
 
@@ -50,6 +52,7 @@ class AssistantStream(Event):
     The emitter updates the same AssistantStream event across multiple
     emissions; the UI reconciles by id.
     """
+
     text: str = ""
     done: bool = False
 
@@ -65,6 +68,7 @@ class ToolCall(Event):
         Kept separate from details so the UI can render it with plain
         styling below the highlighted code block.
     """
+
     tool_name: str = ""
     args: str = ""
     details: str = ""
@@ -74,16 +78,9 @@ class ToolCall(Event):
 
 
 @dataclass
-class ToolResult(Event):
-    """Output attached to a prior ToolCall by call_id."""
-    call_id: str = ""
-    output: str = ""
-    error: str | None = None
-
-
-@dataclass
 class SystemNote(Event):
     """System-side status line (e.g. "Interrupted. History preserved.")."""
+
     text: str = ""
     level: str = "info"  # info | warn | error
 

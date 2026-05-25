@@ -4,6 +4,7 @@ Replaces the prompt_toolkit-based InteractiveSession in cli.py. Built around
 an event-driven output model so tool calls can be rendered as collapsible
 sections instead of raw streamed text.
 """
+
 from .events import (
     AssistantStream,
     Banner,
@@ -12,7 +13,6 @@ from .events import (
     EventEmitter,
     SystemNote,
     ToolCall,
-    ToolResult,
     UserMessage,
 )
 
@@ -25,6 +25,5 @@ __all__ = [
     "EventEmitter",
     "SystemNote",
     "ToolCall",
-    "ToolResult",
     "UserMessage",
 ]

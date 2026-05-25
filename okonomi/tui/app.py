@@ -4,18 +4,19 @@ Phase 1 of the TUI migration. Renders a stream of events via EventEmitter
 into a scrollable VerticalScroll pane. Collapsible tool calls + agent
 wiring come in later phases.
 """
+
 from __future__ import annotations
 
+from pathlib import Path
 from typing import Callable
 
-from pathlib import Path
-
+from textual import on as textual_on
 from textual.app import App, ComposeResult
 from textual.binding import Binding
 from textual.containers import VerticalScroll
+from textual.message import Message
 from textual.screen import ModalScreen
-from textual.suggester import Suggester
-from textual.widgets import Input, OptionList
+from textual.widgets import Input, OptionList, TextArea
 from textual.widgets.option_list import Option
 
 from .events import (
@@ -99,14 +100,15 @@ class SessionPicker(ModalScreen[str]):
         from textual.containers import Vertical
 
         from ..session import SessionManager
+
         all_sessions = SessionManager().list_sessions(limit=500)
         # Drop sessions that have no usable display content. These are
         # interrupted/empty rows that just show date-prefixed session_id
         # placeholders and aren't meaningfully resumable.
         self._all_sessions = [
-            s for s in all_sessions
-            if (getattr(s, "title", "") or "").strip()
-            or (getattr(s, "task_input", "") or "").strip()
+            s
+            for s in all_sessions
+            if (getattr(s, "title", "") or "").strip() or (getattr(s, "task_input", "") or "").strip()
         ]
 
         with Vertical(id="picker-dialog"):
@@ -202,6 +204,122 @@ def _fuzzy_match(query: str, haystack: str) -> bool:
     return i == len(query)
 
 
+class _HistoryScroll(VerticalScroll):
+    """VerticalScroll that doesn't follow focus.
+
+    ToolCallWidget needs ``can_focus = True`` for Tab → Enter to
+    expand, but Textual's default behavior auto-scrolls a focused
+    widget into view. The first focusable widget in the chat is the
+    *oldest* tool call, so any focus event landing in the scroll pane
+    teleports the view back to the top of the conversation. Overriding
+    ``scroll_to_widget`` to a no-op keeps the user's manual scroll
+    position. Streaming auto-follow still works because we call
+    ``scroll_end()`` directly (unaffected by this override).
+    """
+
+    def scroll_to_widget(self, *args, **kwargs):  # noqa: ARG002
+        return False
+
+
+class _ChatInput(TextArea):
+    """Multi-line chat input. Plain Enter submits, Alt/Shift+Enter inserts a newline.
+
+    Box height grows with content (1 row → up to ~12) so the user can
+    author multi-line prompts visually instead of through paste-only
+    workarounds. Multi-line paste lands natively in the buffer.
+
+    The widget posts ``_ChatInput.Submitted(value=str)`` on Enter; the
+    App handler reads that exactly like the old Input.Submitted path.
+    """
+
+    class Submitted(Message):
+        def __init__(self, value: str) -> None:
+            self.value = value
+            super().__init__()
+
+    BINDINGS = [
+        Binding("enter", "submit", "Submit", show=False, priority=True),
+        Binding("alt+enter", "newline", "Insert newline", show=False, priority=True),
+        Binding("shift+enter", "newline", "Insert newline", show=False, priority=True),
+        Binding("ctrl+j", "newline", "Insert newline", show=False, priority=True),
+    ]
+
+    DEFAULT_CSS = """
+    _ChatInput {
+        height: auto;
+        min-height: 1;
+        max-height: 12;
+    }
+    _ChatInput.-approval {
+        background: #3a2a00;
+    }
+    """
+
+    def __init__(self, *args, placeholder: str = "", **kwargs):
+        # Accept the placeholder kwarg for call-site compat but no-op it —
+        # TextArea has no native placeholder rendering, and faking one
+        # via render_line override is fragile across Textual versions.
+        # Empty multi-line box reads fine; the welcome banner above
+        # already prompts the user to start typing.
+        kwargs.pop("placeholder", None)
+        super().__init__(*args, **kwargs)
+        self._placeholder = placeholder  # kept for the .placeholder shim
+
+    @property
+    def value(self) -> str:
+        """Compat shim — old code reads/writes ``inp.value``."""
+        return self.text
+
+    @value.setter
+    def value(self, new: str) -> None:
+        self.text = new
+
+    @property
+    def placeholder(self) -> str:
+        return self._placeholder
+
+    @placeholder.setter
+    def placeholder(self, new: str) -> None:
+        self._placeholder = new
+
+    def action_submit(self) -> None:
+        self.post_message(self.Submitted(value=self.text))
+
+    def action_newline(self) -> None:
+        self.insert("\n")
+
+    def on_key(self, event) -> None:
+        """Up/Down navigate the slash-command dropdown when it's open.
+
+        When no dropdown is showing, the keys fall through to TextArea's
+        default cursor-between-lines behavior.
+        """
+        if event.key not in ("up", "down"):
+            return
+        try:
+            dropdown = self.app.query_one("#slash-dropdown", OptionList)
+        except Exception:
+            return
+        if not dropdown.has_class("-visible") or dropdown.option_count == 0:
+            return
+        current = dropdown.highlighted if dropdown.highlighted is not None else 0
+        if event.key == "up":
+            dropdown.highlighted = max(0, current - 1)
+        else:
+            dropdown.highlighted = min(dropdown.option_count - 1, current + 1)
+        event.stop()
+        event.prevent_default()
+
+    def move_cursor_to_end(self) -> None:
+        """Compat helper for sites that previously did
+        ``inp.move_cursor_to_end()`` on the old single-line
+        Input. TextArea cursor is (row, col), so we have to compute it."""
+        text = self.text
+        if not text:
+            self.move_cursor((0, 0))
+            return
+        lines = text.split("\n")
+        self.move_cursor((len(lines) - 1, len(lines[-1])))
 
 
 class OkonomiApp(App):
@@ -283,15 +401,18 @@ class OkonomiApp(App):
         Binding("ctrl+d", "quit", "Quit", show=False),
         # Ctrl+C still needs priority so it interrupts a running turn even if
         # the focus is on a tool call or the dropdown.
-        Binding("ctrl+c", "interrupt", "Interrupt", show=False, priority=True),
+        Binding("ctrl+c", "interrupt", "Interrupt / clear input", show=False, priority=True),
+        Binding("ctrl+l", "clear_screen", "Clear screen", show=False, priority=True),
         Binding("ctrl+o", "toggle_latest", "Expand latest tool call", show=True),
         # Tab/Up/Down are NOT priority — let modal screens (SessionPicker,
         # OptionList) handle them when focused. They bubble back to the
         # App when no widget consumes them.
         Binding("tab", "focus_history", "Focus history", show=True),
         Binding("escape", "focus_input", "Focus input", show=True),
-        Binding("up", "history_prev", "Previous input", show=False),
-        Binding("down", "history_next", "Next input", show=False),
+        # Ctrl+Up/Down for input history — Up/Down themselves now move
+        # the cursor between lines in the multi-line _ChatInput.
+        Binding("ctrl+up", "history_prev", "Previous input", show=False),
+        Binding("ctrl+down", "history_next", "Next input", show=False),
     ]
 
     HISTORY_FILE = Path.home() / ".okonomi" / "input_history"
@@ -335,7 +456,7 @@ class OkonomiApp(App):
         # History fills the top; input and metadata flow after it in order.
         # can_focus=False so Tab skips the scroll pane and reaches the
         # App-level `tab` binding which focuses the last ToolCallWidget.
-        scroll = VerticalScroll(id="history")
+        scroll = _HistoryScroll(id="history")
         scroll.can_focus = False
         yield scroll
 
@@ -344,10 +465,9 @@ class OkonomiApp(App):
         dropdown.can_focus = False  # keep focus on Input; dropdown is a hint
         yield dropdown
 
-        yield Input(
+        yield _ChatInput(
             id="input",
             placeholder="What's on your mind?",
-            suggester=_SlashSuggester(),
         )
 
         # Metadata rows below the input: spinner/tokens on top, then bg tasks.
@@ -362,7 +482,7 @@ class OkonomiApp(App):
         # Replay any history that was emitted before the app mounted.
         for ev in self.emitter.history():
             self._render_event(ev)
-        self.query_one(Input).focus()
+        self.query_one("#input", _ChatInput).focus()
 
     async def on_unmount(self) -> None:
         if self._unsubscribe is not None:
@@ -376,6 +496,7 @@ class OkonomiApp(App):
         identity and dispatch directly in that case.
         """
         import threading
+
         if threading.current_thread() is threading.main_thread():
             self._render_event(event)
         else:
@@ -414,11 +535,10 @@ class OkonomiApp(App):
             return SystemNoteWidget(event)
         return None
 
-    async def on_input_changed(self, event: Input.Changed) -> None:
+    @textual_on(TextArea.Changed, "#input")
+    async def on_chat_input_changed(self, event: TextArea.Changed) -> None:
         """Show/update the slash-command dropdown as the user types."""
-        if event.input.id != "input":
-            return
-        self._refresh_slash_dropdown(event.value)
+        self._refresh_slash_dropdown(event.text_area.text)
 
     def _refresh_slash_dropdown(self, value: str) -> None:
         from . import commands
@@ -431,15 +551,13 @@ class OkonomiApp(App):
             return
 
         low = value.lower()
-        matches = [
-            (cmd, desc) for cmd, desc in commands.SLASH_COMMANDS
-            if cmd.startswith(low) and cmd != value
-        ]
+        matches = [(cmd, desc) for cmd, desc in commands.SLASH_COMMANDS if cmd.startswith(low) and cmd != value]
         dropdown.clear_options()
         if not matches:
             dropdown.remove_class("-visible")
             return
         from rich.text import Text
+
         for cmd, desc in matches:
             line = Text()
             line.append(cmd, style="bold")
@@ -450,22 +568,19 @@ class OkonomiApp(App):
         if dropdown.option_count > 0:
             dropdown.highlighted = 0
 
-    async def on_input_submitted(self, event: Input.Submitted) -> None:
+    @textual_on(_ChatInput.Submitted)
+    async def on_chat_input_submitted(self, event: "_ChatInput.Submitted") -> None:
         # Enter while the slash dropdown is visible accepts the highlighted
         # option instead of submitting the partial command. Matches the
         # Slack/VSCode/Cmd-palette convention. User then presses Enter
         # again to submit. Skipped during approval mode.
         dropdown = self.query_one("#slash-dropdown", OptionList)
-        if (
-            self._approval_resolve is None
-            and dropdown.has_class("-visible")
-            and dropdown.option_count > 0
-        ):
+        if self._approval_resolve is None and dropdown.has_class("-visible") and dropdown.option_count > 0:
             self._accept_dropdown()
             return
 
         text = event.value.strip()
-        inp = self.query_one(Input)
+        inp = self.query_one("#input", _ChatInput)
         inp.value = ""
 
         # Inline approval mode: route the submission to the approval resolver
@@ -481,6 +596,10 @@ class OkonomiApp(App):
                 decision = False
             else:
                 decision = text  # feedback for the agent
+                # Echo the feedback into chat so the user can see what they
+                # said — without this, the message vanishes into the tool
+                # result and only the agent's downstream revision is visible.
+                self.emitter.user(text)
             resolver = self._approval_resolve
             self._approval_resolve = None
             self._exit_approval_mode()
@@ -533,9 +652,9 @@ class OkonomiApp(App):
         opt = dropdown.get_option_at_index(idx)
         if opt is None or opt.id is None:
             return
-        inp = self.query_one(Input)
+        inp = self.query_one("#input", _ChatInput)
         inp.value = opt.id + " "
-        inp.cursor_position = len(inp.value)
+        inp.move_cursor_to_end()
         dropdown.clear_options()
         dropdown.remove_class("-visible")
 
@@ -544,7 +663,7 @@ class OkonomiApp(App):
         dropdown = self.query_one("#slash-dropdown", OptionList)
         dropdown.clear_options()
         dropdown.remove_class("-visible")
-        self.query_one(Input).focus()
+        self.query_one("#input", _ChatInput).focus()
 
     def action_toggle_latest(self) -> None:
         """Ctrl+O — toggle the most recent tool call from anywhere."""
@@ -554,10 +673,53 @@ class OkonomiApp(App):
         tool_calls[-1].action_toggle()
 
     def action_interrupt(self) -> None:
-        """Ctrl+C — cancel current agent turn if one is running."""
+        """Ctrl+C — three-stage fallback, shell-style:
+
+        1. If an agent turn is running, cancel it.
+        2. Else if the input has draft text, clear it.
+        3. Else no-op (Ctrl+D quits, Ctrl+C doesn't).
+        """
         session = getattr(self, "session", None)
-        if session is not None and hasattr(session, "cancel_current_turn"):
+        turn_running = False
+        if session is not None:
+            task = getattr(session, "_agent_task", None)
+            if task is not None and not task.done():
+                turn_running = True
+
+        if turn_running and session is not None and hasattr(session, "cancel_current_turn"):
             session.cancel_current_turn()
+            return
+
+        try:
+            inp = self.query_one("#input", _ChatInput)
+        except Exception:
+            return
+        if inp.value:
+            inp.value = ""
+            self._history_cursor = None
+            self._pending_input = ""
+
+    def action_clear_screen(self) -> None:
+        """Ctrl+L — clear visible chat scrollback (keeps message history
+        and input history intact, so the model still has context and
+        Up-arrow still works)."""
+        try:
+            history = self.query_one("#history", _HistoryScroll)
+        except Exception:
+            return
+        for child in list(history.children):
+            try:
+                child.remove()
+            except Exception:
+                pass
+        # Also clear any leftover slash dropdown / approval prompt state
+        # so the cleared screen isn't immediately repopulated by stale UI.
+        try:
+            dropdown = self.query_one("#slash-dropdown", OptionList)
+            dropdown.clear_options()
+            dropdown.remove_class("-visible")
+        except Exception:
+            pass
 
     # --- Session picker ---
 
@@ -577,18 +739,17 @@ class OkonomiApp(App):
         full menu doesn't stay in scrollback forever.
         """
         self._approval_prompt_event = self.emitter.note(
-            "Run this code? [Enter] approve  |  [a] approve all  |  "
-            "[n] skip  |  any other text: feedback",
+            "Run this code? [Enter] approve  |  [a] approve all  |  [n] skip  |  any other text: feedback",
             level="warn",
         )
         self._approval_resolve = resolve
-        inp = self.query_one(Input)
+        inp = self.query_one("#input", _ChatInput)
         inp.add_class("-approval")
         inp.placeholder = "approve>"
         inp.focus()
 
     def _exit_approval_mode(self) -> None:
-        inp = self.query_one(Input)
+        inp = self.query_one("#input", _ChatInput)
         inp.remove_class("-approval")
         # Restore the prompt-style placeholder only on a fresh session;
         # after the first submit we keep it empty so the input stays
@@ -612,13 +773,13 @@ class OkonomiApp(App):
             except Exception:
                 pass
 
-    # --- Input history (Up/Down) ---
+    # --- Input history (Ctrl+Up/Ctrl+Down) ---
 
     def _load_history(self) -> list[str]:
         try:
             if self.HISTORY_FILE.exists():
                 lines = self.HISTORY_FILE.read_text().splitlines()
-                return [ln for ln in lines if ln.strip()][-self.HISTORY_LIMIT:]
+                return [ln for ln in lines if ln.strip()][-self.HISTORY_LIMIT :]
         except Exception:
             pass
         return []
@@ -629,7 +790,7 @@ class OkonomiApp(App):
         if self._history and self._history[-1] == text:
             return  # collapse immediate dupes
         self._history.append(text)
-        self._history = self._history[-self.HISTORY_LIMIT:]
+        self._history = self._history[-self.HISTORY_LIMIT :]
         try:
             self.HISTORY_FILE.parent.mkdir(parents=True, exist_ok=True)
             self.HISTORY_FILE.write_text("\n".join(self._history) + "\n")
@@ -638,7 +799,7 @@ class OkonomiApp(App):
 
     def action_history_prev(self) -> None:
         """↑ — navigate dropdown if visible, else step back through history."""
-        inp = self.query_one(Input)
+        inp = self.query_one("#input", _ChatInput)
         if not isinstance(self.focused, Input):
             return
         dropdown = self.query_one("#slash-dropdown", OptionList)
@@ -654,11 +815,11 @@ class OkonomiApp(App):
         elif self._history_cursor > 0:
             self._history_cursor -= 1
         inp.value = self._history[self._history_cursor]
-        inp.cursor_position = len(inp.value)
+        inp.move_cursor_to_end()
 
     def action_history_next(self) -> None:
         """↓ — navigate dropdown if visible, else forward through history."""
-        inp = self.query_one(Input)
+        inp = self.query_one("#input", _ChatInput)
         if not isinstance(self.focused, Input):
             return
         dropdown = self.query_one("#slash-dropdown", OptionList)
@@ -675,27 +836,7 @@ class OkonomiApp(App):
             self._history_cursor = None
             inp.value = self._pending_input
             self._pending_input = ""
-        inp.cursor_position = len(inp.value)
-
-
-class _SlashSuggester(Suggester):
-    """Tab-completion for slash commands. Matches the static SLASH_COMMANDS
-    table from commands.py so users see completions without typing full names.
-    """
-
-    def __init__(self) -> None:
-        super().__init__(use_cache=False, case_sensitive=False)
-
-    async def get_suggestion(self, value: str) -> str | None:
-        if not value.startswith("/"):
-            return None
-        from . import commands
-
-        low = value.lower()
-        for cmd, _desc in commands.SLASH_COMMANDS:
-            if cmd.startswith(low) and cmd != value:
-                return cmd
-        return None
+        inp.move_cursor_to_end()
 
 
 def run_standalone(demo: bool = True) -> None:

@@ -12,6 +12,7 @@ from pygments import highlight as _highlight
 from pygments.formatters import TerminalTrueColorFormatter
 from pygments.lexers import PythonLexer, get_lexer_by_name
 
+
 _CODE_FORMATTER = TerminalTrueColorFormatter(style="monokai")
 _PYTHON_LEXER = PythonLexer()
 
@@ -24,8 +25,6 @@ YELLOW = "\033[33m"
 GREEN = "\033[32m"
 CYAN = "\033[36m"
 LLM = "\033[38;2;180;180;195m"
-
-SPINNER_FRAMES = ("⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏")
 
 MAX_DISPLAY_LINES = 50
 MAX_DISPLAY_CHARS = 4000
@@ -97,7 +96,7 @@ def print_code_box(code: str, label: str = "code", language: str = "python") -> 
     """Print syntax-highlighted code in a bordered box."""
     highlighted = highlight_code(code, language)
     w = shutil.get_terminal_size().columns
-    c = f"\033[2m"
+    c = "\033[2m"
     h = "\u2500"
 
     tag = f" {label} " if label else ""
@@ -110,100 +109,18 @@ def print_code_box(code: str, label: str = "code", language: str = "python") -> 
     print(f"{c}\u2570{h * (w - 2)}\u256f{RST}")
 
 
-def print_user_message(text: str) -> None:
-    """Echo the user's message into the output area."""
-    print(f"\n{PINK}{'─' * 20}{RST}")
-    if "\n" in text:
-        first_line = text.split("\n")[0]
-        line_count = text.count("\n") + 1
-        print(f"{PINK}{BOLD}●{RST} {BOLD}{first_line}{RST} {DIM}(+{line_count - 1} lines){RST}")
-    else:
-        print(f"{PINK}{BOLD}●{RST} {BOLD}{text}{RST}")
-    print()
-
-
-def print_interrupt() -> None:
-    print(f"{PINK}Interrupted.{RST} {DIM}History preserved.{RST}")
-
-
 WAVE_COLORS = [
     ("240;135;175", "#f087af"),
-    ("210;90;135",  "#d25a87"),
-    ("165;55;95",   "#a5375f"),
+    ("210;90;135", "#d25a87"),
+    ("165;55;95", "#a5375f"),
 ]
-
-_GRADIENT_STEPS = [
-    (215, 135, 175),
-    (195, 120, 158),
-    (175, 105, 141),
-    (155, 90, 124),
-    (135, 75, 107),
-    (115, 60, 90),
-    (95, 45, 73),
-    (75, 35, 58),
-]
-
-_BLOCK_CHARS = "█▓▒░"
-
-
-import math
-
-_HEARTBEAT_FRAMES = ["·", "•", "●", "◉", "●", "•", "·", " "]
-_HEARTBEAT_BRIGHTNESS = [0.4, 0.6, 0.8, 1.0, 0.8, 0.6, 0.4, 0.3]
-_EQ_BARS = "▁▂▃▄▅▆▇█"
-
-
-def _heartbeat(tick: int) -> list[tuple[str, str]]:
-    """Heartbeat — single dot expands and contracts with pulsing color."""
-    idx = tick % len(_HEARTBEAT_FRAMES)
-    br = _HEARTBEAT_BRIGHTNESS[idx]
-    r, g, b = int(215 * br), int(135 * br), int(175 * br)
-    return [(f"#{r:02x}{g:02x}{b:02x}", _HEARTBEAT_FRAMES[idx])]
-
-
-_TRAIL_DOTS = ["●", "●", "•", "·"]
-_TRAIL_BRIGHTNESS = [1.0, 0.7, 0.45, 0.25]
-
-
-def _trailing_dots(width: int, tick: int) -> list[tuple[str, str]]:
-    """Trailing dots — a dot sweeps across leaving a fading trail."""
-    cycle = width + 2
-    result = []
-    for i in range(width):
-        pos = (tick - i) % cycle
-        if pos < len(_TRAIL_DOTS):
-            br = _TRAIL_BRIGHTNESS[pos]
-            r, g, b = int(215 * br), int(135 * br), int(175 * br)
-            ch = _TRAIL_DOTS[pos]
-        else:
-            r, g, b = 25, 20, 23
-            ch = " "
-        result.append((f"#{r:02x}{g:02x}{b:02x}", ch))
-    return result
-
-
-def spinner_formatted_text(label: str, tick: int) -> list[tuple[str, str]]:
-    """Generate spinner animation.
-
-    Uses heartbeat for 'Thinking', trailing dots for everything else.
-    """
-    if "thinking" in label.lower():
-        blocks = _heartbeat(tick)
-    else:
-        blocks = _trailing_dots(4, tick)
-
-    result = [("", "  ")]
-    result.extend(blocks)
-    result.append(("", " "))
-    result.append(("bold #d787af", label))
-    return result
 
 
 def _wave_line(content_w: int, offset: int = 0) -> str:
     """Generate a wave string of given width with animation offset."""
     wave = "~^~"
-    shifted = wave[offset % 3:] + wave[:offset % 3]
-    return (shifted * (content_w // 3 + 2))[offset % 3: offset % 3 + content_w]
+    shifted = wave[offset % 3 :] + wave[: offset % 3]
+    return (shifted * (content_w // 3 + 2))[offset % 3 : offset % 3 + content_w]
 
 
 def wave_formatted_text(label: str, w: int, tick: int = 0, mode: str = "diamond") -> list[tuple[str, str]]:
@@ -277,12 +194,6 @@ def print_loading_art(label: str = "What's on your mind?") -> None:
     w = shutil.get_terminal_size().columns
     sys.stdout.write(_render_ft_ansi(wave_formatted_text(label, w, 0)))
     sys.stdout.flush()
-
-
-def print_rule() -> None:
-    w = shutil.get_terminal_size().columns
-    h = "\u2500"
-    print(f"{PINK}{h * w}{RST}")
 
 
 def get_task_input(args: argparse.Namespace) -> str:

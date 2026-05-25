@@ -14,9 +14,28 @@ import subprocess
 import tempfile
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
+from typing import TypedDict
 
 from okonomi.tools._metadata import ToolMetadataMixin
-from okonomi.tools._returns import CaptureVideoResult, ScreenshotResult
+
+
+class ScreenshotResult(TypedDict, total=False):
+    """Return type for browser.render_screenshot. ``screenshot`` and
+    ``output_path`` are aliases pointing at the same local PNG path."""
+
+    screenshot: str
+    output_path: str
+    error: str
+
+
+class CaptureVideoResult(TypedDict, total=False):
+    """Return type for browser.render_video."""
+
+    video: str  # local file path to MP4
+    output_path: str  # alias of video
+    duration_s: float
+    fps: int
+    error: str
 
 
 logger = logging.getLogger(__name__)
@@ -89,13 +108,20 @@ def _do_video(url, output_path, width, height, duration_s, fps, wait_before_reco
 
         subprocess.run(
             [
-                "ffmpeg", "-y",
-                "-i", str(webm_path),
-                "-r", str(fps),
-                "-c:v", "libx264",
-                "-pix_fmt", "yuv420p",
-                "-preset", "fast",
-                "-crf", "23",
+                "ffmpeg",
+                "-y",
+                "-i",
+                str(webm_path),
+                "-r",
+                str(fps),
+                "-c:v",
+                "libx264",
+                "-pix_fmt",
+                "yuv420p",
+                "-preset",
+                "fast",
+                "-crf",
+                "23",
                 output_path,
             ],
             check=True,
@@ -114,6 +140,33 @@ class BrowserRendererTools(ToolMetadataMixin):
 
     def __init__(self, config):
         self.config = config
+        # Set by ToolWrapper at the start of each execute_code call. Used
+        # to auto-register the rendered file as a session artifact, so the
+        # output shows up in /assets without the model having to do
+        # anything explicit (mirrors GenmediaTools._set_deps).
+        self._deps = None
+
+    def _set_deps(self, deps) -> None:
+        self._deps = deps
+
+    def _track_local_file(self, path: str, artifact_type: str, prompt: str = "") -> None:
+        """Register a rendered local file with the session, if deps are set."""
+        if not path or self._deps is None:
+            return
+        from datetime import datetime as _dt
+
+        # Lazy import to avoid a hard dep cycle (session.py -> tools).
+        from okonomi.session import Artifact
+
+        self._deps.add_artifact(
+            Artifact(
+                artifact_type=artifact_type,
+                path=path,
+                prompt=prompt or "",
+                tool_name=f"browser.{artifact_type == 'image' and 'render_screenshot' or 'render_video'}",
+                timestamp=_dt.now().isoformat(),
+            )
+        )
 
     def render_screenshot(
         self,
@@ -154,9 +207,17 @@ class BrowserRendererTools(ToolMetadataMixin):
         try:
             url, tmp_path = _resolve_url(html, file_path)
             future = _thread_pool.submit(
-                _do_screenshot, url, output_path, width, height, wait_ms, full_page, device_scale_factor,
+                _do_screenshot,
+                url,
+                output_path,
+                width,
+                height,
+                wait_ms,
+                full_page,
+                device_scale_factor,
             )
             future.result(timeout=60)
+            self._track_local_file(output_path, "image")
             return {"screenshot": output_path, "output_path": output_path}
         except Exception as e:
             return {"error": str(e)}
@@ -198,7 +259,9 @@ class BrowserRendererTools(ToolMetadataMixin):
             Example: {"video": "/path/to/video.mp4", "output_path": "/path/to/video.mp4", "duration_s": 5.0, "fps": 30}
         """
         if not shutil.which("ffmpeg"):
-            return {"error": "ffmpeg not found. Install with: brew install ffmpeg (macOS) or apt install ffmpeg (Linux)"}
+            return {
+                "error": "ffmpeg not found. Install with: brew install ffmpeg (macOS) or apt install ffmpeg (Linux)"
+            }
 
         if not html and not file_path:
             return {"error": "Provide either 'html' or 'file_path'"}
@@ -209,9 +272,17 @@ class BrowserRendererTools(ToolMetadataMixin):
         try:
             url, tmp_path = _resolve_url(html, file_path)
             future = _thread_pool.submit(
-                _do_video, url, output_path, width, height, duration_s, fps, wait_before_record_ms,
+                _do_video,
+                url,
+                output_path,
+                width,
+                height,
+                duration_s,
+                fps,
+                wait_before_record_ms,
             )
             future.result(timeout=int(duration_s + 120))
+            self._track_local_file(output_path, "video")
             return {
                 "video": output_path,
                 "output_path": output_path,

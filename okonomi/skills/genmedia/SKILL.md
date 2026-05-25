@@ -1,290 +1,173 @@
 ---
 name: genmedia
-description: "Production pipeline for image, video, audio, and 3D generation via fal.ai. Uses the maintained `genmedia` CLI (one binary, every fal endpoint) to discover models, run jobs, poll status, and download results. Trigger when users request: text-to-image, image-to-image, image edits, image upscale (e.g. SeedVR), image segmentation, image-to-video, first-last-frame video, music or sound effects, speech, image-to-3D, lip sync, or any other fal model — including endpoints not previously seen. Replaces the older `image_generation.*` / `video.*` Python wrappers."
+description: "Run any fal.ai endpoint via the `genmedia` programmatic tool. Single namespace covers 1000+ models for image, video, audio, and 3D generation. Auto-tracks every produced asset — no manual session bookkeeping required. Trigger when users request: text-to-image, image edits, image upscale, image-to-video, frame-to-frame video, music, sound effects, speech, image-to-3d, lip sync, or any other fal endpoint."
 metadata:
-  tags: [fal, genmedia, image-generation, video-generation, audio-generation, upscale, segmentation, 3d]
-  related_skills: [video-generation, p5js, ffmpeg, concept-research]
+  tags: [fal, genmedia, image, video, audio, 3d, generation]
+  related_skills: [p5js, ffmpeg]
 ---
 
-# genmedia: fal.ai via CLI
+# genmedia
 
-`genmedia` is a single CLI binary that fronts every fal.ai endpoint.
-Auth via `FAL_KEY` (already exported in this environment). Use it from
-inside `execute_code` via the standalone `run` tool.
+`genmedia` is a programmatic tool in `execute_code`'s globals. Three methods, all synchronous from Python's perspective. Long-running
+generations (multi-minute video) become async at the agent level because okonomi auto-dispatches any `execute_code` block touching
+`genmedia.` to a background thread — your code stays simple, the agent stays responsive.
 
-> **Required:** after every successful generation, call `track_output(url, asset_type, prompt=..., model_id=...)` so the asset is downloaded to the session directory and surfaces in `/assets`. Skipping this means the asset is *not* tracked — it will be lost when the URL expires.
+| Method | Purpose |
+|--------|---------|
+| `genmedia.run(model_id, **arguments)` | Invoke an endpoint, return parsed JSON, auto-track produced URLs |
+| `genmedia.search(query, limit=10)` | Search fal's catalog by keyword |
+| `genmedia.schema(model_id)` | Get an endpoint's parameter schema (`--help` text) |
 
-## The four CLI verbs
+**Auto-tracking is built in.** Every URL `genmedia.run` returns is
+already registered with the session — downloaded in the background,
+visible in `/assets`, surfaced in bg-exec completion notifications.
+No manual tracking needed.
 
-| Verb | Purpose | Example |
-|------|---------|---------|
-| `genmedia models "<query>"` | Discover endpoints by keyword | `genmedia models "image upscale"` |
-| `genmedia run <id> --json …`  | Invoke an endpoint, return JSON | `genmedia run fal-ai/flux/dev --prompt "..." --json` |
-| `genmedia status <request-id>` | Poll a long-running async job | `genmedia status req_abc123` |
-| `genmedia download <request-id> --output <path>` | Pull artifacts to disk | `genmedia download req_abc123 --output out.mp4` |
+## When to use
 
-`--json` is **mandatory** when invoking from code — without it the
-output is human-prose and can't be parsed reliably.
+- Any AI image generation request (text-to-image, edit, upscale, segmentation).
+- Image-to-video, frame-to-frame video, video-to-video.
+- Music, sound effects, TTS, lip-sync.
+- Image-to-3D / mesh generation.
+- Any other fal.ai endpoint — discover with `genmedia.search("<keyword>")`.
 
-## Calling pattern
+**Not for**: rendering HTML / canvas / WebGL sketches (use `browser.render_*` from p5js skill), local file transformations like resize / crop / format conversion (use `ffmpeg` or PIL inside `execute_code`), downloading from a non-fal URL (use `yt-dlp` or `bash`).
 
-Every generation follows the same five-step shape:
+## How to use
+
+Inside `execute_code` only. okonomi auto-detects `genmedia.` calls and dispatches them to a background thread (you'll see a `bg-exec-N` handle and an approval prompt).
+
+```python
+result = genmedia.run(
+    "fal-ai/flux/dev",
+    prompt="a noir detective in a rainy bar, 35mm film",
+    image_size="portrait_16_9",
+    num_images=1,
+)
+url = result["images"][0]["url"]
+print(url)
+```
+
+Three methods:
+- `genmedia.run(model_id, **arguments)` — invoke an endpoint, return parsed JSON, auto-track URLs.
+- `genmedia.search(query, limit=10)` — search fal's catalog by keyword (use this when you don't know the right model id).
+- `genmedia.schema(model_id)` — get an endpoint's parameter schema before calling.
+
+After dispatch: acknowledge in one short sentence and stop. Do *not* narrate expected output — those claims are wrong on failure and unnecessary on success. You'll be re-invoked with a completion note when the bg job finishes.
+
+Reach for deeper guidance via `load_skill_reference("genmedia", "<topic>")` — `image-generation`, `image-editing`, `video-generation`, `camera-and-framing`, `visual-style`, `post-production`.
+
+### One example per asset type
+
+For deeper recipes per category, load the dedicated skill (see "When to
+load companion skills" below). The core skill keeps a single canonical
+example for each so you have something to reach for immediately.
+
+```python
+# Image
+r = genmedia.run("fal-ai/flux/dev", prompt=p, image_size="landscape_16_9")
+url = r["images"][0]["url"]
+
+# Video (note: singular "video" key, not "videos")
+r = genmedia.run("fal-ai/kling-video/v2.5-turbo/pro/image-to-video",
+                 image_url=src, prompt=motion_prompt, duration=5)
+url = r["video"]["url"]
+
+# Audio (music / sfx / TTS — varied keys)
+r = genmedia.run("fal-ai/stable-audio", prompt=p, seconds_total=12)
+url = r["audio_file"]["url"]
+
+# 3D
+r = genmedia.run("fal-ai/trellis", image_url=src)
+url = r["model_mesh"]["url"]
+```
+
+### Discovery
+
+For any endpoint not in the dedicated skills, discover at runtime:
+
+```python
+matches = genmedia.search("music generation")
+print(matches)
+
+# Then peek at parameters before calling
+print(genmedia.schema("fal-ai/stable-audio"))
+```
+
+### Return object
+
+`genmedia.run(...)` returns a dict — the **fal endpoint's response payload, already unwrapped from the genmedia CLI envelope.** The CLI itself emits `{"status", "endpoint_id", "request_id", "result"}`, but the wrapper strips that outer shell and hands you the inner `result` directly. So `r["images"][0]["url"]` works on the first try; you do *not* need `r["result"]["images"]`.
+
+### Top-level shape (after unwrap)
+
+The keys depend on the endpoint. fal's universal asset envelope is `{"url": "..."}` (sometimes with `width`, `height`, `content_type`, `file_size` siblings) — what varies is *where* that envelope lives.
+
+| Endpoint family | Top-level key | Asset shape |
+|---|---|---|
+| Most text-to-image, multi-result | `r["images"]` | `list[{"url", "width", "height", ...}]` |
+| Single-image (upscale, segmentation, edit) | `r["image"]` | `{"url", ...}` |
+| Image-to-video, frame-to-frame | `r["video"]` | `{"url", "duration", ...}` |
+| Music / SFX / TTS (varies by model) | `r["audio_file"]` or `r["audio_url"]` or `r["audio"]` | `{"url", ...}` or a bare URL string |
+| Image-to-3D | `r["model_mesh"]` | `{"url", ...}` (glb/gltf) |
+| LoRA-aware image endpoints | `r["images"]` + `r["seed"]`, `r["timings"]`, `r["has_nsfw_concepts"]` | as above |
+
+### Envelope metadata (kept on the unwrapped dict)
+
+The wrapper preserves the CLI envelope fields as underscored keys, so you can reach them without re-parsing:
+
+- `r["_status"]` — usually `"completed"` on success
+- `r["_endpoint_id"]` — echo of the model id you ran
+- `r["_request_id"]` — fal's request id (useful for `genmedia status` if you ever need to poll, or for debugging support requests)
+
+These are added by the wrapper, not by fal — they only exist on `genmedia.run` results.
+
+### Errors
+
+- Subprocess / parse failures: `r == {"error": "<message>", ...}`. No `images`/`video`/etc. keys.
+- Endpoint-side errors (auth, rate limit, validation): the CLI usually exits non-zero, surfaced as `{"error": "<stderr>"}`. Same shape.
+- Always check for `"error"` *before* indexing into result keys when you're not certain a generation succeeded.
+
+### Inspecting an unfamiliar endpoint
+
+When in doubt, print first. The result variable persists across `execute_code` blocks (don't re-run a successful generation just to re-inspect):
 
 ```python
 import json
-
-# 1. (optional) discover an endpoint
-discover = run(command='genmedia models "image generation flux"')
-print(discover.get("stdout", ""))
-
-# 2. invoke
-result = run(command=(
-    'genmedia run fal-ai/flux/dev --json '
-    '--prompt "cyberpunk dancer, neon, rain, 35mm" '
-    '--num_images 1 '
-    '--image_size landscape_16_9'
-))
-
-if result.get("exit_code", 0) != 0:
-    print("genmedia failed:", result.get("stderr", ""))
-else:
-    # 3. parse the JSON the CLI emitted
-    payload = json.loads(result["stdout"])
-
-    # 4. extract the URL(s). fal endpoints differ — most images return
-    #    {"images": [{"url": ...}]}; videos return {"video": {"url": ...}};
-    #    audio often returns {"audio": {"url": ...}}.
-    url = payload["images"][0]["url"]
-
-    # 5. REQUIRED: register the asset with the session
-    track_output(
-        url=url,
-        asset_type="image",
-        prompt="cyberpunk dancer, neon, rain, 35mm",
-        model_id="fal-ai/flux/dev",
-    )
-    print(f"Generated: {url}")
+r = genmedia.run("fal-ai/some-new-endpoint", prompt="...")
+print(json.dumps(r, indent=2))   # learn the shape once
 ```
 
-That `track_output` call is what makes the asset:
-- Show up in `/assets`
-- Get downloaded to `{session_dir}/assets/...` in the background
-- Survive when the fal CDN URL expires
-
-If you produce N URLs from one call (e.g. `--num_images 4`), call
-`track_output` N times — once per URL.
-
-## Canonical recipes
-
-### Text-to-image
+Or peek at the schema before calling at all:
 
 ```python
-result = run(command=(
-    'genmedia run fal-ai/flux/dev --json '
-    f'--prompt {json.dumps(prompt)} '
-    '--image_size landscape_16_9 --num_images 1'
-))
-payload = json.loads(result["stdout"])
-url = payload["images"][0]["url"]
-track_output(url, "image", prompt=prompt, model_id="fal-ai/flux/dev")
+print(genmedia.schema("fal-ai/some-new-endpoint"))
 ```
-
-### Image edit (instruction-following)
-
-```python
-result = run(command=(
-    'genmedia run fal-ai/flux/dev/redux --json '
-    f'--image_url {source_url} '
-    f'--prompt {json.dumps(edit_instruction)}'
-))
-payload = json.loads(result["stdout"])
-url = payload["images"][0]["url"]
-track_output(url, "image", prompt=edit_instruction, model_id="fal-ai/flux/dev/redux")
-```
-
-### Reference-driven generation
-
-```python
-# Pass multiple reference URLs; supports up to 8 references on most models
-refs = " ".join(f'--image_urls {u}' for u in [ref1_url, ref2_url])
-result = run(command=(
-    f'genmedia run fal-ai/flux-pro/kontext --json '
-    f'{refs} --prompt {json.dumps(prompt)}'
-))
-```
-
-### Image upscale (SeedVR)
-
-```python
-result = run(command=(
-    'genmedia run fal-ai/seedvr/upscale/image --json '
-    f'--image_url {source_url} '
-    '--upscale_factor 4'
-))
-payload = json.loads(result["stdout"])
-url = payload["image"]["url"]   # NOTE: singular "image" here, not "images"
-track_output(url, "image", model_id="fal-ai/seedvr/upscale/image")
-```
-
-### Image-to-video
-
-```python
-result = run(command=(
-    'genmedia run fal-ai/kling-video/v2.5-turbo/pro/image-to-video --json '
-    f'--image_url {source_url} '
-    f'--prompt {json.dumps(motion_prompt)} '
-    '--duration 5'
-))
-payload = json.loads(result["stdout"])
-url = payload["video"]["url"]   # NOTE: "video" key, not "videos"
-track_output(url, "video", prompt=motion_prompt, model_id="fal-ai/kling-video/v2.5-turbo/pro/image-to-video")
-```
-
-### First-last-frame video
-
-```python
-result = run(command=(
-    'genmedia run fal-ai/runway-gen3/turbo/first-and-last-frame --json '
-    f'--first_frame_url {first_url} '
-    f'--last_frame_url {last_url} '
-    f'--prompt {json.dumps(prompt)}'
-))
-payload = json.loads(result["stdout"])
-url = payload["video"]["url"]
-track_output(url, "video", prompt=prompt, model_id="fal-ai/runway-gen3/turbo/first-and-last-frame")
-```
-
-### Music / audio generation
-
-```python
-result = run(command=(
-    'genmedia run fal-ai/stable-audio --json '
-    f'--prompt {json.dumps(prompt)} '
-    '--seconds_total 12'
-))
-payload = json.loads(result["stdout"])
-url = payload["audio_file"]["url"]
-track_output(url, "audio", prompt=prompt, model_id="fal-ai/stable-audio")
-```
-
-### Speech (TTS)
-
-```python
-result = run(command=(
-    'genmedia run fal-ai/elevenlabs/tts/turbo-v2.5 --json '
-    f'--text {json.dumps(text)} '
-    f'--voice {voice}'
-))
-payload = json.loads(result["stdout"])
-url = payload["audio_url"]["url"] if isinstance(payload.get("audio_url"), dict) else payload["audio_url"]
-track_output(url, "audio", prompt=text, model_id="fal-ai/elevenlabs/tts/turbo-v2.5")
-```
-
-### Image-to-3D
-
-```python
-result = run(command=(
-    'genmedia run fal-ai/trellis --json '
-    f'--image_url {source_url}'
-))
-payload = json.loads(result["stdout"])
-url = payload["model_mesh"]["url"]
-track_output(url, "3d", model_id="fal-ai/trellis")
-```
-
-## Discovery
-
-Don't have an endpoint id? Search:
-
-```python
-result = run(command='genmedia models "lip sync"')
-print(result["stdout"])
-```
-
-Pick a model from the list, then see its parameter schema:
-
-```python
-result = run(command='genmedia run fal-ai/sync-lipsync --help')
-print(result["stdout"])
-```
-
-The CLI prints each parameter with type, required/optional, and a
-description. Use that to build the `--param value` flags — never guess.
-
-## Long-running jobs
-
-For most endpoints `genmedia run` blocks until the job finishes and
-returns the JSON result. For very long jobs you can run async and
-poll:
-
-```python
-# Submit
-result = run(command=(
-    'genmedia run fal-ai/some-slow-model --json --async --prompt "..."'
-))
-request_id = json.loads(result["stdout"])["request_id"]
-
-# Poll
-import time
-while True:
-    status = run(command=f'genmedia status {request_id} --json')
-    state = json.loads(status["stdout"])
-    if state["status"] == "COMPLETED":
-        break
-    time.sleep(5)
-```
-
-In okonomi, prefer the *blocking* form — okonomi's bg-exec auto-dispatch
-already runs the whole `execute_code` block in a background thread, so
-the agent stays responsive even on a multi-minute video render. You'll
-get a `[system] Background task bg-exec-N completed` notification when
-it finishes.
 
 ## Pitfalls
 
-1. **Forgetting `--json`** — output is unparseable prose. Always
-   `--json` on `run` and `status` when invoking from code.
-2. **Forgetting `track_output`** — asset shows up in the response but
-   not in `/assets`, and the URL expires before you can save it. Call
-   it once per URL produced.
-3. **Wrong return key** — most image endpoints return `images: [...]`,
-   most video endpoints return `video: {url: ...}` (singular), audio
-   varies. Either inspect `print(json.dumps(payload, indent=2))` once
-   to learn the shape, or use `--help` on the endpoint to see the
-   documented response schema.
-4. **Quoting prompts** — the prompt is a CLI argument so it must be
-   shell-quoted. Use `json.dumps(prompt)` — it produces valid
-   double-quoted output and escapes embedded quotes safely.
-5. **Don't re-run on parse error** — if `json.loads(result["stdout"])`
-   throws KeyError downstream, the generation already succeeded. Do
-   `print(json.dumps(payload, indent=2))` in a *new* execute_code block
-   to inspect the shape and fix the access pattern. Re-running burns
-   another fal call for nothing.
+1. **KeyError on result access** — fal endpoints disagree on key names
+   (`images` vs `image`, `video` vs `videos`). If access fails, inspect
+   the response with `print(json.dumps(r, indent=2))` in a *new*
+   `execute_code` block. The generation already succeeded — its URL is
+   tracked, no need to re-run.
+2. **Re-running on parse error** — every re-run costs another fal call.
+   Always inspect the result variable (it persists across `execute_code`
+   blocks) before re-running.
+3. **Forgetting `image_size`** — defaults vary per model. Set it
+   explicitly when you have aspect-ratio expectations.
+4. **Long jobs feel like freezes** — they're not. The bg-exec thread is
+   working; the agent will get a completion notification when fal
+   returns. Don't spam status checks.
 
-## Workflow with okonomi's bg-exec
+## References
 
-`genmedia run` matches the agent's expensive-pattern detection, so any
-`execute_code` block containing it is:
+For deeper creative direction, consult these reference files in `references/` (read with `bash(command="cat <path>")` when you need them):
 
-1. Approval-gated (the user sees the code, expanded by default, and
-   approves with Enter or denies with `n`)
-2. Auto-dispatched to a background thread once approved — the model
-   gets `Dispatched as bg-exec-N` and moves on
-3. When the bg thread completes, a `[system] Background task bg-exec-N
-   completed` notification is injected as the next turn, listing every
-   asset `track_output` registered
+- **`image-generation.md`** — two-tier doctrine (z-image / flux-lora ideation, gpt-image-2 refinement), prompt craft layers, LoRA conventions, parameter cheat sheet, common workflows.
+- **`image-editing.md`** — when to use `redux` vs `kontext` vs `seedvr/upscale/image` vs `sam-3-1`, structured edit prompts.
+- **`video-generation.md`** — two-tier doctrine (ltx-2.3 ideation, seedance-2.0 refinement), production workflow, prompt anatomy, common mistakes.
+- **`camera-and-framing.md`** — shot types, camera moves, lens vocabulary.
+- **`visual-style.md`** — film stocks, lighting, color grading lookups.
+- **`post-production.md`** — ffmpeg recipes for stitching, transitions, audio muxing.
 
-So a complete one-shot generation is just:
-
-```python
-result = run(command=(
-    'genmedia run fal-ai/flux/dev --json --prompt "noir portrait" '
-    '--image_size portrait_16_9'
-))
-payload = json.loads(result["stdout"])
-url = payload["images"][0]["url"]
-track_output(url, "image", prompt="noir portrait", model_id="fal-ai/flux/dev")
-```
-
-Everything after — download, persistence, UI rendering, completion
-notification — is automatic.
+Pull a reference into context only when the current task actually needs it — they're long. The above bullet list is the index; load specifics on demand.

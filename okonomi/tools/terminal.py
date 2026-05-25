@@ -5,6 +5,7 @@ and working directory support. Designed for use within okonomi's code
 execution environment.
 """
 
+import itertools
 import os
 import re
 import shutil
@@ -13,12 +14,14 @@ import subprocess
 import threading
 import time
 from pathlib import Path
-from typing import Optional
+from typing import Any, Optional
 
 from okonomi.tools._metadata import ToolMetadataMixin
 
+
 MAX_OUTPUT_CHARS = 50_000
 HEAD_RATIO = 0.4
+_bg_counter = itertools.count(1)
 
 
 def _find_bash() -> str:
@@ -46,10 +49,10 @@ def _truncate_output(output: str) -> str:
 def _drain_pipe(pipe, chunks: list) -> None:
     try:
         while True:
-            data = pipe.read(4096)
-            if not data:
+            line = pipe.readline()
+            if not line:
                 break
-            chunks.append(data)
+            chunks.append(line)
     except Exception:
         pass
 
@@ -69,6 +72,15 @@ class TerminalTools(ToolMetadataMixin):
         self._bash = _find_bash()
         self._interrupt = interrupt_event or threading.Event()
         self._has_rg = shutil.which("rg") is not None
+        self._on_bg_complete: Optional[Any] = None
+        # Hook called when a background job (term-N) starts. Receives
+        # (task_id, label, reader) where reader is a zero-arg callable
+        # returning the current stdout snapshot. Set by the agent so its
+        # /logs slash command can find term-N output.
+        self._on_bg_register: Optional[Any] = None
+        # Hook called when a background job finishes. Receives
+        # (task_id, status) where status is "ok" or "error".
+        self._on_bg_finish: Optional[Any] = None
         self._env_blocklist = {
             "OPENROUTER_API_KEY",
             "ANTHROPIC_API_KEY",
@@ -86,11 +98,13 @@ class TerminalTools(ToolMetadataMixin):
             env["PATH"] = f"/usr/local/bin:{env.get('PATH', '/usr/bin:/bin')}"
         return env
 
-    def run(
+    def bash(
         self,
         command: str,
         timeout: int = 120,
         workdir: Optional[str] = None,
+        background: bool = False,
+        _chunks_sink: Optional[list] = None,
     ) -> dict:
         """Execute a shell command and return its output.
 
@@ -99,13 +113,24 @@ class TerminalTools(ToolMetadataMixin):
 
         Args:
             command: Shell command to execute.
-            timeout: Maximum seconds to wait (default 120).
+            timeout: Maximum seconds to wait (default 120). Ignored when
+                ``background=True``.
             workdir: Working directory override. If not set, uses the
                 directory from the previous call.
+            background: When True, run the command in a thread and
+                return immediately with ``{"task_id": "term-N", "message":
+                ...}``. Output and exit code surface as a system note on
+                completion (same notification path as bg-exec). Use this
+                for long downloads (yt-dlp), renders (ffmpeg), or any
+                command that would otherwise stall the agent loop.
 
         Returns:
-            Dict with 'output' (str), 'exit_code' (int), and 'cwd' (str).
+            Sync mode: dict with 'output' (str), 'exit_code' (int), and 'cwd' (str).
+            Background mode: dict with 'task_id' (str) and 'message' (str).
         """
+        if background:
+            return self._bash_background(command, workdir)
+
         if workdir:
             cwd = str(Path(workdir).expanduser().resolve())
         else:
@@ -142,7 +167,7 @@ class TerminalTools(ToolMetadataMixin):
                 "cwd": self._cwd,
             }
 
-        chunks: list[str] = []
+        chunks: list[str] = _chunks_sink if _chunks_sink is not None else []
         drain = threading.Thread(target=_drain_pipe, args=(proc.stdout, chunks), daemon=True)
         drain.start()
 
@@ -189,41 +214,63 @@ class TerminalTools(ToolMetadataMixin):
             "cwd": self._cwd,
         }
 
-    def run_background(
-        self,
-        command: str,
-        workdir: Optional[str] = None,
-    ) -> dict:
-        """Start a command in the background and return immediately.
+    def _bash_background(self, command: str, workdir: Optional[str]) -> dict:
+        """Spawn a command in a thread and notify on completion.
 
-        Args:
-            command: Shell command to execute.
-            workdir: Working directory override.
-
-        Returns:
-            Dict with 'pid' (int) and 'message' (str).
+        Returns immediately. The thread runs the same code path as a
+        synchronous ``run()`` (capturing output, exit code, cwd update)
+        and fires ``self._on_bg_complete`` when done so the TUI can
+        inject a system note for the next agent turn.
         """
-        cwd = str(Path(workdir).expanduser().resolve()) if workdir else self._cwd
+        task_id = f"term-{next(_bg_counter)}"
+        # Live chunks list — populated incrementally by the drain thread
+        # inside `bash()`. Snapshotting via "".join(chunks) is what makes
+        # /logs term-N show output while the command is still running.
+        chunks: list[str] = []
+        def _snapshot() -> str:
+            joined = "".join(chunks)
+            # Strip the internal cwd marker bash() appends to detect cwd
+            # changes — it's not user-visible output.
+            if "__CWD=" in joined:
+                joined = joined.rsplit("__CWD=", 1)[0]
+            return joined or "(no output yet)"
 
-        try:
-            proc = subprocess.Popen(
-                [self._bash, "-lc", command],
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL,
-                stdin=subprocess.DEVNULL,
-                cwd=cwd,
-                env=self._make_env(),
-                start_new_session=True,
-            )
-            return {
-                "pid": proc.pid,
-                "message": f"Started in background (PID {proc.pid})",
-            }
-        except Exception as e:
-            return {
-                "pid": -1,
-                "message": f"Failed to start: {e}",
-            }
+        if self._on_bg_register is not None:
+            try:
+                self._on_bg_register(task_id=task_id, label=command[:60], reader=_snapshot)
+            except Exception:
+                pass
+
+        def _worker() -> None:
+            result = self.bash(command, timeout=3600, workdir=workdir, _chunks_sink=chunks)
+            output = result.get("output", "")
+            exit_code = result.get("exit_code", 0)
+            error = None if exit_code == 0 else f"exit_code={exit_code}"
+            if self._on_bg_finish is not None:
+                try:
+                    self._on_bg_finish(task_id=task_id, status="error" if error else "ok")
+                except Exception:
+                    pass
+            if self._on_bg_complete is not None:
+                try:
+                    self._on_bg_complete(
+                        bg_id=task_id,
+                        error=error,
+                        output=output,
+                        new_artifacts=0,
+                        produced_artifacts=[],
+                    )
+                except Exception:
+                    pass
+
+        threading.Thread(target=_worker, daemon=True, name=f"okonomi-{task_id}").start()
+        return {
+            "task_id": task_id,
+            "message": (
+                f"Started in background as {task_id}. Output and exit code "
+                "will arrive in a system note when the command finishes."
+            ),
+        }
 
     def _quote(self, s: str) -> str:
         return "'" + s.replace("'", "'\\''") + "'"
@@ -289,7 +336,7 @@ class TerminalTools(ToolMetadataMixin):
         fetch = limit + offset + (200 if context > 0 else 0)
         parts.extend(["|", "head", "-n", str(fetch)])
 
-        result = self.run(" ".join(parts), timeout=60)
+        result = self.bash(" ".join(parts), timeout=60)
         stdout = result["output"]
 
         if result["exit_code"] == 2 and not stdout.strip():
@@ -316,7 +363,7 @@ class TerminalTools(ToolMetadataMixin):
         parts.append(self._quote(path))
         parts.extend(["|", "head", "-n", str(limit + offset)])
 
-        result = self.run(" ".join(parts), timeout=60)
+        result = self.bash(" ".join(parts), timeout=60)
         stdout = result["output"]
 
         if not stdout.strip():
