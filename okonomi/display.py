@@ -197,9 +197,9 @@ def print_loading_art(label: str = "What's on your mind?") -> None:
 
 
 def get_task_input(args: argparse.Namespace) -> str:
-    """Return the task string provided via positional arg or --task flag.
+    """Return the task string provided via the --task flag.
 
     The Textual TUI handles interactive input; this helper is only used by
     the one-shot non-interactive code path.
     """
-    return (args.task or args.task_flag or "").strip()
+    return (args.task or "").strip()

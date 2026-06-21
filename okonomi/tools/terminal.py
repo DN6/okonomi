@@ -66,8 +66,7 @@ class TerminalTools(ToolMetadataMixin):
     __namespace__ = "terminal"
     __description__ = "Execute shell commands locally with timeout and output capture"
 
-    def __init__(self, config, interrupt_event: Optional[threading.Event] = None):
-        self.config = config
+    def __init__(self, interrupt_event: Optional[threading.Event] = None):
         self._cwd = os.getcwd()
         self._bash = _find_bash()
         self._interrupt = interrupt_event or threading.Event()

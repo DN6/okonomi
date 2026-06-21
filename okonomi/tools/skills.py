@@ -308,8 +308,7 @@ class SkillTools(ToolMetadataMixin):
     __namespace__ = "skills"
     __description__ = "Tools for discovering, loading, and managing workflow skills"
 
-    def __init__(self, config, available_tools: set[str] | None = None):
-        self.config = config
+    def __init__(self, available_tools: set[str] | None = None):
         self._available_tools = available_tools
         self._skills_cache: dict[str, dict] | None = None
 

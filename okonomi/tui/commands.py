@@ -12,7 +12,7 @@ from __future__ import annotations
 from pathlib import Path
 from typing import TYPE_CHECKING
 
-from .events import EventEmitter
+from ..events import EventEmitter
 
 
 if TYPE_CHECKING:
@@ -32,6 +32,7 @@ SLASH_COMMANDS: list[tuple[str, str]] = [
     ("/heart", "♥ the last generated asset, or pass a URL / local path"),
     ("/loved", "List loved assets — optional filter: images / video / audio / text / 3d / internal / external"),
     ("/prune", "Delete empty sessions older than 24h"),
+    ("/reload", "Rebuild the agent — picks up edited skills, tool docstrings, system prompt"),
     ("/save", "Save current session"),
     ("/skill", "Load a skill by name (`/skill <name>`)"),
     ("/jobs", "List active and recent background jobs (bg-exec-N, term-N)"),
@@ -76,7 +77,8 @@ def handle(
         return None
 
     if low in ("/clear", "/reset"):
-        agent.message_history = []
+        agent.state.message_history = []
+        agent.state.context = []
         emitter.note("Conversation cleared.")
         return None
 
@@ -133,7 +135,7 @@ def handle(
     if low == "/timeout" or low.startswith("/timeout "):
         rest = cmd[len("/timeout"):].strip()
         if not rest:
-            current = agent.config.timeouts.agent_turn
+            current = agent.timeout
             label = "disabled" if current <= 0 else f"{current:.0f}s"
             emitter.note(f"Per-turn timeout: {label}. Use `/timeout <seconds>` to change (0 disables).")
             return None
@@ -142,28 +144,21 @@ def handle(
         except ValueError:
             emitter.note(f"Invalid value: {rest!r}. Use a number of seconds.", level="warn")
             return None
-        agent.config.timeouts.agent_turn = seconds
+        agent.timeout = seconds
         label = "disabled" if seconds <= 0 else f"{seconds:.0f}s"
         emitter.note(f"Per-turn timeout set to {label}.")
         return None
 
     if low == "/assets":
-        artifacts = [a for a in agent.artifacts if a.artifact_type in ("image", "video", "audio", "3d")]
+        try:
+            agent._sync_session_assets(agent._get_dependencies())
+        except Exception:
+            pass
+        artifacts = [a for a in agent.state.artifacts if a.artifact_type in ("image", "video", "audio", "3d", "html")]
         if not artifacts:
             emitter.note("No assets generated yet.")
             return None
-        lines = [f"Assets ({len(artifacts)}):"]
-        for i, a in enumerate(artifacts, 1):
-            kind = a.artifact_type or "file"
-            ref = a.path or a.url or ""
-            prompt = (a.prompt or "").strip()
-            if len(prompt) > 60:
-                prompt = prompt[:60] + "..."
-            lines.append(f"  {i}. [{kind}] {ref}")
-            if prompt:
-                lines.append(f"     {prompt}")
-        emitter.note("\n".join(lines))
-        return None
+        return "__asset_picker__"
 
     if low == "/save":
         agent.save_session(status="completed")
@@ -173,6 +168,11 @@ def handle(
     if low == "/prune":
         count = agent.session_manager.prune_empty_sessions()
         emitter.note(f"Pruned {count} empty session{'s' if count != 1 else ''}.")
+        return None
+
+    if low == "/reload":
+        counts = agent.reload()
+        emitter.note(f"Reloaded — {counts['skills']} skills, {counts['tools']} tools.")
         return None
 
     if low == "/last":
@@ -189,7 +189,7 @@ def handle(
     if low.startswith("/title"):
         title_text = cmd[len("/title") :].strip()
         if title_text:
-            if agent.session_manager.set_title(agent.session_id, title_text):
+            if agent.session_manager.set_title(agent.state.session_id, title_text):
                 emitter.note(f"Title set: {title_text}")
             else:
                 emitter.note(
@@ -197,7 +197,7 @@ def handle(
                     level="error",
                 )
         else:
-            meta = agent.session_manager.load_session(agent.session_id, with_history=False)
+            meta = agent.session_manager.load_session(agent.state.session_id, with_history=False)
             emitter.note(f"Title: {(meta.title if meta else '') or '(none)'}")
         return None
 
@@ -342,7 +342,7 @@ def _resolve_local_path(text: str) -> Path | None:
 
 
 def _heart_last_artifact(agent: "OkonomiAgent", emitter: EventEmitter) -> None:
-    media = [a for a in agent.artifacts if a.artifact_type in ("image", "video", "audio", "3d")]
+    media = [a for a in agent.state.artifacts if a.artifact_type in ("image", "video", "audio", "3d")]
     if not media:
         emitter.note("No generated media in this session.", level="warn")
         return
@@ -354,7 +354,7 @@ def _heart_last_artifact(agent: "OkonomiAgent", emitter: EventEmitter) -> None:
     sm = agent.session_manager
     row = sm._db.execute(
         "SELECT id FROM artifacts WHERE session_id = ? AND (url = ? OR path = ?) ORDER BY id DESC LIMIT 1",
-        (agent.session_id, last.url or "", last.path or ""),
+        (agent.state.session_id, last.url or "", last.path or ""),
     ).fetchone()
     if row is None:
         emitter.note("Asset not yet indexed — try again in a moment.", level="warn")
@@ -362,7 +362,7 @@ def _heart_last_artifact(agent: "OkonomiAgent", emitter: EventEmitter) -> None:
 
     sm.favorite(artifact_id=row["id"])
     src = Path(last.path).resolve()
-    _symlink_into_loved(src, agent.session_id)
+    _symlink_into_loved(src, agent.state.session_id)
     emitter.note(f"♥ {src.name}")
 
 

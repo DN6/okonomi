@@ -252,6 +252,15 @@ Trails are achieved by *not* clearing the trail layer between frames, or by draw
 
 Deeper WebGL material (camera, lighting, GLSL shaders, framebuffers, post-processing) is in `load_skill_reference("p5js", "webgl-and-3d")`.
 
+## Pitfalls
+
+1. **Leaving Friendly Errors on.** Set `p5.disableFriendlyErrors = true` before `setup()` — FES adds heavy per-call overhead in hot loops.
+2. **Retina overdraw.** Skipping `pixelDensity(1)` silently renders at 2–4× resolution and tanks the frame rate. Set it in `setup()`.
+3. **p5 wrappers in hot loops.** `sin()` / `dist()` wrap `Math.*` with per-call overhead — use `Math.sin`, `Math.sqrt` inside tight loops.
+4. **Raw noise.** `noise(x, y)` on its own looks like smooth blobs; layer octaves (fBM) for organic detail.
+5. **WebGL coordinate surprises.** In `WEBGL` mode the origin is the canvas *center*, Y is inverted, every transform needs `push()`/`pop()`, and `texture()` goes *before* the shape (see the WebGL gotchas section and `load_skill_reference("p5js", "webgl-and-3d")`).
+6. **Baking when you don't need to.** The default deliverable is the live HTML — only render to PNG/MP4/GIF when the user explicitly asks.
+
 ## References
 
 Topic-deep material, available via `load_skill_reference("p5js", "<name>")`:

@@ -10,7 +10,6 @@ import threading
 from dataclasses import dataclass
 from datetime import datetime
 
-from okonomi.config import OkonomiConfig
 from okonomi.display import DIM, GREEN, RED, RST
 
 
@@ -27,8 +26,7 @@ class BackgroundTask:
 class AgentTools:
     """Tool for launching and managing background sub-agents."""
 
-    def __init__(self, config: OkonomiConfig):
-        self._config = config
+    def __init__(self):
         self._tasks: dict[str, BackgroundTask] = {}
         self._counter = 0
         self._parent_agent = None
@@ -103,8 +101,10 @@ class AgentTools:
             final_status = "ok"
             try:
                 agent = OkonomiAgent(
-                    parent.config,
-                    session_id=parent.session_id,
+                    model_id=parent.model_id,
+                    timeout=parent.timeout,
+                    compress_at_tokens=parent.compress_at_tokens,
+                    session_id=parent.state.session_id,
                 )
                 agent.approval_callback = approval_callback
 
@@ -112,9 +112,9 @@ class AgentTools:
                 asyncio.set_event_loop(loop)
                 try:
                     loop.run_until_complete(agent.run_async(task, reset=True))
-                    parent.artifacts.extend(agent.artifacts)
-                    parent.tools_used.update(agent.tools_used)
-                    bg_task.outputs = len(agent.artifacts)
+                    parent.state.artifacts.extend(agent.state.artifacts)
+                    parent.state.tools_used.update(agent.state.tools_used)
+                    bg_task.outputs = len(agent.state.artifacts)
                     bg_task.status = "done"
                     print(
                         f"\n{GREEN}✓ Agent done: {label} — {bg_task.outputs} artifact{'s' if bg_task.outputs != 1 else ''}{RST}"

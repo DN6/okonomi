@@ -17,7 +17,7 @@ import httpx
 from discord import app_commands
 
 from ..agent import OkonomiAgent
-from ..config import OkonomiConfig
+from ..config import load_env_or_die
 from ..session import SessionManager
 
 
@@ -30,32 +30,31 @@ DISCORD_MAX_FILE_SIZE = 25 * 1024 * 1024
 class AgentSession:
     """Wraps an OkonomiAgent for a single Discord conversation context."""
 
-    def __init__(self, config: OkonomiConfig, session_manager: SessionManager):
-        self.agent = OkonomiAgent(config)
+    def __init__(self, session_manager: SessionManager):
+        self.agent = OkonomiAgent()
         self.agent.session_manager = session_manager
         self.lock = asyncio.Lock()
         self._prev_output_count = 0
 
     async def run(self, message: str, reset: bool = False) -> str:
         async with self.lock:
-            self._prev_output_count = len(self.agent.artifacts)
+            self._prev_output_count = len(self.agent.state.artifacts)
             return await self.agent.run_async(message, reset=reset)
 
     def new_outputs(self) -> list:
-        return self.agent.artifacts[self._prev_output_count :]
+        return self.agent.state.artifacts[self._prev_output_count :]
 
 
 class OkonomiBot(discord.Client):
     """Discord bot that routes messages to OkonomiAgent instances."""
 
-    def __init__(self, config: OkonomiConfig):
+    def __init__(self):
         intents = discord.Intents.default()
         intents.message_content = True
         intents.dm_messages = True
         intents.guild_messages = True
         super().__init__(intents=intents)
 
-        self.config = config
         self.session_manager = SessionManager()
         self.tree = app_commands.CommandTree(self)
         self._sessions: dict[str, AgentSession] = {}
@@ -93,7 +92,7 @@ class OkonomiBot(discord.Client):
 
     def _get_session(self, key: str) -> AgentSession:
         if key not in self._sessions:
-            self._sessions[key] = AgentSession(self.config, self.session_manager)
+            self._sessions[key] = AgentSession(self.session_manager)
         return self._sessions[key]
 
     def _setup_commands(self) -> None:
@@ -122,11 +121,11 @@ class OkonomiBot(discord.Client):
                 await interaction.response.send_message("No active session.", ephemeral=True)
                 return
             agent = session.agent
-            usage = agent.token_usage
+            usage = agent.state.tokens
             lines = [
-                f"**Session:** `{agent.session_id[:8]}`",
-                f"**Task:** {agent.task or 'N/A'}",
-                f"**Artifacts:** {len(agent.artifacts)}",
+                f"**Session:** `{agent.state.session_id[:8]}`",
+                f"**Task:** {agent.state.task or 'N/A'}",
+                f"**Artifacts:** {len(agent.state.artifacts)}",
                 f"**Tokens:** {usage.total_tokens:,} ({usage.requests} requests)",
             ]
             await interaction.response.send_message("\n".join(lines), ephemeral=True)
@@ -333,8 +332,8 @@ def run_discord_bot() -> None:
     logging.getLogger("httpx").setLevel(logging.WARNING)
     logging.getLogger("httpcore").setLevel(logging.WARNING)
 
-    config = OkonomiConfig()
-    bot = OkonomiBot(config)
+    load_env_or_die()
+    bot = OkonomiBot()
 
     logger.info("Starting Okonomi Discord bot...")
     bot.run(token, log_handler=None)

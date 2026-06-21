@@ -7,19 +7,22 @@ wiring come in later phases.
 
 from __future__ import annotations
 
+import threading
 from pathlib import Path
 from typing import Callable
 
+from rich.text import Text
 from textual import on as textual_on
 from textual.app import App, ComposeResult
 from textual.binding import Binding
-from textual.containers import VerticalScroll
+from textual.containers import Vertical, VerticalScroll
+from textual.css.query import NoMatches
 from textual.message import Message
 from textual.screen import ModalScreen
-from textual.widgets import Input, OptionList, TextArea
+from textual.widgets import Input, OptionList, Static, TextArea
 from textual.widgets.option_list import Option
 
-from .events import (
+from ..events import (
     AssistantStream,
     Banner,
     Divider,
@@ -29,6 +32,8 @@ from .events import (
     ToolCall,
     UserMessage,
 )
+from ..utils import fuzzy_match
+from . import commands
 from .widgets import (
     AssistantStreamWidget,
     BgTasksWidget,
@@ -97,8 +102,6 @@ class SessionPicker(ModalScreen[str]):
         self._all_sessions: list = []
 
     def compose(self) -> ComposeResult:
-        from textual.containers import Vertical
-
         from ..session import SessionManager
 
         all_sessions = SessionManager().list_sessions(limit=500)
@@ -119,15 +122,13 @@ class SessionPicker(ModalScreen[str]):
         self.query_one("#picker-search", Input).focus()
 
     def _build_options(self, query: str) -> list[Option]:
-        from rich.text import Text
-
         q = query.strip().lower()
         rows = []
         for s in self._all_sessions:
             name = s.display_name or "(untitled)"
             date = (s.created_at or "")[:10]
             haystack = f"{name} {date} {s.session_id}".lower()
-            if q and not _fuzzy_match(q, haystack):
+            if q and not fuzzy_match(q, haystack):
                 continue
             line = Text()
             line.append(f"{date}  ", style="#888888")
@@ -192,16 +193,209 @@ class SessionPicker(ModalScreen[str]):
         self.dismiss("")
 
 
-def _fuzzy_match(query: str, haystack: str) -> bool:
-    """Simple subsequence match: every char of `query` appears in order in
-    `haystack`. Cheap, dependency-free, and matches what cmd-K pickers do."""
-    i = 0
-    for ch in haystack:
-        if i < len(query) and ch == query[i]:
-            i += 1
-        if i == len(query):
-            return True
-    return i == len(query)
+class AssetPicker(ModalScreen[str]):
+    """Modal listing the session's generated assets. Filter via the top
+    Input, Space/Enter toggles selection on the highlighted row, ``o``
+    opens all selected with the OS, ``c`` copies paths to the clipboard,
+    ``h`` hearts (favorites) the selection. Esc closes.
+    """
+
+    DEFAULT_CSS = """
+    AssetPicker {
+        align: center middle;
+    }
+    #asset-dialog {
+        width: 80%;
+        height: 70%;
+        background: #1a1a2e;
+        border: round #6f4355;
+        padding: 1 2;
+        layout: vertical;
+    }
+    #asset-search {
+        height: 3;
+        border: round #6f4355;
+        background: transparent;
+        color: #e8e8e8;
+        margin: 0 0 1 0;
+    }
+    #asset-search:focus { border: round #8f5a75; }
+    #asset-list {
+        height: 1fr;
+        background: transparent;
+        border: none;
+        padding: 0;
+        scrollbar-size: 0 0;
+    }
+    #asset-list > .option-list--option { padding: 0 1; color: #b4b4c3; }
+    #asset-list > .option-list--option-highlighted {
+        background: #333355;
+        color: #d787af;
+        text-style: bold;
+    }
+    #asset-footer { height: 1; color: #888888; margin: 1 0 0 0; }
+    """
+
+    BINDINGS = [
+        Binding("escape", "close", "Close", show=True),
+        Binding("down", "to_list", "Move to list", show=False),
+        Binding("space", "toggle", "Toggle select", show=True),
+        Binding("a", "select_all", "Select all", show=True),
+        Binding("ctrl+a", "select_all", "Select all", show=False),
+        Binding("x", "clear_selection", "Clear", show=True),
+        Binding("o", "open", "Open", show=True),
+        Binding("c", "copy", "Copy paths", show=True),
+        Binding("h", "heart", "Favorite", show=True),
+    ]
+
+    def __init__(self, artifacts: list, on_action) -> None:
+        super().__init__()
+        self.on_action = on_action
+        self._artifacts = artifacts
+        # Asset ref (path or url) is the stable selection key.
+        self._selected: set[str] = set()
+
+    def compose(self) -> ComposeResult:
+        with Vertical(id="asset-dialog"):
+            yield Input(placeholder="Filter by type, prompt, path…", id="asset-search")
+            yield OptionList(*self._build_options(""), id="asset-list")
+            yield Static(self._footer_text(), id="asset-footer")
+
+    def on_mount(self) -> None:
+        self.query_one("#asset-search", Input).focus()
+
+    def _ref(self, artifact) -> str:
+        return artifact.path or artifact.url or ""
+
+    def _build_options(self, query: str) -> list[Option]:
+        q = query.strip().lower()
+        rows: list[Option] = []
+        for a in self._artifacts:
+            ref = self._ref(a)
+            if not ref:
+                continue
+            kind = a.artifact_type or "file"
+            prompt = (a.prompt or "").strip()
+            haystack = f"{kind} {prompt} {ref}".lower()
+            if q and not fuzzy_match(q, haystack):
+                continue
+            check = "[x] " if ref in self._selected else "[ ] "
+            line = Text()
+            line.append(check, style="#d787af bold")
+            line.append(f"{kind:<6} ", style="#888888")
+            display_ref = ref if len(ref) <= 70 else "…" + ref[-69:]
+            line.append(display_ref, style="#b4b4c3")
+            if prompt:
+                prompt_short = prompt[:60] + ("…" if len(prompt) > 60 else "")
+                line.append(f"  — {prompt_short}", style="#666677")
+            rows.append(Option(line, id=ref))
+        if not rows:
+            rows = [Option(Text("(no matches)", style="#888888"), disabled=True)]
+        return rows
+
+    def _footer_text(self) -> str:
+        n = len(self._selected)
+        return f"{n} selected  ·  Space/Enter toggle · " "a all · x clear · o open · c copy · h heart · Esc close"
+
+    def _refresh_list(self) -> None:
+        query = self.query_one("#asset-search", Input).value
+        ol = self.query_one("#asset-list", OptionList)
+        prev_highlight = ol.highlighted
+        ol.clear_options()
+        for opt in self._build_options(query):
+            ol.add_option(opt)
+        if ol.option_count > 0:
+            ol.highlighted = min(prev_highlight or 0, ol.option_count - 1)
+        self.query_one("#asset-footer", Static).update(self._footer_text())
+
+    def on_input_changed(self, event: Input.Changed) -> None:
+        if event.input.id == "asset-search":
+            self._refresh_list()
+
+    def on_input_submitted(self, event: Input.Submitted) -> None:
+        # Enter in the search field: move to list (mirrors SessionPicker's
+        # Down behavior so the user can immediately start toggling).
+        if event.input.id == "asset-search":
+            self.query_one("#asset-list", OptionList).focus()
+
+    def action_to_list(self) -> None:
+        if isinstance(self.focused, Input) and self.focused.id == "asset-search":
+            self.query_one("#asset-list", OptionList).focus()
+
+    def _highlighted_ref(self) -> str | None:
+        ol = self.query_one("#asset-list", OptionList)
+        idx = ol.highlighted
+        if idx is None or ol.option_count == 0:
+            return None
+        opt = ol.get_option_at_index(idx)
+        return opt.id if opt is not None else None
+
+    def on_key(self, event) -> None:
+        # Up-arrow at the top of the list bounces back to search.
+        if event.key == "up" and isinstance(self.focused, OptionList):
+            ol = self.focused
+            if ol.id == "asset-list" and ol.highlighted in (0, None):
+                self.query_one("#asset-search", Input).focus()
+                event.stop()
+                event.prevent_default()
+
+    def on_option_list_option_selected(self, event: OptionList.OptionSelected) -> None:
+        # Enter on a row toggles selection (don't dismiss — multi-select).
+        ref = event.option.id
+        if not ref:
+            return
+        if ref in self._selected:
+            self._selected.remove(ref)
+        else:
+            self._selected.add(ref)
+        self._refresh_list()
+        event.stop()
+
+    def action_toggle(self) -> None:
+        ref = self._highlighted_ref()
+        if not ref:
+            return
+        if ref in self._selected:
+            self._selected.remove(ref)
+        else:
+            self._selected.add(ref)
+        self._refresh_list()
+
+    def action_select_all(self) -> None:
+        ol = self.query_one("#asset-list", OptionList)
+        for i in range(ol.option_count):
+            opt = ol.get_option_at_index(i)
+            if opt is not None and opt.id:
+                self._selected.add(opt.id)
+        self._refresh_list()
+
+    def action_clear_selection(self) -> None:
+        self._selected.clear()
+        self._refresh_list()
+
+    def _dispatch(self, action: str) -> None:
+        paths = (
+            sorted(self._selected)
+            if self._selected
+            else ([self._highlighted_ref()] if self._highlighted_ref() else [])
+        )
+        paths = [p for p in paths if p]
+        if not paths:
+            return
+        self.on_action(action, paths)
+        self.dismiss("")
+
+    def action_open(self) -> None:
+        self._dispatch("open")
+
+    def action_copy(self) -> None:
+        self._dispatch("copy")
+
+    def action_heart(self) -> None:
+        self._dispatch("heart")
+
+    def action_close(self) -> None:
+        self.dismiss("")
 
 
 class _HistoryScroll(VerticalScroll):
@@ -242,6 +436,11 @@ class _ChatInput(TextArea):
         Binding("alt+enter", "newline", "Insert newline", show=False, priority=True),
         Binding("shift+enter", "newline", "Insert newline", show=False, priority=True),
         Binding("ctrl+j", "newline", "Insert newline", show=False, priority=True),
+        # Priority bindings so we preempt TextArea's default
+        # cursor_up/cursor_down for the at-boundary history-scrub case.
+        # The action falls through to cursor movement when mid-text.
+        Binding("up", "smart_up", show=False, priority=True),
+        Binding("down", "smart_down", show=False, priority=True),
     ]
 
     DEFAULT_CSS = """
@@ -256,18 +455,12 @@ class _ChatInput(TextArea):
     """
 
     def __init__(self, *args, placeholder: str = "", **kwargs):
-        # Accept the placeholder kwarg for call-site compat but no-op it —
-        # TextArea has no native placeholder rendering, and faking one
-        # via render_line override is fragile across Textual versions.
-        # Empty multi-line box reads fine; the welcome banner above
-        # already prompts the user to start typing.
         kwargs.pop("placeholder", None)
         super().__init__(*args, **kwargs)
-        self._placeholder = placeholder  # kept for the .placeholder shim
+        self._placeholder = placeholder
 
     @property
     def value(self) -> str:
-        """Compat shim — old code reads/writes ``inp.value``."""
         return self.text
 
     @value.setter
@@ -288,32 +481,42 @@ class _ChatInput(TextArea):
     def action_newline(self) -> None:
         self.insert("\n")
 
-    def on_key(self, event) -> None:
-        """Up/Down navigate the slash-command dropdown when it's open.
-
-        When no dropdown is showing, the keys fall through to TextArea's
-        default cursor-between-lines behavior.
-        """
-        if event.key not in ("up", "down"):
-            return
+    def _dropdown_nav(self, direction: int) -> bool:
+        """If the slash dropdown is open, move highlight and return True."""
         try:
             dropdown = self.app.query_one("#slash-dropdown", OptionList)
-        except Exception:
-            return
+        except NoMatches:
+            return False
         if not dropdown.has_class("-visible") or dropdown.option_count == 0:
-            return
+            return False
         current = dropdown.highlighted if dropdown.highlighted is not None else 0
-        if event.key == "up":
+        if direction < 0:
             dropdown.highlighted = max(0, current - 1)
         else:
             dropdown.highlighted = min(dropdown.option_count - 1, current + 1)
-        event.stop()
-        event.prevent_default()
+        return True
+
+    def action_smart_up(self) -> None:
+        """Up arrow: dropdown nav > input history > cursor up."""
+        if self._dropdown_nav(-1):
+            return
+        row, _col = self.cursor_location
+        if row == 0:
+            self.app.action_history_prev()
+            return
+        self.action_cursor_up()
+
+    def action_smart_down(self) -> None:
+        """Down arrow: dropdown nav > input history > cursor down."""
+        if self._dropdown_nav(+1):
+            return
+        row, _col = self.cursor_location
+        if row == self.document.line_count - 1:
+            self.app.action_history_next()
+            return
+        self.action_cursor_down()
 
     def move_cursor_to_end(self) -> None:
-        """Compat helper for sites that previously did
-        ``inp.move_cursor_to_end()`` on the old single-line
-        Input. TextArea cursor is (row, col), so we have to compute it."""
         text = self.text
         if not text:
             self.move_cursor((0, 0))
@@ -404,15 +607,17 @@ class OkonomiApp(App):
         Binding("ctrl+c", "interrupt", "Interrupt / clear input", show=False, priority=True),
         Binding("ctrl+l", "clear_screen", "Clear screen", show=False, priority=True),
         Binding("ctrl+o", "toggle_latest", "Expand latest tool call", show=True),
-        # Tab/Up/Down are NOT priority — let modal screens (SessionPicker,
-        # OptionList) handle them when focused. They bubble back to the
-        # App when no widget consumes them.
-        Binding("tab", "focus_history", "Focus history", show=True),
+        # priority=True so the Screen-level `tab` → `focus_next` default
+        # doesn't fire and yank focus (and the viewport) to the first
+        # ToolCallWidget in the DOM.
+        Binding("tab", "focus_history", "Autocomplete slash command", show=False, priority=True),
         Binding("escape", "focus_input", "Focus input", show=True),
-        # Ctrl+Up/Down for input history — Up/Down themselves now move
-        # the cursor between lines in the multi-line _ChatInput.
         Binding("ctrl+up", "history_prev", "Previous input", show=False),
         Binding("ctrl+down", "history_next", "Next input", show=False),
+        Binding("pageup", "scroll_history_up", "Scroll back", show=False),
+        Binding("pagedown", "scroll_history_down", "Scroll forward", show=False),
+        Binding("ctrl+home", "scroll_history_top", "Jump to top", show=False),
+        Binding("ctrl+end", "scroll_history_bottom", "Jump to bottom", show=False),
     ]
 
     HISTORY_FILE = Path.home() / ".okonomi" / "input_history"
@@ -437,9 +642,8 @@ class OkonomiApp(App):
         # Inline approval state. When set, the next input submission is
         # routed through this callback instead of as a user message.
         self._approval_resolve: Callable[[object], None] | None = None
-        # Tracks whether the user has submitted at least one message.
-        # Used to drop the "What's on your mind?" placeholder after the
-        # first turn — by then it's just visual noise.
+        # Drop the welcome placeholder after the first submit — it's
+        # noise once the user is in a conversation.
         self._has_submitted: bool = False
         # The SystemNote event currently asking for approval. We mutate it
         # to a one-line summary on resolve so the verbose prompt doesn't
@@ -451,8 +655,6 @@ class OkonomiApp(App):
         self._pending_input: str = ""  # saved draft when cursor steps up
 
     def compose(self) -> ComposeResult:
-        from textual.widgets import Static as _Static
-
         # History fills the top; input and metadata flow after it in order.
         # can_focus=False so Tab skips the scroll pane and reaches the
         # App-level `tab` binding which focuses the last ToolCallWidget.
@@ -475,7 +677,7 @@ class OkonomiApp(App):
         yield BgTasksWidget(self.bg_tasks_fn)
 
         # Spacer pushes the metadata clear of the terminal bottom edge.
-        yield _Static("", id="bottom-spacer")
+        yield Static("", id="bottom-spacer")
 
     async def on_mount(self) -> None:
         self._unsubscribe = self.emitter.subscribe(self._on_event)
@@ -495,8 +697,6 @@ class OkonomiApp(App):
         -> emitter.user()), call_from_thread() raises — so branch on thread
         identity and dispatch directly in that case.
         """
-        import threading
-
         if threading.current_thread() is threading.main_thread():
             self._render_event(event)
         else:
@@ -510,7 +710,11 @@ class OkonomiApp(App):
             # Event was mutated (streaming append, tool finished). Re-sync.
             if hasattr(existing, "sync_from_event"):
                 existing.sync_from_event()
-            history.scroll_end(animate=False)
+            # Defer scroll_end so the widget's new height is reflected
+            # in max_scroll_y before we jump — otherwise we land at the
+            # *stale* bottom and the freshly-revealed text below the
+            # input box is clipped from view.
+            self.call_after_refresh(history.scroll_end, animate=False)
             return
 
         widget = self._build_widget(event)
@@ -518,7 +722,7 @@ class OkonomiApp(App):
             return
         self._widgets_by_id[event.id] = widget
         history.mount(widget)
-        history.scroll_end(animate=False)
+        self.call_after_refresh(history.scroll_end, animate=False)
 
     def _build_widget(self, event: Event):
         if isinstance(event, Banner):
@@ -541,13 +745,12 @@ class OkonomiApp(App):
         self._refresh_slash_dropdown(event.text_area.text)
 
     def _refresh_slash_dropdown(self, value: str) -> None:
-        from . import commands
-
         dropdown = self.query_one("#slash-dropdown", OptionList)
         # Don't pop the dropdown while user is responding to an approval.
         if self._approval_resolve is not None or not value.startswith("/"):
-            dropdown.clear_options()
-            dropdown.remove_class("-visible")
+            if dropdown.has_class("-visible"):
+                dropdown.clear_options()
+                dropdown.remove_class("-visible")
             return
 
         low = value.lower()
@@ -556,8 +759,6 @@ class OkonomiApp(App):
         if not matches:
             dropdown.remove_class("-visible")
             return
-        from rich.text import Text
-
         for cmd, desc in matches:
             line = Text()
             line.append(cmd, style="bold")
@@ -614,7 +815,6 @@ class OkonomiApp(App):
         self._history_cursor = None
         self._pending_input = ""
 
-        # First submit drops the welcome placeholder permanently.
         if not self._has_submitted:
             self._has_submitted = True
             inp.placeholder = ""
@@ -634,15 +834,10 @@ class OkonomiApp(App):
     # --- Focus / navigation actions ---
 
     def action_focus_history(self) -> None:
-        """Tab: complete dropdown option if visible, otherwise focus last tool call."""
+        """Tab: complete slash-dropdown option if visible; otherwise no-op."""
         dropdown = self.query_one("#slash-dropdown", OptionList)
         if dropdown.has_class("-visible") and dropdown.option_count > 0:
             self._accept_dropdown()
-            return
-        tool_calls = list(self.query(ToolCallWidget))
-        if not tool_calls:
-            return
-        tool_calls[-1].focus()
 
     def _accept_dropdown(self) -> None:
         dropdown = self.query_one("#slash-dropdown", OptionList)
@@ -672,6 +867,20 @@ class OkonomiApp(App):
             return
         tool_calls[-1].action_toggle()
 
+    # --- Chat-transcript scroll ---
+
+    def action_scroll_history_up(self) -> None:
+        self.query_one("#history", _HistoryScroll).scroll_page_up(animate=False)
+
+    def action_scroll_history_down(self) -> None:
+        self.query_one("#history", _HistoryScroll).scroll_page_down(animate=False)
+
+    def action_scroll_history_top(self) -> None:
+        self.query_one("#history", _HistoryScroll).scroll_home(animate=False)
+
+    def action_scroll_history_bottom(self) -> None:
+        self.query_one("#history", _HistoryScroll).scroll_end(animate=False)
+
     def action_interrupt(self) -> None:
         """Ctrl+C — three-stage fallback, shell-style:
 
@@ -680,20 +889,26 @@ class OkonomiApp(App):
         3. Else no-op (Ctrl+D quits, Ctrl+C doesn't).
         """
         session = getattr(self, "session", None)
-        turn_running = False
-        if session is not None:
-            task = getattr(session, "_agent_task", None)
-            if task is not None and not task.done():
-                turn_running = True
+        turn_running = bool(session and getattr(session, "_agent_running", False))
 
-        if turn_running and session is not None and hasattr(session, "cancel_current_turn"):
+        if turn_running and hasattr(session, "cancel_current_turn"):
+            # If an approval prompt is open, resolve it (as a "skip") so
+            # the worker thread blocked on the approval queue unblocks
+            # and the UI exits approval mode cleanly. Otherwise the input
+            # box stays in "approve>" mode and the worker leaks.
+            if self._approval_resolve is not None:
+                resolver = self._approval_resolve
+                self._approval_resolve = None
+                self._exit_approval_mode()
+                # User-supplied callback; treat any exception as best-effort.
+                try:
+                    resolver(False)
+                except Exception:
+                    pass
             session.cancel_current_turn()
             return
 
-        try:
-            inp = self.query_one("#input", _ChatInput)
-        except Exception:
-            return
+        inp = self.query_one("#input", _ChatInput)
         if inp.value:
             inp.value = ""
             self._history_cursor = None
@@ -703,29 +918,35 @@ class OkonomiApp(App):
         """Ctrl+L — clear visible chat scrollback (keeps message history
         and input history intact, so the model still has context and
         Up-arrow still works)."""
-        try:
-            history = self.query_one("#history", _HistoryScroll)
-        except Exception:
-            return
+        history = self.query_one("#history", _HistoryScroll)
         for child in list(history.children):
+            # remove() can race with widget unmount during streaming.
             try:
                 child.remove()
             except Exception:
                 pass
-        # Also clear any leftover slash dropdown / approval prompt state
-        # so the cleared screen isn't immediately repopulated by stale UI.
-        try:
-            dropdown = self.query_one("#slash-dropdown", OptionList)
-            dropdown.clear_options()
-            dropdown.remove_class("-visible")
-        except Exception:
-            pass
+        # Without this, _widgets_by_id retains references to the removed
+        # widgets and prevents GC for the lifetime of the session.
+        self._widgets_by_id.clear()
+        dropdown = self.query_one("#slash-dropdown", OptionList)
+        dropdown.clear_options()
+        dropdown.remove_class("-visible")
 
     # --- Session picker ---
 
     def show_session_picker(self, on_select: Callable[[str], None]) -> None:
         """Open a modal listing past sessions to resume."""
         self.push_screen(SessionPicker(on_select))
+
+    # --- Asset picker ---
+
+    def show_asset_picker(self, artifacts: list, on_action) -> None:
+        """Open a searchable, multi-select modal over the session's assets.
+
+        ``on_action(action: str, paths: list[str])`` is called when the
+        user confirms with one of: ``"open"``, ``"copy"``, ``"heart"``.
+        """
+        self.push_screen(AssetPicker(artifacts, on_action))
 
     # --- Inline approval ---
 
@@ -777,12 +998,10 @@ class OkonomiApp(App):
 
     def _load_history(self) -> list[str]:
         try:
-            if self.HISTORY_FILE.exists():
-                lines = self.HISTORY_FILE.read_text().splitlines()
-                return [ln for ln in lines if ln.strip()][-self.HISTORY_LIMIT :]
-        except Exception:
-            pass
-        return []
+            lines = self.HISTORY_FILE.read_text().splitlines()
+        except (FileNotFoundError, OSError, UnicodeDecodeError):
+            return []
+        return [ln for ln in lines if ln.strip()][-self.HISTORY_LIMIT :]
 
     def _append_history(self, text: str) -> None:
         if not text.strip():
@@ -794,13 +1013,13 @@ class OkonomiApp(App):
         try:
             self.HISTORY_FILE.parent.mkdir(parents=True, exist_ok=True)
             self.HISTORY_FILE.write_text("\n".join(self._history) + "\n")
-        except Exception:
+        except OSError:
             pass
 
     def action_history_prev(self) -> None:
         """↑ — navigate dropdown if visible, else step back through history."""
         inp = self.query_one("#input", _ChatInput)
-        if not isinstance(self.focused, Input):
+        if not isinstance(self.focused, _ChatInput):
             return
         dropdown = self.query_one("#slash-dropdown", OptionList)
         if dropdown.has_class("-visible") and dropdown.option_count > 0:
@@ -820,7 +1039,7 @@ class OkonomiApp(App):
     def action_history_next(self) -> None:
         """↓ — navigate dropdown if visible, else forward through history."""
         inp = self.query_one("#input", _ChatInput)
-        if not isinstance(self.focused, Input):
+        if not isinstance(self.focused, _ChatInput):
             return
         dropdown = self.query_one("#slash-dropdown", OptionList)
         if dropdown.has_class("-visible") and dropdown.option_count > 0:

@@ -25,7 +25,58 @@ from typing import Any, Literal, Optional
 SessionStatus = Literal["in_progress", "completed", "interrupted", "error", "abandoned"]
 
 from . import db as _db
-from .config import config
+
+
+_DEFAULT_STORAGE_DIR = Path.home() / ".okonomi" / "sessions"
+
+
+@dataclass
+class TokenTracker:
+    """Per-session token + cost accumulator.
+
+    Field semantics mirror pydantic-ai's ``RunUsage``: ``input_tokens``
+    is the *non-cached* prompt count; cache hits/writes count separately.
+    ``input + cache_read + cache_write`` ≈ the full prompt size sent to
+    the provider — the columns are non-overlapping and safe to sum.
+    """
+
+    input_tokens: int = 0
+    output_tokens: int = 0
+    total_tokens: int = 0
+    cache_read_tokens: int = 0
+    cache_write_tokens: int = 0
+    reasoning_tokens: int = 0
+    requests: int = 0
+    cost_usd: float = 0.0  # cumulative actual USD from OpenRouter
+    # Estimated size of the prompt the model will see on the NEXT turn:
+    # working-set messages + system prompt + tool/skill index. This is
+    # "what's in the context window," not cumulative usage.
+    context_tokens: int = 0
+
+    def add(
+        self,
+        input_tokens: int,
+        output_tokens: int,
+        requests: int = 1,
+        cache_read_tokens: int = 0,
+        cache_write_tokens: int = 0,
+        reasoning_tokens: int = 0,
+        cost_usd: float = 0.0,
+    ) -> None:
+        self.input_tokens += input_tokens
+        self.output_tokens += output_tokens
+        self.total_tokens += input_tokens + output_tokens
+        self.cache_read_tokens += cache_read_tokens
+        self.cache_write_tokens += cache_write_tokens
+        self.reasoning_tokens += reasoning_tokens
+        self.requests += requests
+        self.cost_usd += cost_usd
+
+    def __str__(self) -> str:
+        line = f"total: {self.total_tokens:,} (in: {self.input_tokens:,}, out: {self.output_tokens:,})"
+        if self.context_tokens:
+            line += f" | context: ~{self.context_tokens:,}"
+        return line
 
 
 _ASSET_EXTENSIONS = {
@@ -137,6 +188,36 @@ class Session:
         """Row-shaped dict — drops the body payloads (artifacts, message_history)."""
         return {f.name: getattr(self, f.name) for f in fields(self) if f.name not in ("artifacts", "message_history")}
 
+
+@dataclass
+class OkonomiState:
+    """Per-session runtime state the agent mutates during a run.
+
+    Distinct from :class:`Session` (the persisted snapshot owned by
+    SessionManager). ``OkonomiState`` is the live mutable bag — message
+    history, working context, artifacts, tokens, REPL globals — that
+    the agent reads/writes on every turn. ``save_session`` projects
+    OkonomiState into a Session for SQLite + jsonl persistence;
+    ``load_session`` materializes a fresh OkonomiState from a Session
+    on resume.
+    """
+
+    session_id: str
+    task: str = ""
+    # Append-only audit log: every message ever produced this session.
+    # Persisted to messages.jsonl. Compression never touches it.
+    message_history: list[Any] = field(default_factory=list)
+    # Working set sent to the LLM each turn. Sanitized and compressed
+    # as needed. Not persisted separately — recomputed from
+    # message_history on resume.
+    context: list[Any] = field(default_factory=list)
+    artifacts: list[Artifact] = field(default_factory=list)
+    tools_used: set[str] = field(default_factory=set)
+    tokens: TokenTracker = field(default_factory=TokenTracker)
+    # REPL state across execute_code turns (model-bound locals).
+    execution_globals: dict[str, Any] = field(default_factory=dict)
+
+
 class SessionManager:
     """Thin façade over the SQLite store + ``messages.jsonl`` sidecar.
 
@@ -146,11 +227,7 @@ class SessionManager:
     """
 
     def __init__(self, storage_dir: Optional[Path] = None):
-        if storage_dir is None:
-            cfg_dir = config.sessions.storage_dir
-            storage_dir = Path(cfg_dir) if cfg_dir else Path.home() / ".okonomi" / "sessions"
-
-        self.storage_dir = Path(storage_dir)
+        self.storage_dir = Path(storage_dir) if storage_dir else _DEFAULT_STORAGE_DIR
         self.storage_dir.mkdir(parents=True, exist_ok=True)
         self._db = _db.open_db(self.storage_dir / _db.DB_FILENAME)
 
@@ -251,6 +328,24 @@ class SessionManager:
         with _db.transaction(self._db):
             _db.upsert_session(self._db, session.metadata_dict())
             _db.replace_artifacts(self._db, session.session_id, [a.to_dict() for a in session.artifacts])
+
+        # Titles are generated out-of-band by a small model, fire-and-forget,
+        # so the agent never blocks on (or owns) titling. Refresh on every
+        # completed turn so the title tracks the whole conversation.
+        if session.status == "completed" and session.message_history:
+            from .utils import title_session_async
+
+            title_session_async(self, session.session_id, session.message_history)
+
+    def update_title(self, session_id: str, title: str) -> bool:
+        """Update only the stored title, preserving the existing dir_name (no
+        directory rename). Used by the out-of-band titler."""
+        row = _db.fetch_session(self._db, session_id)
+        if row is None:
+            return False
+        with _db.transaction(self._db):
+            _db.update_session_title(self._db, session_id, title, row.get("dir_name") or session_id)
+        return True
 
     def set_title(self, session_id: str, title: str) -> bool:
         """Set a title and rename the session directory accordingly."""

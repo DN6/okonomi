@@ -138,8 +138,7 @@ class BrowserRendererTools(ToolMetadataMixin):
     __namespace__ = "browser"
     __description__ = "Render HTML/JS in a headless browser and capture screenshots or video"
 
-    def __init__(self, config):
-        self.config = config
+    def __init__(self):
         # Set by ToolWrapper at the start of each execute_code call. Used
         # to auto-register the rendered file as a session artifact, so the
         # output shows up in /assets without the model having to do
@@ -149,7 +148,9 @@ class BrowserRendererTools(ToolMetadataMixin):
     def _set_deps(self, deps) -> None:
         self._deps = deps
 
-    def _track_local_file(self, path: str, artifact_type: str, prompt: str = "") -> None:
+    def _track_local_file(
+        self, path: str, artifact_type: str, tool_name: str, prompt: str = ""
+    ) -> None:
         """Register a rendered local file with the session, if deps are set."""
         if not path or self._deps is None:
             return
@@ -163,7 +164,7 @@ class BrowserRendererTools(ToolMetadataMixin):
                 artifact_type=artifact_type,
                 path=path,
                 prompt=prompt or "",
-                tool_name=f"browser.{artifact_type == 'image' and 'render_screenshot' or 'render_video'}",
+                tool_name=tool_name,
                 timestamp=_dt.now().isoformat(),
             )
         )
@@ -217,7 +218,16 @@ class BrowserRendererTools(ToolMetadataMixin):
                 device_scale_factor,
             )
             future.result(timeout=60)
-            self._track_local_file(output_path, "image")
+            self._track_local_file(output_path, "image", "browser.render_screenshot")
+            # Track the source HTML when the caller supplied a real file
+            # (the p5js workflow saves a sketch.html in the session dir).
+            # Inline html= strings land in a temp file we delete below.
+            if file_path:
+                self._track_local_file(
+                    str(Path(file_path).expanduser().resolve()),
+                    "html",
+                    "browser.render_screenshot",
+                )
             return {"screenshot": output_path, "output_path": output_path}
         except Exception as e:
             return {"error": str(e)}
@@ -282,7 +292,13 @@ class BrowserRendererTools(ToolMetadataMixin):
                 wait_before_record_ms,
             )
             future.result(timeout=int(duration_s + 120))
-            self._track_local_file(output_path, "video")
+            self._track_local_file(output_path, "video", "browser.render_video")
+            if file_path:
+                self._track_local_file(
+                    str(Path(file_path).expanduser().resolve()),
+                    "html",
+                    "browser.render_video",
+                )
             return {
                 "video": output_path,
                 "output_path": output_path,

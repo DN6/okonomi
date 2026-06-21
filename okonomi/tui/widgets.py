@@ -10,7 +10,7 @@ from textual.reactive import reactive
 from textual.widget import Widget
 from textual.widgets import Static
 
-from .events import AssistantStream, Divider, SystemNote, ToolCall, UserMessage
+from ..events import AssistantStream, Divider, SystemNote, ToolCall, UserMessage
 
 
 class WelcomeBannerWidget(Static):
@@ -101,6 +101,7 @@ class AssistantStreamWidget(Static):
         self.event = event
         self._displayed_chars: int = 0
         self._refresh_timer = None
+        self._history_scroll = None
 
     def on_mount(self) -> None:
         self._tick()
@@ -138,9 +139,29 @@ class AssistantStreamWidget(Static):
         if new_pos > pos:
             self._displayed_chars = new_pos
             self.update(Text(text[:new_pos]))
+            # Reveal continues past the last stream event (catch-up
+            # drain), and the app's _render_event only scrolls on event
+            # arrival — so follow growth here when pinned, deferring
+            # scroll_end until layout reflects the new height.
+            self._follow_scroll_if_pinned()
 
         if self.event.done and self._displayed_chars >= total:
             self._stop_timer()
+
+    def _follow_scroll_if_pinned(self) -> None:
+        scroll = self._history_scroll
+        if scroll is None:
+            try:
+                scroll = self.app.query_one("#history")
+            except Exception:
+                return
+            self._history_scroll = scroll
+        try:
+            was_pinned = scroll.max_scroll_y - scroll.scroll_y <= 2
+        except Exception:
+            return
+        if was_pinned:
+            self.call_after_refresh(scroll.scroll_end, animate=False)
 
     def _snap_to_word_boundary(self, text: str, pos: int, target: int, total: int) -> int:
         """Pick a reveal endpoint that lands on a word boundary.

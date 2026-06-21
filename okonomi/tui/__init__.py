@@ -1,29 +1,6 @@
 """Textual-based TUI for okonomi.
 
-Replaces the prompt_toolkit-based InteractiveSession in cli.py. Built around
-an event-driven output model so tool calls can be rendered as collapsible
-sections instead of raw streamed text.
+The chat app + event subscribers that render :mod:`okonomi.events` into
+Textual widgets. Headless callers (CLI one-shot, Discord) don't need
+to import anything from this package.
 """
-
-from .events import (
-    AssistantStream,
-    Banner,
-    Divider,
-    Event,
-    EventEmitter,
-    SystemNote,
-    ToolCall,
-    UserMessage,
-)
-
-
-__all__ = [
-    "AssistantStream",
-    "Banner",
-    "Divider",
-    "Event",
-    "EventEmitter",
-    "SystemNote",
-    "ToolCall",
-    "UserMessage",
-]

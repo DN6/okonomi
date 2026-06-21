@@ -1,6 +1,6 @@
 ---
 name: genmedia
-description: "Run any fal.ai endpoint via the `genmedia` programmatic tool. Single namespace covers 1000+ models for image, video, audio, and 3D generation. Auto-tracks every produced asset — no manual session bookkeeping required. Trigger when users request: text-to-image, image edits, image upscale, image-to-video, frame-to-frame video, music, sound effects, speech, image-to-3d, lip sync, or any other fal endpoint."
+description: "REQUIRED before any image / video / audio / 3D generation. Single namespace (`genmedia.run`, `genmedia.search`, `genmedia.schema`) covers 1000+ fal.ai endpoints; auto-tracks every produced asset into the session. Load FIRST when users request: text-to-image, image edits, image-to-video, frame-to-frame video, music, sound effects, speech, image-to-3d, lip sync, or any other fal endpoint."
 metadata:
   tags: [fal, genmedia, image, video, audio, 3d, generation]
   related_skills: [p5js, ffmpeg]
@@ -23,9 +23,11 @@ already registered with the session — downloaded in the background,
 visible in `/assets`, surfaced in bg-exec completion notifications.
 No manual tracking needed.
 
+Pull just the section you need with `load_skill_section("genmedia", "<slug>")` rather than the whole file. Deep creative guidance (image generation, image editing, video, camera, style, post-production) lives in `references/` — load on demand via `load_skill_reference("genmedia", "<name>")`.
+
 ## When to use
 
-- Any AI image generation request (text-to-image, edit, upscale, segmentation).
+- Any AI image generation request (text-to-image, edit).
 - Image-to-video, frame-to-frame video, video-to-video.
 - Music, sound effects, TTS, lip-sync.
 - Image-to-3D / mesh generation.
@@ -105,7 +107,7 @@ The keys depend on the endpoint. fal's universal asset envelope is `{"url": "...
 | Endpoint family | Top-level key | Asset shape |
 |---|---|---|
 | Most text-to-image, multi-result | `r["images"]` | `list[{"url", "width", "height", ...}]` |
-| Single-image (upscale, segmentation, edit) | `r["image"]` | `{"url", ...}` |
+| Single-image result endpoints | `r["image"]` | `{"url", ...}` |
 | Image-to-video, frame-to-frame | `r["video"]` | `{"url", "duration", ...}` |
 | Music / SFX / TTS (varies by model) | `r["audio_file"]` or `r["audio_url"]` or `r["audio"]` | `{"url", ...}` or a bare URL string |
 | Image-to-3D | `r["model_mesh"]` | `{"url", ...}` (glb/gltf) |
@@ -163,8 +165,8 @@ print(genmedia.schema("fal-ai/some-new-endpoint"))
 
 For deeper creative direction, consult these reference files in `references/` (read with `bash(command="cat <path>")` when you need them):
 
-- **`image-generation.md`** — two-tier doctrine (z-image / flux-lora ideation, gpt-image-2 refinement), prompt craft layers, LoRA conventions, parameter cheat sheet, common workflows.
-- **`image-editing.md`** — when to use `redux` vs `kontext` vs `seedvr/upscale/image` vs `sam-3-1`, structured edit prompts.
+- **`image-generation.md`** — two-tier doctrine (Krea turbo for exploration → Krea large for the hero render → gpt-image-2 refinement), prompt craft layers, LoRA conventions, parameter cheat sheet, common workflows.
+- **`image-editing.md`** — instruction-following edits with `gpt-image-2/edit`, structured edit prompts.
 - **`video-generation.md`** — two-tier doctrine (ltx-2.3 ideation, seedance-2.0 refinement), production workflow, prompt anatomy, common mistakes.
 - **`camera-and-framing.md`** — shot types, camera moves, lens vocabulary.
 - **`visual-style.md`** — film stocks, lighting, color grading lookups.
