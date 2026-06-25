@@ -189,7 +189,7 @@ def handle(
     if low.startswith("/title"):
         title_text = cmd[len("/title") :].strip()
         if title_text:
-            if agent.session_manager.set_title(agent.state.session_id, title_text):
+            if agent.session_manager.set_title(agent.state.info.session_id, title_text):
                 emitter.note(f"Title set: {title_text}")
             else:
                 emitter.note(
@@ -197,7 +197,7 @@ def handle(
                     level="error",
                 )
         else:
-            meta = agent.session_manager.load_session(agent.state.session_id, with_history=False)
+            meta = agent.session_manager.get_info(agent.state.info.session_id)
             emitter.note(f"Title: {(meta.title if meta else '') or '(none)'}")
         return None
 
@@ -354,7 +354,7 @@ def _heart_last_artifact(agent: "OkonomiAgent", emitter: EventEmitter) -> None:
     sm = agent.session_manager
     row = sm._db.execute(
         "SELECT id FROM artifacts WHERE session_id = ? AND (url = ? OR path = ?) ORDER BY id DESC LIMIT 1",
-        (agent.state.session_id, last.url or "", last.path or ""),
+        (agent.state.info.session_id, last.url or "", last.path or ""),
     ).fetchone()
     if row is None:
         emitter.note("Asset not yet indexed — try again in a moment.", level="warn")
@@ -362,7 +362,7 @@ def _heart_last_artifact(agent: "OkonomiAgent", emitter: EventEmitter) -> None:
 
     sm.favorite(artifact_id=row["id"])
     src = Path(last.path).resolve()
-    _symlink_into_loved(src, agent.state.session_id)
+    _symlink_into_loved(src, agent.state.info.session_id)
     emitter.note(f"♥ {src.name}")
 
 

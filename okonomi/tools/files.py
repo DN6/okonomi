@@ -9,7 +9,7 @@ surface.
 """
 
 from pathlib import Path
-from typing import Optional, TypedDict
+from typing import TypedDict
 
 from okonomi.tools._metadata import ToolMetadataMixin
 
@@ -251,7 +251,7 @@ class FileTools(ToolMetadataMixin):
 
         return {"path": str(p), "bytes_written": len(data), "created": False}
 
-    def _check_fresh(self, p: Path) -> Optional[str]:
+    def _check_fresh(self, p: Path) -> str | None:
         """Return an error string if ``p`` wasn't read at its current mtime."""
         key = str(p)
         seen = self._read_mtimes.get(key)

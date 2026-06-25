@@ -2,6 +2,10 @@
 
 from __future__ import annotations
 
+import os
+import re
+from functools import lru_cache
+
 from rich.syntax import Syntax
 from rich.text import Text
 from textual.app import ComposeResult
@@ -11,6 +15,70 @@ from textual.widget import Widget
 from textual.widgets import Static
 
 from ..events import AssistantStream, Divider, SystemNote, ToolCall, UserMessage
+
+
+# Matches absolute paths (/...) and home-relative paths (~/...). Bounded
+# by whitespace and common surrounding punctuation. The negative
+# lookbehind avoids matching the `/` inside URLs like https://... or
+# bare strings like TCP/IP.
+# One pass matches either an http(s) URL or an on-disk path. URL first so
+# the `://` is consumed there; the path branch's negative lookbehind then
+# can't re-match the slashes inside a URL.
+_LINK_RE = re.compile(
+    r"(?P<url>https?://[^\s`\"'<>(){}\[\]]+)"
+    r"|(?P<path>(?<![\w:/])(?:~/|/)[^\s`\"'<>(){}\[\]]+)"
+)
+# Trailing punctuation that's almost never part of a real path/URL — strip
+# before resolving so "see /foo/bar.png." or "...png)." resolves.
+_PATH_TRAILING_PUNCT = ".,;:!?)"
+_IMAGE_EXTS = (".png", ".jpg", ".jpeg", ".webp", ".gif", ".bmp", ".tiff")
+
+
+@lru_cache(maxsize=512)
+def _path_exists(expanded: str) -> bool:
+    return os.path.exists(expanded)
+
+
+def _is_image_url(url: str) -> bool:
+    path = url.split("?", 1)[0].split("#", 1)[0]
+    return path.lower().endswith(_IMAGE_EXTS)
+
+
+def text_with_path_links(s: str) -> Text:
+    """Return a Rich ``Text`` with on-disk paths and http(s) image URLs
+    wrapped as ``link`` styles. The link *target* rides along in the Rich
+    style; the app's ``on_click`` reads it back and opens it (Textual holds
+    the mouse, so the terminal can't open OSC 8 links itself).
+
+    Only paths that exist on disk, and URLs that look like images, are
+    linked — to avoid false positives.
+    """
+    out = Text()
+    last = 0
+    for m in _LINK_RE.finditer(s):
+        raw = m.group(0)
+        trim = 0
+        while trim < len(raw) and raw[-1 - trim] in _PATH_TRAILING_PUNCT:
+            trim += 1
+        candidate = raw[: len(raw) - trim] if trim else raw
+
+        if m.lastgroup == "url":
+            if not _is_image_url(candidate):
+                continue
+            target = candidate
+        else:
+            expanded = os.path.expanduser(candidate)
+            if not _path_exists(expanded):
+                continue
+            target = f"file://{expanded}"
+
+        out.append(s[last : m.start()])
+        out.append(candidate, style=f"link {target}")
+        if trim:
+            out.append(raw[len(raw) - trim :])
+        last = m.end()
+    out.append(s[last:])
+    return out
 
 
 class WelcomeBannerWidget(Static):
@@ -97,7 +165,7 @@ class AssistantStreamWidget(Static):
     """
 
     def __init__(self, event: AssistantStream) -> None:
-        super().__init__(Text(event.text))
+        super().__init__(text_with_path_links(event.text))
         self.event = event
         self._displayed_chars: int = 0
         self._refresh_timer = None
@@ -138,7 +206,7 @@ class AssistantStreamWidget(Static):
 
         if new_pos > pos:
             self._displayed_chars = new_pos
-            self.update(Text(text[:new_pos]))
+            self.update(text_with_path_links(text[:new_pos]))
             # Reveal continues past the last stream event (catch-up
             # drain), and the app's _render_event only scrolls on event
             # arrival — so follow growth here when pinned, deferring

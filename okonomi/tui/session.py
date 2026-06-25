@@ -242,7 +242,7 @@ class TuiSession:
                 model_id=parent.model_id,
                 timeout=parent.timeout,
                 compress_at_tokens=parent.compress_at_tokens,
-                session_id=parent.state.session_id,
+                session_id=parent.state.info.session_id,
             )
             bg_agent.approval_callback = approval_cb
             bg_agent.on_bg_complete = on_bg_complete_cb
@@ -280,7 +280,7 @@ class TuiSession:
         self._next_reset = False
 
         replay_history(self.agent.state.message_history, self.emitter)
-        meta = self.agent.session_manager.load_session(session_id, with_history=False)
+        meta = self.agent.session_manager.get_info(session_id)
         title = (meta.title if meta else "") or ""
         label = f"{session_id[:10]} · {title}" if title else session_id
         self.emitter.note(f"↑ Resumed: {label}")
@@ -378,7 +378,7 @@ class TuiSession:
         return f"{txt}  ({stamp})"
 
     def _usage_label(self) -> str:
-        usage = self.agent.state.tokens
+        usage = self.agent.state.info.tokens
         if not usage.total_tokens:
             return ""
         return str(usage)

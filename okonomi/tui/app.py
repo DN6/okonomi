@@ -34,6 +34,7 @@ from ..events import (
 )
 from ..utils import fuzzy_match
 from . import commands
+from .asset_actions import _open_paths
 from .widgets import (
     AssistantStreamWidget,
     BgTasksWidget,
@@ -913,6 +914,19 @@ class OkonomiApp(App):
             inp.value = ""
             self._history_cursor = None
             self._pending_input = ""
+
+    def on_click(self, event) -> None:
+        """Open a link clicked in a response. Textual captures the mouse, so
+        the terminal never opens OSC 8 links itself — we read the link target
+        under the cursor and open it: ``file://`` paths via the native opener
+        (Preview/xdg-open), http(s) URLs via the browser."""
+        link = getattr(event.style, "link", "") if event.style else ""
+        if not link:
+            return
+        if link.startswith("file://"):
+            _open_paths([link[len("file://") :]], self.emitter)
+        else:
+            self.open_url(link)
 
     def action_clear_screen(self) -> None:
         """Ctrl+L — clear visible chat scrollback (keeps message history

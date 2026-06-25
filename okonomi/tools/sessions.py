@@ -9,7 +9,7 @@ shape coercion) every call — which adds up.
 from __future__ import annotations
 
 from datetime import datetime, timedelta
-from typing import Any, Optional, TypedDict
+from typing import Any, TypedDict
 
 from okonomi.session import SessionManager
 from okonomi.tools._metadata import ToolMetadataMixin
@@ -61,7 +61,7 @@ class SessionsTools(ToolMetadataMixin):
     __description__ = "Search across past sessions and their generated artifacts."
 
     def __init__(self):
-        self._sm: Optional[SessionManager] = None
+        self._sm: SessionManager | None = None
 
     def _mgr(self) -> SessionManager:
         if self._sm is None:
@@ -96,8 +96,8 @@ class SessionsTools(ToolMetadataMixin):
     def search_artifacts(
         self,
         query: str,
-        artifact_type: Optional[str] = None,
-        since_days: Optional[int] = None,
+        artifact_type: str | None = None,
+        since_days: int | None = None,
         limit: int = 12,
     ) -> dict:
         """Find past artifacts by prompt / description / tool_name OR
@@ -164,12 +164,12 @@ class SessionsTools(ToolMetadataMixin):
             ``{"session_id", "metadata": {...}, "artifacts": [...]}`` or
             ``{"error": ..., "session_id": ...}`` on miss.
         """
-        sess = self._mgr().load_session(session_id, with_history=False)
-        if sess is None:
+        info = self._mgr().get_info(session_id)
+        if info is None:
             return {"error": f"Unknown session_id '{session_id}'", "session_id": session_id}
 
         return {
             "session_id": session_id,
-            "metadata": sess.metadata_dict(),
-            "artifacts": [a.to_dict() for a in sess.artifacts],
+            "metadata": info.metadata_dict(),
+            "artifacts": [a.to_dict() for a in self._mgr().get_artifacts(session_id)],
         }

@@ -1,7 +1,7 @@
 """Web tools — search and page fetching backed by Tavily."""
 
 import os
-from typing import Optional, TypedDict
+from typing import TypedDict
 
 from tavily import TavilyClient
 
@@ -49,8 +49,8 @@ class WebTools(ToolMetadataMixin):
         max_results: int = 5,
         search_depth: str = "ultra-fast",
         include_images: bool = True,
-        include_domains: Optional[list[str]] = None,
-        exclude_domains: Optional[list[str]] = None,
+        include_domains: list[str] | None = None,
+        exclude_domains: list[str] | None = None,
     ) -> WebSearchResult:
         """Search the web for a query.
 

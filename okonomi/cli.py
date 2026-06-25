@@ -33,9 +33,9 @@ def resolve_session(args: argparse.Namespace) -> str | None:
         print(f"{YELLOW}No previous sessions found. Starting new session.{RST}\n")
         return None
 
-    session = manager.load_session(args.session)
-    if session:
-        print(f"{BOLD}{GREEN}Loaded: {session.display_name}{RST}\n")
+    info = manager.get_info(args.session)
+    if info:
+        print(f"{BOLD}{GREEN}Loaded: {info.display_name}{RST}\n")
         return args.session
 
     print(f"{RED}Session {args.session} not found. Starting new session.{RST}\n")

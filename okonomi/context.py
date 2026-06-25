@@ -7,7 +7,6 @@ intact.
 
 import logging
 import re
-from typing import Optional
 
 from pydantic_ai.messages import (
     ModelMessage,
@@ -150,7 +149,7 @@ class ContextManager:
         self._client = create_chat_client()
         logger.info("Context manager: compress_at=%d", compress_at_tokens)
 
-    def compress(self, messages: list[ModelMessage]) -> Optional[list[ModelMessage]]:
+    def compress(self, messages: list[ModelMessage]) -> list[ModelMessage] | None:
         """Compress middle turns into a summary if over the threshold.
 
         Returns the compressed message list on success, or ``None`` if
@@ -217,7 +216,7 @@ class ContextManager:
         session_id: str,
         task: str,
         steps_summary: str,
-        artifacts: Optional[list] = None,
+        artifacts: list | None = None,
     ) -> list[ModelMessage]:
         """Synthesize a single resume message for sessions without messages.jsonl."""
         parts = [f"[Resumed session {session_id[:8]}]", f"\nPrevious task: {task}"]
@@ -262,7 +261,7 @@ class ContextManager:
             logger.warning("LLM call failed: %s", e)
             return ""
 
-    def _summarize(self, messages: list[ModelMessage]) -> Optional[str]:
+    def _summarize(self, messages: list[ModelMessage]) -> str | None:
         prompt = (
             "Summarize this conversation segment as a handoff note for a later "
             "assistant. Preserve concrete details: file paths, tool calls and "

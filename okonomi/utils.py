@@ -32,7 +32,7 @@ _TITLE_PROMPT = (
 )
 
 
-def _conversation_digest(messages: list, max_chars: int = 4000) -> str:
+def _compact_messages(messages: list, max_chars: int = 4000) -> str:
     """Compact transcript for titling: user prompts + assistant text + tool-call
     args (where genmedia/image prompts — i.e. the actual subject — live)."""
     try:
@@ -65,13 +65,13 @@ def _conversation_digest(messages: list, max_chars: int = 4000) -> str:
     return "\n".join(lines)[:max_chars]
 
 
-def generate_title(messages: list, model: str = TITLE_MODEL) -> str:
+def generate_session_title(messages: list, model: str = TITLE_MODEL) -> str:
     """One-sentence title summarizing the conversation so far. ``""`` on failure.
 
     The transcript is passed as delimited material to summarize, NOT as a live
     turn — otherwise the model continues the task instead of labelling it.
     """
-    body = _conversation_digest(messages)
+    body = _compact_messages(messages)
     if not body:
         return ""
     try:
@@ -93,7 +93,7 @@ def generate_title(messages: list, model: str = TITLE_MODEL) -> str:
     return title
 
 
-def title_session_async(session_manager, session_id: str, messages: list) -> None:
+def _maybe_update_session_title_async(session_manager, session_id: str, messages: list) -> None:
     """Fire-and-forget: regenerate the title and persist it (without renaming
     the session directory) in a daemon thread, so a turn never blocks on the
     LLM call. Silently no-ops on any failure."""
@@ -101,7 +101,7 @@ def title_session_async(session_manager, session_id: str, messages: list) -> Non
         return
 
     def _worker() -> None:
-        title = generate_title(messages)
+        title = generate_session_title(messages)
         if not title:
             return
         try:
@@ -109,7 +109,7 @@ def title_session_async(session_manager, session_id: str, messages: list) -> Non
         except Exception:
             logger.debug("Failed to persist auto-title", exc_info=True)
 
-    threading.Thread(target=_worker, name="okonomi-titler", daemon=True).start()
+    threading.Thread(target=_worker, name="okonomi-generate-title", daemon=True).start()
 
 
 def copy_to_clipboard(text: str) -> bool:

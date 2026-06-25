@@ -14,8 +14,9 @@ import subprocess
 import threading
 import time
 from pathlib import Path
-from typing import Any, Optional
+from typing import Any
 
+from okonomi.tools._command_guard import check_command
 from okonomi.tools._metadata import ToolMetadataMixin
 
 
@@ -66,20 +67,20 @@ class TerminalTools(ToolMetadataMixin):
     __namespace__ = "terminal"
     __description__ = "Execute shell commands locally with timeout and output capture"
 
-    def __init__(self, interrupt_event: Optional[threading.Event] = None):
+    def __init__(self, interrupt_event: threading.Event | None = None):
         self._cwd = os.getcwd()
         self._bash = _find_bash()
         self._interrupt = interrupt_event or threading.Event()
         self._has_rg = shutil.which("rg") is not None
-        self._on_bg_complete: Optional[Any] = None
+        self._on_bg_complete: Any | None = None
         # Hook called when a background job (term-N) starts. Receives
         # (task_id, label, reader) where reader is a zero-arg callable
         # returning the current stdout snapshot. Set by the agent so its
         # /logs slash command can find term-N output.
-        self._on_bg_register: Optional[Any] = None
+        self._on_bg_register: Any | None = None
         # Hook called when a background job finishes. Receives
         # (task_id, status) where status is "ok" or "error".
-        self._on_bg_finish: Optional[Any] = None
+        self._on_bg_finish: Any | None = None
         self._env_blocklist = {
             "OPENROUTER_API_KEY",
             "ANTHROPIC_API_KEY",
@@ -101,9 +102,9 @@ class TerminalTools(ToolMetadataMixin):
         self,
         command: str,
         timeout: int = 120,
-        workdir: Optional[str] = None,
+        workdir: str | None = None,
         background: bool = False,
-        _chunks_sink: Optional[list] = None,
+        _chunks_sink: list | None = None,
     ) -> dict:
         """Execute a shell command and return its output.
 
@@ -127,6 +128,14 @@ class TerminalTools(ToolMetadataMixin):
             Sync mode: dict with 'output' (str), 'exit_code' (int), and 'cwd' (str).
             Background mode: dict with 'task_id' (str) and 'message' (str).
         """
+        allowed, reason = check_command(command)
+        if not allowed:
+            return {
+                "output": reason,
+                "exit_code": 126,
+                "cwd": self._cwd,
+            }
+
         if background:
             return self._bash_background(command, workdir)
 
@@ -213,7 +222,7 @@ class TerminalTools(ToolMetadataMixin):
             "cwd": self._cwd,
         }
 
-    def _bash_background(self, command: str, workdir: Optional[str]) -> dict:
+    def _bash_background(self, command: str, workdir: str | None) -> dict:
         """Spawn a command in a thread and notify on completion.
 
         Returns immediately. The thread runs the same code path as a
@@ -284,7 +293,7 @@ class TerminalTools(ToolMetadataMixin):
         self,
         pattern: str,
         path: str = ".",
-        file_glob: Optional[str] = None,
+        file_glob: str | None = None,
         limit: int = 50,
         offset: int = 0,
         output_mode: str = "content",

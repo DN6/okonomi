@@ -121,10 +121,10 @@ class OkonomiBot(discord.Client):
                 await interaction.response.send_message("No active session.", ephemeral=True)
                 return
             agent = session.agent
-            usage = agent.state.tokens
+            usage = agent.state.info.tokens
             lines = [
-                f"**Session:** `{agent.state.session_id[:8]}`",
-                f"**Task:** {agent.state.task or 'N/A'}",
+                f"**Session:** `{agent.state.info.session_id[:8]}`",
+                f"**Task:** {agent.state.info.task_input or 'N/A'}",
                 f"**Artifacts:** {len(agent.state.artifacts)}",
                 f"**Tokens:** {usage.total_tokens:,} ({usage.requests} requests)",
             ]

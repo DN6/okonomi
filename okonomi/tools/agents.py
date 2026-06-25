@@ -104,7 +104,7 @@ class AgentTools:
                     model_id=parent.model_id,
                     timeout=parent.timeout,
                     compress_at_tokens=parent.compress_at_tokens,
-                    session_id=parent.state.session_id,
+                    session_id=parent.state.info.session_id,
                 )
                 agent.approval_callback = approval_callback
 

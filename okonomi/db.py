@@ -6,7 +6,7 @@ large, append-friendly, and never queried).
 
 Tables:
 
-  sessions       — one row per session_id, mirrors Session dataclass 1:1
+  sessions       — one row per session_id, mirrors SessionInfo 1:1
   artifacts      — one row per artifact, FK to sessions
   favorites      — user-curated artifact bookmarks
   sessions_fts   — FTS5 mirror of (title, task_input)
@@ -188,7 +188,7 @@ _COERCE = {
 
 
 def _meta_to_row(meta: dict[str, Any]) -> tuple:
-    """Coerce a Session-shaped dict into the column-ordered tuple.
+    """Coerce a SessionInfo-shaped dict into the column-ordered tuple.
 
     Sparse dicts produce valid rows; unknown keys are ignored.
     """
@@ -196,7 +196,7 @@ def _meta_to_row(meta: dict[str, Any]) -> tuple:
 
 
 def upsert_session(conn: sqlite3.Connection, meta: dict[str, Any]) -> None:
-    """Insert or replace a session row. ``meta`` mirrors ``Session``."""
+    """Insert or replace a session row. ``meta`` mirrors ``SessionInfo``."""
     cols = [name for name, _kind, _decl in SESSION_COLUMNS]
     placeholders = ", ".join("?" for _ in cols)
     updates = ", ".join(f"{c} = excluded.{c}" for c in cols if c != "session_id")

@@ -54,11 +54,10 @@ from .context import _CHARS_PER_TOKEN, ContextManager, count_tokens
 from .display import GREEN, RED, RST, print_ansi_box
 from .session import (
     Artifact,
-    Session,
+    SessionInfo,
     SessionManager,
     OkonomiState,
     SessionStatus,
-    TokenTracker,
     asset_subdir_for_file,
     new_session_id,
 )
@@ -126,7 +125,7 @@ class AgentDependencies:
     # Fired from add_artifact so the agent can kick off an eager
     # background download for artifacts with a remote ``url``.
     # Signature: (artifact: Artifact) -> None, must not raise.
-    on_artifact_added: Optional[Any] = None
+    on_artifact_added: Any | None = None
 
     def add_artifact(self, artifact: Artifact) -> None:
         """Track an artifact (AI-generated media OR locally-written file).
@@ -409,7 +408,7 @@ class ToolWrapper:
     @property
     def session_dir(self) -> str:
         """Get the current session directory path, creating it if needed."""
-        session_dir = self._deps.session_manager.session_dir(self._deps.state.session_id)
+        session_dir = self._deps.session_manager.session_dir(self._deps.state.info.session_id)
         session_dir.mkdir(parents=True, exist_ok=True)
         return str(session_dir)
 
@@ -471,15 +470,15 @@ class OkonomiAgent:
         model_id: str = "anthropic/claude-sonnet-4-5",
         timeout: float = 600.0,
         compress_at_tokens: int = 170_000,
-        storage_dir: Optional[Path] = None,
-        session_id: Optional[str] = None,
+        storage_dir: Path | None = None,
+        session_id: str | None = None,
         verbose: bool = False,
     ):
         self.model_id = model_id
         self.timeout = timeout
         self.compress_at_tokens = compress_at_tokens
         self.session_manager = SessionManager(storage_dir=storage_dir)
-        self.state = OkonomiState(session_id=session_id or new_session_id())
+        self.state = OkonomiState(info=SessionInfo(session_id=session_id or new_session_id(), model=model_id))
         self.verbose = verbose
         self._setup_tools()
 
@@ -494,7 +493,7 @@ class OkonomiAgent:
         # "you were interrupted, focus on the new instruction" marker.
         self._was_interrupted: bool = False
 
-        self.compressor = ContextManager(
+        self.context_manager = ContextManager(
             model_id=model_id,
             compress_at_tokens=compress_at_tokens,
         )
@@ -941,7 +940,7 @@ Be creative and help users generate stunning images and videos."""
                     with open(html_path, "w") as f:
                         f.write(html)
                 """
-                session_dir = ctx.deps.session_manager.session_dir(ctx.deps.state.session_id)
+                session_dir = ctx.deps.session_manager.session_dir(ctx.deps.state.info.session_id)
                 session_dir.mkdir(parents=True, exist_ok=True)
                 return str(session_dir)
 
@@ -1301,7 +1300,7 @@ Be creative and help users generate stunning images and videos."""
         downloads and prior sweeps are skipped). Returns the number added.
         """
         try:
-            session_dir = deps.session_manager.session_dir(deps.state.session_id)
+            session_dir = deps.session_manager.session_dir(deps.state.info.session_id)
         except Exception:
             return 0
         if not session_dir.exists():
@@ -1357,7 +1356,7 @@ Be creative and help users generate stunning images and videos."""
 
         def _run() -> None:
             try:
-                session_dir = self.session_manager.session_dir(self.state.session_id)
+                session_dir = self.session_manager.session_dir(self.state.info.session_id)
                 session_dir.mkdir(parents=True, exist_ok=True)
                 local_path = download_asset(artifact.url, session_dir, artifact.artifact_type)
                 artifact.path = local_path
@@ -1372,7 +1371,7 @@ Be creative and help users generate stunning images and videos."""
             _run()
 
     def _accumulate_usage(self, agent_run) -> None:
-        """Fold one ``agent_run`` worth of usage + cost into ``self.state.tokens``.
+        """Fold one ``agent_run`` worth of usage + cost into ``self.state.info.tokens``.
 
         Tokens: pydantic-ai's ``RunUsage.input_tokens`` is already the
         non-cached prompt count (cache hits/writes are reported
@@ -1408,7 +1407,7 @@ Be creative and help users generate stunning images and videos."""
         except Exception:
             pass
 
-        self.state.tokens.add(
+        self.state.info.record_usage(
             input_tokens=in_toks or 0,
             output_tokens=out_toks or 0,
             requests=getattr(usage, "requests", 0) or 1,
@@ -1462,7 +1461,7 @@ Be creative and help users generate stunning images and videos."""
             return args.code
         return str(args)
 
-    def _finish_pending_tool_call(self, *, output: str = "", error: Optional[str] = None) -> None:
+    def _finish_pending_tool_call(self, *, output: str = "", error: str | None = None) -> None:
         """Mark the next pending tool-call widget as complete. Used by paths
         that resolve a tool call without invoking it (approval skip /
         feedback) or before the wrapper has a chance to."""
@@ -1513,7 +1512,7 @@ Be creative and help users generate stunning images and videos."""
         same path as user-initiated cancel.
         """
         if reset:
-            self.state = OkonomiState(session_id=self.state.session_id)
+            self.state = OkonomiState(info=SessionInfo(session_id=self.state.info.session_id, model=self.model_id))
 
         # Snapshot the interrupt flag before clearing it; the checks below
         # need the prior turn's value.
@@ -1522,7 +1521,7 @@ Be creative and help users generate stunning images and videos."""
         # "Approve all" applies to this turn only — a new user message
         # implicitly resets it.
         self.auto_approve = False
-        self.state.task = user_message
+        self.state.info.task_input = user_message
         deps = self._get_dependencies()
 
         if self.state.context:
@@ -1532,7 +1531,7 @@ Be creative and help users generate stunning images and videos."""
                 # the new instruction starts from a clean state.
                 while self.state.context and isinstance(self.state.context[-1], ModelResponse):
                     self.state.context.pop()
-            compressed = self.compressor.compress(self.state.context)
+            compressed = self.context_manager.compress(self.state.context)
             if compressed is not None:
                 self.emitter.note(f"Context compressed: {len(self.state.context)} → {len(compressed)} messages")
                 self.state.context = compressed
@@ -1583,6 +1582,11 @@ Be creative and help users generate stunning images and videos."""
         except Exception as e:
             print(f"{RED}Error: {e}{RST}")
             return f"Error: {str(e)}"
+        finally:
+            # The turn is over on every exit path (normal, cancel, timeout,
+            # error). Clear the spinner so the status bar can't get stuck on
+            # a stale "Thinking..." while the agent is actually idle.
+            self.spinner_text = ""
 
     def _handle_interruption(self, agent_run, deps: AgentDependencies, timed_out: bool) -> None:
         """Commit partial state and surface a timeout note. Caller decides
@@ -1630,7 +1634,7 @@ Be creative and help users generate stunning images and videos."""
         try:
             ctx_toks = count_tokens(self.state.context)
             system_toks = len(self._get_system_prompt()) // _CHARS_PER_TOKEN
-            self.state.tokens.context_tokens = ctx_toks + system_toks
+            self.state.info.tokens.context_tokens = ctx_toks + system_toks
         except Exception:
             pass
 
@@ -1663,7 +1667,7 @@ Be creative and help users generate stunning images and videos."""
 
     def _generate_steps_summary(self) -> str:
         """Generate LLM summary of session actions."""
-        return self.compressor.generate_steps_summary(self.state.message_history)
+        return self.context_manager.generate_steps_summary(self.state.message_history)
 
     def save_session(
         self,
@@ -1686,47 +1690,24 @@ Be creative and help users generate stunning images and videos."""
                 shutdown paths set this True so exit returns promptly.
                 The previous per-turn save already wrote a fresh summary.
         """
-        session_dir = self.session_manager.session_dir(self.state.session_id)
+        session_dir = self.session_manager.session_dir(self.state.info.session_id)
         session_dir.mkdir(parents=True, exist_ok=True)
 
         if download_assets:
             download_session_assets(self.state.artifacts, session_dir)
 
-        # Carry forward identity-shaping fields so mid-session title
-        # regen doesn't relocate the directory or reset created_at.
-        existing = self.session_manager.load_session(self.state.session_id, with_history=False)
-        existing_dir_name = existing.dir_name if existing else ""
-        existing_title = existing.title if existing else ""
-        existing_created = existing.created_at if existing else ""
-        existing_summary = existing.steps_summary if existing else ""
-
-        now = datetime.now().isoformat()
-        session = Session(
-            session_id=self.state.session_id,
-            task_input=self.state.task,
-            status=status,
-            created_at=existing_created or now,
-            updated_at=now,
-            num_artifacts=len(self.state.artifacts),
-            model=self.model_id,
-            input_tokens=self.state.tokens.input_tokens,
-            output_tokens=self.state.tokens.output_tokens,
-            cache_read_tokens=self.state.tokens.cache_read_tokens,
-            cache_write_tokens=self.state.tokens.cache_write_tokens,
-            reasoning_tokens=self.state.tokens.reasoning_tokens,
-            requests=self.state.tokens.requests,
-            cost_usd=self.state.tokens.cost_usd or None,
-            # Body
-            steps_summary=existing_summary if skip_summary else self._generate_steps_summary(),
-            title=existing_title,
-            dir_name=existing_dir_name,
-            artifacts=list(self.state.artifacts),
-            message_history=self.state.message_history if self.state.message_history else None,
-        )
+        # Stamp the run-owned fields onto the live info; SessionManager
+        # carries forward identity (title / dir_name / created_at) and
+        # persists everything else as-is. skip_summary leaves the prior
+        # turn's summary in place (a completed save already wrote one).
+        self.state.info.status = status
+        self.state.info.model = self.model_id
+        if not skip_summary:
+            self.state.info.steps_summary = self._generate_steps_summary()
 
         # Titling lives outside the agent: SessionManager.save_session fires a
         # small-model titler in the background. The agent never generates titles.
-        self.session_manager.save_session(session)
+        self.session_manager.save_session(self.state)
         self._serialize_user_globals()
 
     def _serialize_user_globals(self) -> None:
@@ -1758,7 +1739,7 @@ Be creative and help users generate stunning images and videos."""
             return
 
         try:
-            session_dir = self.session_manager.session_dir(self.state.session_id)
+            session_dir = self.session_manager.session_dir(self.state.info.session_id)
             session_dir.mkdir(parents=True, exist_ok=True)
             path = session_dir / "globals.pkl"
             try:
@@ -1786,7 +1767,7 @@ Be creative and help users generate stunning images and videos."""
         ``self.state.execution_globals``. Tool wrappers + helpers will be
         reinstalled on the next ``execute_code`` call."""
         try:
-            session_dir = self.session_manager.session_dir(self.state.session_id)
+            session_dir = self.session_manager.session_dir(self.state.info.session_id)
             globals_path = session_dir / "globals.pkl"
             if not globals_path.exists():
                 return
@@ -1816,53 +1797,37 @@ Be creative and help users generate stunning images and videos."""
         Returns:
             True if session was loaded successfully
         """
-        session = self.session_manager.load_session(session_id)
+        state = self.session_manager.load_session(session_id)
 
-        if not session:
+        if state is None:
             return False
 
         # Raw log restored as-is (append-only audit record). Working set
         # is a sanitized view — strip orphan tool calls at the tail from
         # an interrupted save. Compression on the working set fires on
         # the next turn if oversized.
-        if session.message_history:
-            message_history = list(session.message_history)
-            context = self._strip_unanswered_tool_calls(list(message_history))
+        if state.message_history:
+            context = self._strip_unanswered_tool_calls(list(state.message_history))
             if not context:
                 # Sanitization wiped everything (rare). Fall back to summary.
-                context = self.compressor.build_resume_context(
+                context = self.context_manager.build_resume_context(
                     session_id=session_id,
-                    task=session.task_input,
-                    steps_summary=session.steps_summary,
-                    artifacts=session.artifacts,
+                    task=state.info.task_input,
+                    steps_summary=state.info.steps_summary,
+                    artifacts=state.artifacts,
                 )
         else:
             # Legacy session — no jsonl. Synthesize a summary message.
-            context = self.compressor.build_resume_context(
+            context = self.context_manager.build_resume_context(
                 session_id=session_id,
-                task=session.task_input,
-                steps_summary=session.steps_summary,
-                artifacts=session.artifacts,
+                task=state.info.task_input,
+                steps_summary=state.info.steps_summary,
+                artifacts=state.artifacts,
             )
-            message_history = list(context)
+            state.message_history = list(context)
 
-        self.state = OkonomiState(
-            session_id=session_id,
-            task=session.task_input,
-            message_history=message_history,
-            context=context,
-            artifacts=session.artifacts,
-            tokens=TokenTracker(
-                input_tokens=session.input_tokens,
-                output_tokens=session.output_tokens,
-                total_tokens=session.input_tokens + session.output_tokens,
-                cache_read_tokens=session.cache_read_tokens,
-                cache_write_tokens=session.cache_write_tokens,
-                reasoning_tokens=session.reasoning_tokens,
-                requests=session.requests,
-                cost_usd=float(session.cost_usd or 0.0),
-            ),
-        )
+        state.context = context
+        self.state = state
 
         # Restore Python locals the model bound during the prior session.
         # Tool wrappers / helpers are re-injected on the next execute_code
