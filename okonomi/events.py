@@ -181,7 +181,7 @@ class EventEmitter:
             ev.output = (ev.output + "\n" if ev.output else "") + output
         self.update(ev)
 
-    def note(self, text: str, level: str = "info") -> SystemNote:
+    def log(self, text: str, level: str = "info") -> SystemNote:
         ev = SystemNote(text=text, level=level)
         self.emit(ev)
         return ev

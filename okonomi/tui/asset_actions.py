@@ -43,21 +43,21 @@ def handle_asset_action(
 def _open_paths(paths: list[str], emitter: EventEmitter) -> None:
     opener = {"darwin": "open", "linux": "xdg-open"}.get(sys.platform)
     if opener is None:
-        emitter.note(f"Don't know how to open files on {sys.platform}.", level="warn")
+        emitter.log(f"Don't know how to open files on {sys.platform}.", level="warn")
         return
     for p in paths:
         try:
             subprocess.Popen([opener, p], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         except Exception as e:
-            emitter.note(f"open {p!r} failed: {e}", level="warn")
-    emitter.note(f"Opened {len(paths)} asset{'s' if len(paths) != 1 else ''}.")
+            emitter.log(f"open {p!r} failed: {e}", level="warn")
+    emitter.log(f"Opened {len(paths)} asset{'s' if len(paths) != 1 else ''}.")
 
 
 def _copy_paths(paths: list[str], emitter: EventEmitter) -> None:
     if copy_to_clipboard("\n".join(paths)):
-        emitter.note(f"Copied {len(paths)} path{'s' if len(paths) != 1 else ''} to clipboard.")
+        emitter.log(f"Copied {len(paths)} path{'s' if len(paths) != 1 else ''} to clipboard.")
     else:
-        emitter.note("Clipboard copy failed (no pbcopy / xclip / xsel found).", level="warn")
+        emitter.log("Clipboard copy failed (no pbcopy / xclip / xsel found).", level="warn")
 
 
 def _heart_paths(paths: list[str], agent: "OkonomiAgent", emitter: EventEmitter) -> None:
@@ -77,4 +77,4 @@ def _heart_paths(paths: list[str], agent: "OkonomiAgent", emitter: EventEmitter)
             n += 1
         except Exception:
             continue
-    emitter.note(f"Hearted {n} asset{'s' if n != 1 else ''}.")
+    emitter.log(f"Hearted {n} asset{'s' if n != 1 else ''}.")

@@ -1,7 +1,8 @@
 """Command-line entry point for okonomi.
 
-The interactive UI lives in ``okonomi.tui`` (Textual). This module is thin:
-argparse + one-shot task runner + session resolution.
+The interactive UI lives in ``okonomi.tui`` (a prompt_toolkit streaming-
+scrollback REPL). This module is thin: argparse + one-shot task runner +
+session resolution.
 """
 
 import argparse

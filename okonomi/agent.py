@@ -23,7 +23,7 @@ from contextlib import redirect_stderr, redirect_stdout
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Optional
+from typing import Any
 from urllib.parse import unquote, urlparse
 
 import httpx
@@ -52,11 +52,12 @@ except Exception:
 
 from .context import _CHARS_PER_TOKEN, ContextManager, count_tokens
 from .display import GREEN, RED, RST, print_ansi_box
+from .events import EventEmitter
 from .session import (
     Artifact,
+    OkonomiState,
     SessionInfo,
     SessionManager,
-    OkonomiState,
     SessionStatus,
     asset_subdir_for_file,
     new_session_id,
@@ -71,7 +72,6 @@ from .tools import (
     TerminalTools,
     WebTools,
 )
-from .events import EventEmitter
 
 
 logger = logging.getLogger(__name__)
@@ -248,7 +248,7 @@ def _parse_user_message(text: str, emitter=None):
     downstream. Returns ``text`` unchanged when no images resolve.
 
     Dead refs (path missing, unsupported format) surface via
-    ``emitter.note`` so the user sees *why* their image wasn't attached.
+    ``emitter.log`` so the user sees *why* their image wasn't attached.
     """
     parts: list = []
     dead: list[str] = []
@@ -261,7 +261,7 @@ def _parse_user_message(text: str, emitter=None):
 
     if emitter is not None:
         for ref in dead:
-            emitter.note(
+            emitter.log(
                 f"Couldn't attach image {ref!r} — file missing, unreadable, "
                 "or unsupported format (need png/jpg/gif/webp).",
                 level="warn",
@@ -1533,7 +1533,7 @@ Be creative and help users generate stunning images and videos."""
                     self.state.context.pop()
             compressed = self.context_manager.compress(self.state.context)
             if compressed is not None:
-                self.emitter.note(f"Context compressed: {len(self.state.context)} → {len(compressed)} messages")
+                self.emitter.log(f"Context compressed: {len(self.state.context)} → {len(compressed)} messages")
                 self.state.context = compressed
 
         if prior_interrupted and self.state.context:
@@ -1594,7 +1594,7 @@ Be creative and help users generate stunning images and videos."""
         self._was_interrupted = True
         self._commit_turn(agent_run, deps, self._strip_unanswered_tool_calls(agent_run.all_messages()))
         if timed_out:
-            self.emitter.note(
+            self.emitter.log(
                 f"Turn timed out after {self.timeout:.0f}s. Partial state preserved.",
                 level="warn",
             )

@@ -1,4 +1,4 @@
-"""TuiSession — drives the agent from the Textual app.
+"""TuiSession — drives the agent from the streaming-scrollback REPL.
 
 Owns a persistent worker loop on a daemon thread; user messages are
 serialized through an ``asyncio.Queue`` and consumed one turn at a
@@ -16,12 +16,12 @@ from concurrent.futures import TimeoutError as FutureTimeout
 from ..agent import OkonomiAgent
 from ..events import Banner, EventEmitter, replay_history
 from ..session import SessionStatus
-from .app import OkonomiApp
 from .asset_actions import handle_asset_action
+from .repl.app import ReplApp
 
 
 class TuiSession:
-    """Textual-driven interactive session for OkonomiAgent."""
+    """Streaming-scrollback REPL session for OkonomiAgent."""
 
     def __init__(self, agent: OkonomiAgent) -> None:
         self.agent = agent
@@ -63,7 +63,10 @@ class TuiSession:
         self._bg_tasks: dict[str, threading.Thread] = {}
         self._bg_counter = 0
 
-        self._app = OkonomiApp(
+        # The prompt_toolkit streaming-scrollback REPL front-end. Prints the
+        # EventEmitter stream into native terminal scrollback and owns the
+        # bottom input chrome.
+        self._app = ReplApp(
             self.emitter,
             on_submit=self._on_submit,
             spinner_label_fn=self._spinner_label,
@@ -97,13 +100,13 @@ class TuiSession:
             await self.agent.run_async(user_message, reset=reset)
         except asyncio.CancelledError:
             status = "interrupted"
-            self.emitter.note("Interrupted. History preserved.", level="warn")
+            self.emitter.log("Interrupted. History preserved.", level="warn")
         except Exception as e:  # noqa: BLE001
             import traceback
 
             status = "error"
             tb = traceback.format_exc()
-            self.emitter.note(f"Agent error: {type(e).__name__}: {e}", level="error")
+            self.emitter.log(f"Agent error: {type(e).__name__}: {e}", level="error")
             trace_event = self.emitter.tool_call("traceback", args="agent failure", details=tb)
             self.emitter.tool_finish(trace_event, error="see traceback above")
         finally:
@@ -157,9 +160,9 @@ class TuiSession:
     # --- Submit / approval / bg-exec hooks ---
 
     def _on_submit(self, text: str) -> None:
-        """Handle user text from the Textual app.
+        """Handle user text from the REPL.
 
-        Runs in the Textual thread; push work to the worker via queue.
+        Runs on the prompt_toolkit loop; push work to the worker via queue.
         Intercepts slash commands before they reach the agent.
         """
         from . import commands
@@ -185,6 +188,13 @@ class TuiSession:
                         list(self.agent.state.artifacts),
                         lambda action, paths: handle_asset_action(action, paths, self.agent, self.emitter),
                     )
+                return
+            if result == "__verbose__":
+                toggle = getattr(self._app, "toggle_verbose", None)
+                if toggle is not None:
+                    toggle()
+                else:
+                    self.emitter.log("`/verbose` is only available in the REPL.", level="warn")
                 return
             if result.startswith("__bg__:"):
                 self._spawn_bg_task(result[len("__bg__:") :])
@@ -227,15 +237,13 @@ class TuiSession:
         Mirrors the prompt_toolkit CLI's _run_bg_task. Outputs merge back
         into the parent agent's session on completion.
         """
-        from ..agent import OkonomiAgent
-
         self._bg_counter += 1
         task_id = f"bg-{self._bg_counter}"
         parent = self.agent
         approval_cb = parent.approval_callback
         on_bg_complete_cb = parent.on_bg_complete
 
-        self.emitter.note(f"Background task {task_id} started: {task_input[:80]}")
+        self.emitter.log(f"Background task {task_id} started: {task_input[:80]}")
 
         def _run() -> None:
             bg_agent = OkonomiAgent(
@@ -255,9 +263,9 @@ class TuiSession:
                 parent.state.artifacts.extend(bg_agent.state.artifacts)
                 parent.state.tools_used.update(bg_agent.state.tools_used)
                 n = len(bg_agent.state.artifacts)
-                self.emitter.note(f"Background task {task_id} done — {n} artifact{'s' if n != 1 else ''}")
+                self.emitter.log(f"Background task {task_id} done — {n} artifact{'s' if n != 1 else ''}")
             except Exception as e:  # noqa: BLE001
-                self.emitter.note(f"Background task {task_id} failed: {e}", level="error")
+                self.emitter.log(f"Background task {task_id} failed: {e}", level="error")
             finally:
                 self._bg_tasks.pop(task_id, None)
 
@@ -272,7 +280,7 @@ class TuiSession:
         actually see where they left off (otherwise the scrollback is
         empty even though the model has full context)."""
         if not self.agent.load_session(session_id):
-            self.emitter.note(f"Failed to load session: {session_id}", level="error")
+            self.emitter.log(f"Failed to load session: {session_id}", level="error")
             return
 
         # Skip the first-turn reset — it would wipe the freshly-loaded
@@ -283,7 +291,7 @@ class TuiSession:
         meta = self.agent.session_manager.get_info(session_id)
         title = (meta.title if meta else "") or ""
         label = f"{session_id[:10]} · {title}" if title else session_id
-        self.emitter.note(f"↑ Resumed: {label}")
+        self.emitter.log(f"↑ Resumed: {label}")
 
     async def _approval_callback(self, code: str) -> bool | str:
         """Agent asks: is this expensive code ok to run?
@@ -359,7 +367,7 @@ class TuiSession:
 
     # --- Entry points ---
 
-    # --- Status-bar callables passed to OkonomiApp ---
+    # --- Status-bar callables passed to ReplApp ---
 
     def _spinner_label(self) -> str:
         """Working-state label with elapsed timer. Always shows liveness
@@ -413,12 +421,13 @@ class TuiSession:
             pass
 
         self.emitter.emit(Banner())
-        self.emitter.note(
-            "type a message or /help. Ctrl+D to exit, Ctrl+O to expand the latest tool call.",
+        self.emitter.log(
+            "type a message or /help. Ctrl+D to exit. Scroll and select text "
+            "natively; /verbose toggles full tool output.",
         )
 
         if shutil.which("genmedia") is None:
-            self.emitter.note(
+            self.emitter.log(
                 "genmedia CLI not found on $PATH. Install with:\n"
                 "  curl -fsSL https://genmedia.sh/install | sh\n"
                 "Until then, image/video generation via the genmedia "
@@ -431,10 +440,7 @@ class TuiSession:
             self._on_submit(initial_message)
 
         try:
-            # inline=True keeps the app in normal scrollback. mouse=True
-            # enables in-app wheel scroll; terminal text selection is
-            # modifier-gated (Shift / Option / Fn depending on terminal).
-            await self._app.run_async(inline=True, inline_no_clear=True, mouse=True)
+            await self._app.run_async()
         finally:
             self.shutdown()
 
