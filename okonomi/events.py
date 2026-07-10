@@ -1,9 +1,9 @@
 """Typed events produced by the agent and rendered by the TUI.
 
-The agent pushes events onto an ``EventEmitter``; the TUI subscribes and
-materializes them as widgets. This replaces the raw ``print()`` flow that
-the prompt_toolkit CLI used — by making every user-visible artifact a
-structured record, we can render it with per-item expansion state.
+The agent pushes events onto an ``EventEmitter``; subscribers render them
+(the REPL transcript for both interactive and one-shot modes). By making
+every user-visible artifact a structured record, rendering is decoupled
+from the agent loop.
 
 Every event carries a ``type`` discriminator (tau-style tagged events):
 ``TurnStart``/``TurnEnd`` bracket each agent turn and
@@ -97,11 +97,11 @@ class AssistantStream(Event):
 
 @dataclass
 class ToolCall(Event):
-    """A collapsible tool call. Starts collapsed.
+    """A tool call and its result.
 
-    args: short one-line summary (shown in collapsed view).
-    details: full args/code (shown when expanded — kept as the original
-        input so the widget can syntax-highlight just this part).
+    args: short one-line summary (shown in the compact view).
+    details: full args/code — the original input, so the renderer can
+        syntax-highlight it in the verbose view.
     output: text appended after the call returns (stdout, summary, etc.).
         Kept separate from details so the UI can render it with plain
         styling below the highlighted code block.
@@ -115,7 +115,6 @@ class ToolCall(Event):
     args: str = ""
     details: str = ""
     output: str = ""
-    expanded: bool = False
     status: str = "running"  # running | ok | error
     tool_call_id: str = ""
 

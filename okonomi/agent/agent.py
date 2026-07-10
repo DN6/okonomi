@@ -650,16 +650,12 @@ class OkonomiAgent(CodeExecutionMixin):
             code = self._extract_code(part)
             if not code:
                 return
-            needs_approval = self.approval_callback is not None and any(p in code for p in self._expensive_patterns)
             line_count = code.count("\n") + 1
-            # Approval-gated code is expanded by default so the user can
-            # read what they're about to authorize without hitting Ctrl+O.
             ev = self.emitter.emit(
                 ToolCall(
                     "execute_code",
                     args=f"{line_count} lines",
                     details=code,
-                    expanded=needs_approval,
                     tool_call_id=call_id,
                 )
             )
