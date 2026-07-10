@@ -412,7 +412,7 @@ class TuiSession:
         import shutil
 
         # Last-ditch save: atexit fires before interpreter exit even on
-        # SIGTERM / uncaught exception / Textual hang.
+        # SIGTERM, an uncaught exception, or a hung front-end.
         atexit.register(self._safe_save_session, status="abandoned", skip_summary=True)
 
         try:

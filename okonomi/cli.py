@@ -10,8 +10,17 @@ import asyncio
 
 from .agent import OkonomiAgent
 from .config import load_env_or_raise
-from .display import BOLD, DIM, GREEN, RED, RST, YELLOW, get_task_input
 from .events import SystemNote
+
+
+# ANSI colors for the startup chrome (session resolution, one-shot notes) —
+# printed before any TUI exists, so raw escapes rather than the REPL style.
+DIM = "\033[2m"
+RST = "\033[0m"
+RED = "\033[31m"
+BOLD = "\033[1m"
+YELLOW = "\033[33m"
+GREEN = "\033[32m"
 
 
 # =============================================================================
@@ -159,7 +168,7 @@ def main() -> None:
     if is_interactive:
         asyncio.run(run_agent_async(args, ""))
     else:
-        user_request = get_task_input(args)
+        user_request = (args.task or "").strip()
         if not user_request.strip():
             print(f"{DIM}No task provided.{RST}")
             return
