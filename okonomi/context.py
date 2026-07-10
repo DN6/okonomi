@@ -18,6 +18,7 @@ from pydantic_ai.messages import (
     UserPromptPart,
 )
 
+from .events import SystemNote
 from .utils import create_chat_client
 
 
@@ -147,6 +148,9 @@ class ContextManager:
         self.protect_last_n = protect_last_n
         self.compression_count = 0
         self._client = create_chat_client()
+        # Set by OkonomiAgent after its EventEmitter exists, so the
+        # compression warning renders through the one event pipe.
+        self.emitter = None
         logger.info("Context manager: compress_at=%d", compress_at_tokens)
 
     def compress(self, messages: list[ModelMessage]) -> list[ModelMessage] | None:
@@ -194,10 +198,14 @@ class ContextManager:
         after = count_tokens(compressed)
         logger.info("Compressed: %d → %d messages (~%d tokens saved)", n, len(compressed), before - after)
         if self.compression_count >= 3:
-            print(
-                f"\033[33mSession compressed {self.compression_count}× — "
-                "consider /clear for a fresh start or /save to preserve this work.\033[0m"
+            msg = (
+                f"Session compressed {self.compression_count}× — "
+                "consider /clear for a fresh start or /save to preserve this work."
             )
+            if self.emitter is not None:
+                self.emitter.emit(SystemNote(msg, level="warn"))
+            else:
+                print(f"\033[33m{msg}\033[0m")
         return compressed
 
     def generate_steps_summary(self, messages: list[ModelMessage]) -> str:

@@ -10,7 +10,7 @@ import threading
 from dataclasses import dataclass
 from datetime import datetime
 
-from okonomi.display import DIM, GREEN, RED, RST
+from ..events import SystemNote
 
 
 @dataclass
@@ -116,14 +116,14 @@ class AgentTools:
                     parent.state.tools_used.update(agent.state.tools_used)
                     bg_task.outputs = len(agent.state.artifacts)
                     bg_task.status = "done"
-                    print(
-                        f"\n{GREEN}✓ Agent done: {label} — {bg_task.outputs} artifact{'s' if bg_task.outputs != 1 else ''}{RST}"
-                    )
+                    parent.emitter.emit(SystemNote(
+                        f"✓ Agent done: {label} — {bg_task.outputs} artifact{'s' if bg_task.outputs != 1 else ''}"
+                    ))
                 except Exception as e:
                     bg_task.status = "failed"
                     bg_task.error = str(e)
                     final_status = "error"
-                    print(f"\n{RED}✗ Agent failed: {label} — {e}{RST}")
+                    parent.emitter.emit(SystemNote(f"✗ Agent failed: {label} — {e}", level="error"))
                 finally:
                     from okonomi.cli import _shutdown_loop
 
@@ -132,7 +132,7 @@ class AgentTools:
                 bg_task.status = "failed"
                 bg_task.error = str(e)
                 final_status = "error"
-                print(f"\n{RED}✗ Agent error: {label} — {e}{RST}")
+                parent.emitter.emit(SystemNote(f"✗ Agent error: {label} — {e}", level="error"))
             finally:
                 if hasattr(parent, "_mark_bg_log_done"):
                     try:
@@ -143,7 +143,7 @@ class AgentTools:
         t = threading.Thread(target=_run, daemon=True, name=f"okonomi-{task_id}")
         t.start()
 
-        print(f"{DIM}Launched background agent: {label} [{task_id}]{RST}")
+        parent.emitter.emit(SystemNote(f"Launched background agent: {label} [{task_id}]"))
         return f"Background agent launched: {task_id} ({label}). It will run concurrently — check status with list_agents()."
 
     def list_agents(self) -> str:

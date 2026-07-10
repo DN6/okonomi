@@ -14,7 +14,7 @@ import time
 from concurrent.futures import TimeoutError as FutureTimeout
 
 from ..agent import OkonomiAgent
-from ..events import Banner, EventEmitter, replay_history
+from ..events import Banner, Divider, EventEmitter, SystemNote, ToolCall, UserMessage, replay_history
 from ..session import SessionStatus
 from .asset_actions import handle_asset_action
 from .repl.app import ReplApp
@@ -100,15 +100,15 @@ class TuiSession:
             await self.agent.run_async(user_message, reset=reset)
         except asyncio.CancelledError:
             status = "interrupted"
-            self.emitter.log("Interrupted. History preserved.", level="warn")
+            self.emitter.emit(SystemNote("Interrupted. History preserved.", level="warn"))
         except Exception as e:  # noqa: BLE001
             import traceback
 
             status = "error"
             tb = traceback.format_exc()
-            self.emitter.log(f"Agent error: {type(e).__name__}: {e}", level="error")
-            trace_event = self.emitter.tool_call("traceback", args="agent failure", details=tb)
-            self.emitter.tool_finish(trace_event, error="see traceback above")
+            self.emitter.emit(SystemNote(f"Agent error: {type(e).__name__}: {e}", level="error"))
+            trace_event = self.emitter.emit(ToolCall("traceback", args="agent failure", details=tb))
+            self.emitter.emit(trace_event.finish(error="see traceback above"))
         finally:
             self._current_task = None
             self._turn_started_at = None
@@ -167,8 +167,8 @@ class TuiSession:
         """
         from . import commands
 
-        self.emitter.divider()
-        self.emitter.user(text)
+        self.emitter.emit(Divider())
+        self.emitter.emit(UserMessage(text))
 
         if commands.is_slash_command(text):
             result = commands.handle(text, self.agent, self.emitter)
@@ -194,7 +194,7 @@ class TuiSession:
                 if toggle is not None:
                     toggle()
                 else:
-                    self.emitter.log("`/verbose` is only available in the REPL.", level="warn")
+                    self.emitter.emit(SystemNote("`/verbose` is only available in the REPL.", level="warn"))
                 return
             if result.startswith("__bg__:"):
                 self._spawn_bg_task(result[len("__bg__:") :])
@@ -243,7 +243,7 @@ class TuiSession:
         approval_cb = parent.approval_callback
         on_bg_complete_cb = parent.on_bg_complete
 
-        self.emitter.log(f"Background task {task_id} started: {task_input[:80]}")
+        self.emitter.emit(SystemNote(f"Background task {task_id} started: {task_input[:80]}"))
 
         def _run() -> None:
             bg_agent = OkonomiAgent(
@@ -263,9 +263,9 @@ class TuiSession:
                 parent.state.artifacts.extend(bg_agent.state.artifacts)
                 parent.state.tools_used.update(bg_agent.state.tools_used)
                 n = len(bg_agent.state.artifacts)
-                self.emitter.log(f"Background task {task_id} done — {n} artifact{'s' if n != 1 else ''}")
+                self.emitter.emit(SystemNote(f"Background task {task_id} done — {n} artifact{'s' if n != 1 else ''}"))
             except Exception as e:  # noqa: BLE001
-                self.emitter.log(f"Background task {task_id} failed: {e}", level="error")
+                self.emitter.emit(SystemNote(f"Background task {task_id} failed: {e}", level="error"))
             finally:
                 self._bg_tasks.pop(task_id, None)
 
@@ -280,7 +280,7 @@ class TuiSession:
         actually see where they left off (otherwise the scrollback is
         empty even though the model has full context)."""
         if not self.agent.load_session(session_id):
-            self.emitter.log(f"Failed to load session: {session_id}", level="error")
+            self.emitter.emit(SystemNote(f"Failed to load session: {session_id}", level="error"))
             return
 
         # Skip the first-turn reset — it would wipe the freshly-loaded
@@ -291,7 +291,7 @@ class TuiSession:
         meta = self.agent.session_manager.get_info(session_id)
         title = (meta.title if meta else "") or ""
         label = f"{session_id[:10]} · {title}" if title else session_id
-        self.emitter.log(f"↑ Resumed: {label}")
+        self.emitter.emit(SystemNote(f"↑ Resumed: {label}"))
 
     async def _approval_callback(self, code: str) -> bool | str:
         """Agent asks: is this expensive code ok to run?
@@ -421,20 +421,20 @@ class TuiSession:
             pass
 
         self.emitter.emit(Banner())
-        self.emitter.log(
+        self.emitter.emit(SystemNote(
             "type a message or /help. Ctrl+D to exit. Scroll and select text "
             "natively; /verbose toggles full tool output.",
-        )
+        ))
 
         if shutil.which("genmedia") is None:
-            self.emitter.log(
+            self.emitter.emit(SystemNote(
                 "genmedia CLI not found on $PATH. Install with:\n"
                 "  curl -fsSL https://genmedia.sh/install | sh\n"
                 "Until then, image/video generation via the genmedia "
                 "skill won't work — local tools (browser, prompt, "
                 "research) still do.",
                 level="warn",
-            )
+            ))
 
         if initial_message:
             self._on_submit(initial_message)

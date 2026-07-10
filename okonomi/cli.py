@@ -10,7 +10,8 @@ import asyncio
 
 from .agent import OkonomiAgent
 from .config import load_env_or_raise
-from .display import BOLD, DIM, GREEN, PINK, RED, RST, YELLOW, get_task_input
+from .display import BOLD, DIM, GREEN, RED, RST, YELLOW, get_task_input
+from .events import SystemNote
 
 
 # =============================================================================
@@ -80,9 +81,10 @@ async def _run_single_task(agent: OkonomiAgent, user_message: str) -> None:
     """Run a single task without interactive input."""
     import signal
 
-    from .events import StdoutPrinter
+    from .tui.repl.transcript import ReplTranscript
 
-    agent.emitter.subscribe(StdoutPrinter().handle)
+    transcript = ReplTranscript(tool_detail="full" if agent.verbose else "compact")
+    agent.emitter.subscribe(transcript.on_event)
     loop = asyncio.get_running_loop()
     agent_task = asyncio.create_task(agent.run_async(user_message, reset=True))
     interrupted = False
@@ -105,7 +107,7 @@ async def _run_single_task(agent: OkonomiAgent, user_message: str) -> None:
         loop.remove_signal_handler(signal.SIGINT)
 
     if interrupted:
-        print(f"\n{PINK}Interrupted.{RST}")
+        agent.emitter.emit(SystemNote("Interrupted.", level="warn"))
 
     try:
         agent.save_session(status="completed")

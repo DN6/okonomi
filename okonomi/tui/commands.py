@@ -12,7 +12,7 @@ from __future__ import annotations
 from pathlib import Path
 from typing import TYPE_CHECKING
 
-from ..events import AssistantStream, EventEmitter
+from ..events import AssistantStream, EventEmitter, SystemNote
 from ..utils import copy_to_clipboard
 
 
@@ -71,30 +71,30 @@ def handle(
         lines.append("  ↑ / ↓        Input history")
         lines.append("  Ctrl+C       Interrupt running turn / clear draft")
         lines.append("  Ctrl+D       Exit")
-        emitter.log("\n".join(lines))
+        emitter.emit(SystemNote("\n".join(lines)))
         return None
 
     if low == "/copy" or low.startswith("/copy "):
         rest = cmd[len("/copy") :].strip()
         texts = [ev.text for ev in emitter.history() if isinstance(ev, AssistantStream) and ev.text.strip()]
         if not texts:
-            emitter.log("Nothing to copy yet.", level="warn")
+            emitter.emit(SystemNote("Nothing to copy yet.", level="warn"))
             return None
         n = 1
         if rest:
             try:
                 n = max(1, int(rest))
             except ValueError:
-                emitter.log("Usage: /copy [n] — copies the nth-from-last assistant message.", level="warn")
+                emitter.emit(SystemNote("Usage: /copy [n] — copies the nth-from-last assistant message.", level="warn"))
                 return None
         if n > len(texts):
-            emitter.log(f"Only {len(texts)} assistant message(s) so far.", level="warn")
+            emitter.emit(SystemNote(f"Only {len(texts)} assistant message(s) so far.", level="warn"))
             return None
         text = texts[-n]
         if copy_to_clipboard(text):
-            emitter.log(f"Copied {len(text)} characters to clipboard.")
+            emitter.emit(SystemNote(f"Copied {len(text)} characters to clipboard."))
         else:
-            emitter.log("Clipboard copy failed (no pbcopy/xclip/xsel found).", level="warn")
+            emitter.emit(SystemNote("Clipboard copy failed (no pbcopy/xclip/xsel found).", level="warn"))
         return None
 
     if low == "/verbose":
@@ -103,7 +103,7 @@ def handle(
     if low == "/clear":
         agent.state.message_history = []
         agent.state.context = []
-        emitter.log("Conversation cleared.")
+        emitter.emit(SystemNote("Conversation cleared."))
         return None
 
     if low == "/jobs":
@@ -111,7 +111,7 @@ def handle(
 
         jobs = getattr(agent, "_bg_logs", {}) or {}
         if not jobs:
-            emitter.log("No background jobs.")
+            emitter.emit(SystemNote("No background jobs."))
             return None
         now = _time.time()
         running = [(jid, j) for jid, j in jobs.items() if j.get("status") == "running"]
@@ -130,7 +130,7 @@ def handle(
                 lines.append(f"  {glyph} {jid:<14} {j['kind']:<8} {j.get('label','')} ({dur:.0f}s)")
         lines.append("")
         lines.append("Use `/logs <id>` to view captured output.")
-        emitter.log("\n".join(lines))
+        emitter.emit(SystemNote("\n".join(lines)))
         return None
 
     if low == "/logs" or low.startswith("/logs "):
@@ -138,11 +138,11 @@ def handle(
         jobs = getattr(agent, "_bg_logs", {}) or {}
         if not rest:
             ids = ", ".join(sorted(jobs.keys())) or "(none)"
-            emitter.log(f"Usage: /logs <id>. Known jobs: {ids}")
+            emitter.emit(SystemNote(f"Usage: /logs <id>. Known jobs: {ids}"))
             return None
         entry = jobs.get(rest)
         if entry is None:
-            emitter.log(f"No job named {rest!r}. Run /jobs to list.", level="warn")
+            emitter.emit(SystemNote(f"No job named {rest!r}. Run /jobs to list.", level="warn"))
             return None
         try:
             output = entry["_reader"]()
@@ -153,7 +153,7 @@ def handle(
         if len(output) > MAX:
             output = f"…[truncated {len(output) - MAX} chars]…\n" + output[-MAX:]
         header = f"{rest} [{entry.get('status','?')}] {entry.get('label','')}"
-        emitter.log(f"{header}\n{output}")
+        emitter.emit(SystemNote(f"{header}\n{output}"))
         return None
 
     if low == "/timeout" or low.startswith("/timeout "):
@@ -161,16 +161,16 @@ def handle(
         if not rest:
             current = agent.timeout
             label = "disabled" if current <= 0 else f"{current:.0f}s"
-            emitter.log(f"Per-turn timeout: {label}. Use `/timeout <seconds>` to change (0 disables).")
+            emitter.emit(SystemNote(f"Per-turn timeout: {label}. Use `/timeout <seconds>` to change (0 disables)."))
             return None
         try:
             seconds = float(rest)
         except ValueError:
-            emitter.log(f"Invalid value: {rest!r}. Use a number of seconds.", level="warn")
+            emitter.emit(SystemNote(f"Invalid value: {rest!r}. Use a number of seconds.", level="warn"))
             return None
         agent.timeout = seconds
         label = "disabled" if seconds <= 0 else f"{seconds:.0f}s"
-        emitter.log(f"Per-turn timeout set to {label}.")
+        emitter.emit(SystemNote(f"Per-turn timeout set to {label}."))
         return None
 
     if low == "/assets":
@@ -180,49 +180,49 @@ def handle(
             pass
         artifacts = [a for a in agent.state.artifacts if a.artifact_type in ("image", "video", "audio", "3d", "html")]
         if not artifacts:
-            emitter.log("No assets generated yet.")
+            emitter.emit(SystemNote("No assets generated yet."))
             return None
         return "__asset_picker__"
 
     if low == "/save":
         agent.save_session(status="completed")
-        emitter.log("Session saved.")
+        emitter.emit(SystemNote("Session saved."))
         return None
 
     if low == "/prune":
         count = agent.session_manager.prune_empty_sessions()
-        emitter.log(f"Pruned {count} empty session{'s' if count != 1 else ''}.")
+        emitter.emit(SystemNote(f"Pruned {count} empty session{'s' if count != 1 else ''}."))
         return None
 
     if low == "/reload":
         counts = agent.reload()
-        emitter.log(f"Reloaded — {counts['skills']} skills, {counts['tools']} tools.")
+        emitter.emit(SystemNote(f"Reloaded — {counts['skills']} skills, {counts['tools']} tools."))
         return None
 
     if low == "/last":
         sessions = agent.session_manager.list_sessions(limit=1)
         if not sessions:
-            emitter.log("No previous sessions.", level="warn")
+            emitter.emit(SystemNote("No previous sessions.", level="warn"))
             return None
         if agent.load_session(sessions[0].session_id):
-            emitter.log(f"Resumed: {sessions[0].display_name}")
+            emitter.emit(SystemNote(f"Resumed: {sessions[0].display_name}"))
         else:
-            emitter.log("Failed to load last session.", level="error")
+            emitter.emit(SystemNote("Failed to load last session.", level="error"))
         return None
 
     if low.startswith("/title"):
         title_text = cmd[len("/title") :].strip()
         if title_text:
             if agent.session_manager.set_title(agent.state.info.session_id, title_text):
-                emitter.log(f"Title set: {title_text}")
+                emitter.emit(SystemNote(f"Title set: {title_text}"))
             else:
-                emitter.log(
+                emitter.emit(SystemNote(
                     "Failed to set title (conflict or session not saved yet).",
                     level="error",
-                )
+                ))
         else:
             meta = agent.session_manager.get_info(agent.state.info.session_id)
-            emitter.log(f"Title: {(meta.title if meta else '') or '(none)'}")
+            emitter.emit(SystemNote(f"Title: {(meta.title if meta else '') or '(none)'}"))
         return None
 
     if low == "/heart" or low.startswith("/heart "):
@@ -244,13 +244,13 @@ def handle(
         result = agent.skills._load_full(name)
         if "content" in result:
             return f"Follow this skill:\n\n{result['content']}"
-        emitter.log(result.get("error", "Skill not found"), level="error")
+        emitter.emit(SystemNote(result.get("error", "Skill not found"), level="error"))
         return None
 
     if low.startswith("/bg "):
         task = cmd[len("/bg ") :].strip()
         if not task:
-            emitter.log("Usage: /bg <task>", level="warn")
+            emitter.emit(SystemNote("Usage: /bg <task>", level="warn"))
             return None
         # Sentinel picked up by TuiSession to spawn a parallel agent.
         return f"__bg__:{task}"
@@ -258,7 +258,7 @@ def handle(
     if low.startswith("/btw"):
         rest = cmd[len("/btw") :].strip()
         if not rest:
-            emitter.log("Usage: /btw <question>", level="warn")
+            emitter.emit(SystemNote("Usage: /btw <question>", level="warn"))
             return None
         # Sentinel picked up by TuiSession to cancel the in-flight turn
         # and redirect the agent to this side question.
@@ -273,7 +273,7 @@ def handle(
         # TuiSession checks for this and calls app.exit().
         return "__exit__"
 
-    emitter.log(f"Unknown command: {cmd}. Type /help for a list.", level="warn")
+    emitter.emit(SystemNote(f"Unknown command: {cmd}. Type /help for a list.", level="warn"))
     return None
 
 
@@ -346,11 +346,11 @@ def _heart_dispatch(agent: "OkonomiAgent", emitter: EventEmitter, arg: str) -> N
     if p is not None:
         _heart_local_path(agent, emitter, p)
         return
-    emitter.log(
+    emitter.emit(SystemNote(
         f"{arg!r} is neither a URL nor an existing file. "
         "Use `/heart` alone to heart the last generated asset.",
         level="warn",
-    )
+    ))
 
 
 def _looks_like_url(text: str) -> bool:
@@ -368,11 +368,11 @@ def _resolve_local_path(text: str) -> Path | None:
 def _heart_last_artifact(agent: "OkonomiAgent", emitter: EventEmitter) -> None:
     media = [a for a in agent.state.artifacts if a.artifact_type in ("image", "video", "audio", "3d")]
     if not media:
-        emitter.log("No generated media in this session.", level="warn")
+        emitter.emit(SystemNote("No generated media in this session.", level="warn"))
         return
     last = media[-1]
     if not last.path or not Path(last.path).exists():
-        emitter.log("Last output has no local file yet — wait for the download to finish.", level="warn")
+        emitter.emit(SystemNote("Last output has no local file yet — wait for the download to finish.", level="warn"))
         return
 
     sm = agent.session_manager
@@ -381,19 +381,19 @@ def _heart_last_artifact(agent: "OkonomiAgent", emitter: EventEmitter) -> None:
         (agent.state.info.session_id, last.url or "", last.path or ""),
     ).fetchone()
     if row is None:
-        emitter.log("Asset not yet indexed — try again in a moment.", level="warn")
+        emitter.emit(SystemNote("Asset not yet indexed — try again in a moment.", level="warn"))
         return
 
     sm.favorite(artifact_id=row["id"])
     src = Path(last.path).resolve()
     _symlink_into_loved(src, agent.state.info.session_id)
-    emitter.log(f"♥ {src.name}")
+    emitter.emit(SystemNote(f"♥ {src.name}"))
 
 
 def _heart_url(agent: "OkonomiAgent", emitter: EventEmitter, url: str) -> None:
     artifact_type = _guess_artifact_type(url)
     agent.session_manager.favorite(url=url, artifact_type=artifact_type)
-    emitter.log(f"♥ {url}  [{artifact_type}]")
+    emitter.emit(SystemNote(f"♥ {url}  [{artifact_type}]"))
 
 
 def _heart_local_path(agent: "OkonomiAgent", emitter: EventEmitter, path: Path) -> None:
@@ -401,7 +401,7 @@ def _heart_local_path(agent: "OkonomiAgent", emitter: EventEmitter, path: Path) 
     artifact_type = _guess_artifact_type(resolved.name)
     agent.session_manager.favorite(url=str(resolved), artifact_type=artifact_type)
     _symlink_into_loved(resolved, "local")
-    emitter.log(f"♥ {resolved.name}  [{artifact_type}]  ({resolved})")
+    emitter.emit(SystemNote(f"♥ {resolved.name}  [{artifact_type}]  ({resolved})"))
 
 
 # Filter aliases for `/loved <filter>`. Maps user-typed word → (kind, value)
@@ -429,7 +429,7 @@ def _list_loved(agent: "OkonomiAgent", emitter: EventEmitter, *, filter_arg: str
         match = _LOVED_FILTERS.get(filter_arg)
         if match is None:
             options = ", ".join(sorted(set(_LOVED_FILTERS.keys())))
-            emitter.log(f"Unknown filter {filter_arg!r}. Try: {options}", level="warn")
+            emitter.emit(SystemNote(f"Unknown filter {filter_arg!r}. Try: {options}", level="warn"))
             return
         kind, value = match
         if kind == "type":
@@ -443,7 +443,7 @@ def _list_loved(agent: "OkonomiAgent", emitter: EventEmitter, *, filter_arg: str
     )
     if not favs:
         msg = f"Nothing loved matching {filter_arg!r}." if filter_arg else "Nothing loved yet. Use /heart to start."
-        emitter.log(msg)
+        emitter.emit(SystemNote(msg))
         return
     lines = [f"Loved{label} ({len(favs)}) — browse in {_LOVED_DIR}:"]
     for f in favs:
@@ -457,4 +457,4 @@ def _list_loved(agent: "OkonomiAgent", emitter: EventEmitter, *, filter_arg: str
         if session:
             line += f"  · {session}"
         lines.append(line)
-    emitter.log("\n".join(lines))
+    emitter.emit(SystemNote("\n".join(lines)))
