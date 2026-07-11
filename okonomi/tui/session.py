@@ -18,7 +18,7 @@ from ..events import Banner, Divider, EventEmitter, SystemNote, ToolCall, UserMe
 from ..session import SessionStatus
 from ..utils import format_elapsed
 from .app import ReplApp
-from .asset_actions import handle_asset_action
+from .assets import handle_asset_action
 from .transcript import replay_history
 
 
@@ -177,6 +177,7 @@ class TuiSession:
         Intercepts slash commands before they reach the agent.
         """
         from . import commands
+        from .commands import Action
 
         self.emitter.emit(Divider())
         self.emitter.emit(UserMessage(text))
@@ -185,37 +186,30 @@ class TuiSession:
             result = commands.handle(text, self.agent, self.emitter)
             if result is None:
                 return  # handled locally, no agent turn
-            if result == "__exit__":
-                if self._app is not None:
-                    self._app.exit()
+            if result.action is Action.EXIT:
+                self._app.exit()
                 return
-            if result == "__session_picker__":
-                if self._app is not None:
-                    self._app.show_session_picker(self._resume_session)
+            if result.action is Action.SESSION_PICKER:
+                self._app.show_session_picker(self._resume_session)
                 return
-            if result == "__asset_picker__":
-                if self._app is not None:
-                    self._app.show_asset_picker(
-                        list(self.agent.state.artifacts),
-                        lambda action, paths: handle_asset_action(action, paths, self.agent, self.emitter),
-                    )
+            if result.action is Action.ASSET_PICKER:
+                self._app.show_asset_picker(
+                    list(self.agent.state.artifacts),
+                    lambda action, paths: handle_asset_action(action, paths, self.agent, self.emitter),
+                )
                 return
-            if result == "__verbose__":
-                toggle = getattr(self._app, "toggle_verbose", None)
-                if toggle is not None:
-                    toggle()
-                else:
-                    self.emitter.emit(SystemNote("`/verbose` is only available in the REPL.", level="warn"))
+            if result.action is Action.VERBOSE:
+                self._app.toggle_verbose()
                 return
-            if result.startswith("__bg__:"):
-                self._spawn_bg_task(result[len("__bg__:") :])
+            if result.action is Action.BG:
+                self._spawn_bg_task(result.payload)
                 return
-            if result.startswith("__btw__:"):
-                self._inject_side_question(result[len("__btw__:") :])
+            if result.action is Action.BTW:
+                self._inject_side_question(result.payload)
                 return
 
-            # Command returned follow-on text — forward to the agent.
-            text = result
+            # Action.FORWARD — send the command's payload to the agent.
+            text = result.payload
 
         self._submit(text)
 
