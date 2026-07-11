@@ -14,10 +14,11 @@ import time
 from concurrent.futures import TimeoutError as FutureTimeout
 
 from ..agent import OkonomiAgent
-from ..events import Banner, Divider, EventEmitter, SystemNote, ToolCall, UserMessage, replay_history
+from ..events import Banner, Divider, EventEmitter, SystemNote, ToolCall, UserMessage
 from ..session import SessionStatus
+from .app import ReplApp
 from .asset_actions import handle_asset_action
-from .repl.app import ReplApp
+from .transcript import replay_history
 
 
 class TuiSession:

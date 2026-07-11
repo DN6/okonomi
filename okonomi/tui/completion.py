@@ -4,8 +4,8 @@ from __future__ import annotations
 
 from prompt_toolkit.completion import Completer, Completion
 
-from ...utils import fuzzy_match
-from ..commands import SLASH_COMMANDS
+from ..utils import fuzzy_match
+from .commands import SLASH_COMMANDS
 
 
 class SlashCompleter(Completer):
