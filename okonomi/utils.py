@@ -145,6 +145,12 @@ def copy_to_clipboard(text: str) -> bool:
         return False
 
 
+def format_elapsed(seconds: float) -> str:
+    """Human elapsed time: ``"45s"`` under a minute, ``"1m 23s"`` above."""
+    m, s = divmod(int(seconds), 60)
+    return f"{m}m {s}s" if m else f"{s}s"
+
+
 def fuzzy_match(query: str, haystack: str) -> bool:
     """Subsequence match: every char of ``query`` appears in order in
     ``haystack``. Cheap, dependency-free, matches what cmd-K pickers do."""

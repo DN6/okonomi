@@ -1,23 +1,24 @@
-"""prompt_toolkit Style for the REPL — the okonomi palette.
+"""prompt_toolkit Style for the REPL, built from the shared palette.
 
-One source of truth for the chrome colors. The accent (pink) and amber are
-shared with the transcript's rich constants so the live region and scrollback
-read as one theme.
+Maps the okonomi palette (:mod:`okonomi.tui.palette`) onto prompt_toolkit
+style classes so the live input region reads as one theme with the rich
+transcript in scrollback.
 """
 
 from __future__ import annotations
 
 from prompt_toolkit.styles import Style
 
+from .palette import (
+    ACCENT as _ACCENT,
+    AMBER as _AMBER,
+    FAINT as _FAINT,
+    MUTED as _MUTED,
+    SURFACE as _SURFACE,
+    SURFACE_HI as _SURFACE_HI,
+    TEXT as _TEXT,
+)
 
-# Core palette — keep in sync with transcript.py's rich constants.
-_ACCENT = "#d787af"  # pink — prompt, spinner, selection
-_AMBER = "#ffaf00"  # approval / warnings
-_SURFACE = "#1a1a2e"  # toolbar / menu background (dark navy)
-_SURFACE_HI = "#2a2a45"  # highlighted row background
-_TEXT = "#c6c6d0"  # primary toolbar text
-_MUTED = "#6c6c80"  # metadata / separators
-_FAINT = "#3a3a4a"  # de-emphasized (background jobs)
 
 REPL_STYLE = Style.from_dict(
     {

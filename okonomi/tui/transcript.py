@@ -40,14 +40,12 @@ from ..events import (
     TurnEnd,
     UserMessage,
 )
+from ..utils import format_elapsed
+from .palette import ACCENT as _ACCENT, AMBER as _WARN, ERROR as _ERROR, MUTED as _RULE
 
 
 _ASSISTANT_STYLE = "color(110)"  # LLM gray
-_ACCENT = "#d787af"  # pink bullet
-_DIM = "dim"
-_WARN = "#ffaf00"
-_ERROR = "#ff5f5f"
-_RULE = "#6c6c80"  # muted rule — matches style.py class:rule
+_DIM = "dim"  # rich style keyword
 
 # Lines of tool output shown inline in compact mode before clamping.
 _OUTPUT_CLAMP = 10
@@ -259,9 +257,7 @@ class ReplTranscript:
         Ticks because the toolbar re-renders on refresh_interval."""
         if not self._running_since:
             return ""
-        secs = int(time.monotonic() - next(reversed(self._running_since.values())))
-        m, s = divmod(secs, 60)
-        return f"{m}m {s}s" if m else f"{s}s"
+        return format_elapsed(time.monotonic() - next(reversed(self._running_since.values())))
 
 
 # =============================================================================
