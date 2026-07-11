@@ -45,7 +45,7 @@ from prompt_toolkit.layout.menus import CompletionsMenu
 from prompt_toolkit.patch_stdout import patch_stdout
 from prompt_toolkit.widgets import Frame
 
-from ...events import EventEmitter, SystemNote, UserMessage
+from ..events import EventEmitter, SystemNote, UserMessage
 from .completion import SlashCompleter
 from .style import REPL_STYLE
 from .transcript import ReplTranscript

@@ -21,8 +21,8 @@ from prompt_toolkit.layout import HSplit, Layout, Window
 from prompt_toolkit.layout.controls import BufferControl, FormattedTextControl
 from prompt_toolkit.output.defaults import create_output
 
-from ...session import SessionManager
-from ...utils import fuzzy_match
+from ..session import SessionManager
+from ..utils import fuzzy_match
 from .style import REPL_STYLE
 
 

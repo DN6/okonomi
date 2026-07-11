@@ -90,7 +90,7 @@ async def _run_single_task(agent: OkonomiAgent, user_message: str) -> None:
     """Run a single task without interactive input."""
     import signal
 
-    from .tui.repl.transcript import ReplTranscript
+    from .tui.transcript import ReplTranscript
 
     transcript = ReplTranscript(tool_detail="full" if agent.verbose else "compact")
     agent.emitter.subscribe(transcript.on_event)
