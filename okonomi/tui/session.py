@@ -16,6 +16,7 @@ from concurrent.futures import TimeoutError as FutureTimeout
 from ..agent import OkonomiAgent
 from ..events import Banner, Divider, EventEmitter, SystemNote, ToolCall, UserMessage
 from ..session import SessionStatus
+from ..utils import format_elapsed
 from .app import ReplApp
 from .asset_actions import handle_asset_action
 from .transcript import replay_history
@@ -70,11 +71,11 @@ class TuiSession:
         self._app = ReplApp(
             self.emitter,
             on_submit=self._on_submit,
+            on_interrupt=self._handle_interrupt,
             spinner_label_fn=self._spinner_label,
             usage_fn=self._usage_label,
             bg_tasks_fn=self._bg_tasks_list,
         )
-        self._app.session = self  # type: ignore[attr-defined]
 
     # --- Agent worker ---
 
@@ -157,6 +158,15 @@ class TuiSession:
                 task.cancel()
 
         self._loop.call_soon_threadsafe(_do_cancel)
+
+    def _handle_interrupt(self) -> bool:
+        """Ctrl+C hook for ReplApp: cancel the in-flight turn if one is
+        running. Returns True if a turn was cancelled, False if idle (the
+        app then clears the draft)."""
+        if self._agent_running:
+            self.cancel_current_turn()
+            return True
+        return False
 
     # --- Submit / approval / bg-exec hooks ---
 
@@ -366,8 +376,6 @@ class TuiSession:
         )
         self._submit(msg)
 
-    # --- Entry points ---
-
     # --- Status-bar callables passed to ReplApp ---
 
     def _spinner_label(self) -> str:
@@ -381,10 +389,7 @@ class TuiSession:
             return ""
         if self._turn_started_at is None:
             return txt
-        elapsed = int(time.monotonic() - self._turn_started_at)
-        m, s = divmod(elapsed, 60)
-        stamp = f"{m}m {s}s" if m else f"{s}s"
-        return f"{txt}  ({stamp})"
+        return f"{txt}  ({format_elapsed(time.monotonic() - self._turn_started_at)})"
 
     def _usage_label(self) -> str:
         usage = self.agent.state.info.tokens

@@ -60,17 +60,20 @@ class ReplApp:
         self,
         emitter: EventEmitter,
         on_submit: Callable[[str], None],
+        on_interrupt: Callable[[], bool] | None = None,
         spinner_label_fn: Callable[[], str] | None = None,
         usage_fn: Callable[[], str] | None = None,
         bg_tasks_fn: Callable[[], list] | None = None,
     ) -> None:
         self.emitter = emitter
         self.on_submit_cb = on_submit
+        # Ctrl+C hook: return True if a running turn was cancelled, False if
+        # there was nothing to interrupt (so the app clears the draft instead).
+        self.on_interrupt_cb = on_interrupt
         self.spinner_label_fn = spinner_label_fn
         self.usage_fn = usage_fn
         self.bg_tasks_fn = bg_tasks_fn
 
-        self.session = None  # back-ref to TuiSession, set after construction
         self.transcript = ReplTranscript()
         self._loop: asyncio.AbstractEventLoop | None = None
         self._exit = False
@@ -240,7 +243,7 @@ class ReplApp:
 
     # --- main loop ---
 
-    async def run_async(self, **_ignored) -> None:
+    async def run_async(self) -> None:
         self._loop = asyncio.get_running_loop()
         with patch_stdout(raw=True):  # pass rich's ANSI/OSC escapes through unescaped
             unsub = self.emitter.subscribe(self.transcript.on_event)
@@ -282,10 +285,8 @@ class ReplApp:
             self._invalidate()
             self._safe_resolve(resolver, False)
             return
-        sess = self.session
-        if sess is not None and getattr(sess, "_agent_running", False):
-            sess.cancel_current_turn()
-            return
+        if self.on_interrupt_cb is not None and self.on_interrupt_cb():
+            return  # a running turn was cancelled
         self.input.reset()
 
     # --- inline approval (runs on the main loop via call_from_thread) ---
