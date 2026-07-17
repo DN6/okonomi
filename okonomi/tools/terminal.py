@@ -235,6 +235,7 @@ class TerminalTools(ToolMetadataMixin):
         # inside `bash()`. Snapshotting via "".join(chunks) is what makes
         # /logs term-N show output while the command is still running.
         chunks: list[str] = []
+
         def _snapshot() -> str:
             joined = "".join(chunks)
             # Strip the internal cwd marker bash() appends to detect cwd
