@@ -22,13 +22,14 @@ from pathlib import Path
 
 import yaml
 
+from okonomi.constants import OKONOMI_SKILLS_DIR
 from okonomi.tools._metadata import ToolMetadataMixin
 
 
 logger = logging.getLogger(__name__)
 
 BUNDLED_SKILLS_DIR = Path(__file__).parent.parent / "skills"
-USER_SKILLS_DIR = Path(os.getenv("OKONOMI_HOME", Path.home() / ".okonomi")) / "skills"
+USER_SKILLS_DIR = OKONOMI_SKILLS_DIR
 
 MAX_NAME_LENGTH = 64
 MAX_DESCRIPTION_LENGTH = 1024

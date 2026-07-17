@@ -93,7 +93,7 @@ def generate_session_title(messages: list, model: str = TITLE_MODEL) -> str:
     return title
 
 
-def _maybe_update_session_title_async(session_manager, session_id: str, messages: list) -> None:
+def _maybe_update_session_title_async(session, messages: list) -> None:
     """Fire-and-forget: regenerate the title and persist it (without renaming
     the session directory) in a daemon thread, so a turn never blocks on the
     LLM call. Silently no-ops on any failure."""
@@ -105,7 +105,7 @@ def _maybe_update_session_title_async(session_manager, session_id: str, messages
         if not title:
             return
         try:
-            session_manager.update_title(session_id, title)
+            session.set_title(title)
         except Exception:
             logger.debug("Failed to persist auto-title", exc_info=True)
 

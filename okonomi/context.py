@@ -6,7 +6,6 @@ intact.
 """
 
 import logging
-import re
 
 from pydantic_ai.messages import (
     ModelMessage,
@@ -18,7 +17,7 @@ from pydantic_ai.messages import (
     UserPromptPart,
 )
 
-from .events import SystemNote
+from .events import SystemNote, _strip_base64, _strip_large_content
 from .utils import create_chat_client
 
 
@@ -38,23 +37,35 @@ _TRUNCATE_AT_CHARS = 3000  # per-part cap in serialization for summarizer
 _PRUNED_PLACEHOLDER = "[Old tool output cleared to save context space]"
 _IMAGE_PART_TOKEN_ESTIMATE = 1500  # flat per-image charge; vision bills 1.5–3K
 
-_BASE64_PATTERN = re.compile(r"data:image/[^;]+;base64,[A-Za-z0-9+/=]{100,}")
-_HTML_PREFIX_PATTERN = re.compile(r"^\s*(<(!DOCTYPE|html)\b)", re.IGNORECASE)
 
+def strip_unanswered_tool_calls(messages: list[ModelMessage]) -> list[ModelMessage]:
+    """Remove trailing messages with unprocessed tool calls.
 
-def _strip_base64(text: str) -> str:
-    def _replace(m):
-        kb = len(m.group(0)) * 3 // 4 // 1024
-        return f"[embedded image, ~{kb}KB]"
+    After cancellation the history may end with a ModelResponse containing
+    ToolCallParts that were never answered with ToolReturnParts.  Passing
+    such history back to the model triggers:
+      "Cannot provide a new user prompt when the message history
+       contains unprocessed tool calls."
 
-    return _BASE64_PATTERN.sub(_replace, text)
-
-
-def _strip_large_content(text: str) -> str:
-    text = _strip_base64(text)
-    if len(text) > 500 and _HTML_PREFIX_PATTERN.match(text):
-        return f"[HTML content, {len(text)} chars — saved to file]"
-    return text
+    We walk backwards and strip any trailing ModelResponse that has tool
+    calls, plus any ModelRequest that only contains tool returns (since
+    those are orphaned without their preceding response).
+    """
+    trimmed = list(messages)
+    while trimmed:
+        last = trimmed[-1]
+        if isinstance(last, ModelResponse):
+            has_tool_calls = any(isinstance(p, ToolCallPart) for p in last.parts)
+            if has_tool_calls:
+                trimmed.pop()
+                continue
+        if isinstance(last, ModelRequest):
+            only_tool_returns = all(isinstance(p, ToolReturnPart) for p in last.parts)
+            if only_tool_returns:
+                trimmed.pop()
+                continue
+        break
+    return trimmed
 
 
 def _content_chars(content) -> int:
@@ -207,50 +218,6 @@ class ContextManager:
             else:
                 print(f"\033[33m{msg}\033[0m")
         return compressed
-
-    def generate_steps_summary(self, messages: list[ModelMessage]) -> str:
-        """Short LLM summary of session actions for saved metadata."""
-        if not messages:
-            return ""
-        prompt = (
-            "Summarize this image/video generation session in 2-4 sentences. "
-            "Focus on tools used, key prompts, iterations, and final outcomes.\n\n"
-            f"Conversation:\n{_serialize_for_summary(messages)}"
-        )
-        return self._chat(prompt, max_tokens=256)
-
-    def build_resume_context(
-        self,
-        session_id: str,
-        task: str,
-        steps_summary: str,
-        artifacts: list | None = None,
-    ) -> list[ModelMessage]:
-        """Synthesize a single resume message for sessions without messages.jsonl."""
-        parts = [f"[Resumed session {session_id[:8]}]", f"\nPrevious task: {task}"]
-        if steps_summary:
-            parts.append(f"\n## Summary of previous work\n{steps_summary}")
-        if artifacts:
-            media_types = {"image", "video", "audio", "3d"}
-            media = [a for a in artifacts if a.artifact_type in media_types]
-            other = [a for a in artifacts if a.artifact_type not in media_types]
-            if media:
-                parts.append("\n## Generated media")
-                for i, a in enumerate(media, 1):
-                    line = f"{i}. {a.artifact_type}: {a.path or a.url}"
-                    if a.prompt:
-                        line += f"\n   Prompt: {a.prompt}"
-                    if a.tool_name:
-                        line += f"\n   Tool: {a.tool_name}"
-                    parts.append(line)
-            if other:
-                parts.append("\n## Artifacts")
-                for a in other:
-                    line = f"- [{a.artifact_type}] {a.path or a.url}"
-                    if a.description:
-                        line += f": {a.description}"
-                    parts.append(line)
-        return [ModelRequest(parts=[UserPromptPart(content="\n".join(parts))])]
 
     # ------------------------------------------------------------------
     # Internals

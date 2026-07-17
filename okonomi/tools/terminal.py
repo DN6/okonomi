@@ -227,8 +227,8 @@ class TerminalTools(ToolMetadataMixin):
 
         Returns immediately. The thread runs the same code path as a
         synchronous ``run()`` (capturing output, exit code, cwd update)
-        and fires ``self._on_bg_complete`` when done so the TUI can
-        inject a system note for the next agent turn.
+        and fires ``self._on_bg_complete`` when done (the agent wires it
+        to emit a ``JobFinished`` event; subscribers react from there).
         """
         task_id = f"term-{next(_bg_counter)}"
         # Live chunks list — populated incrementally by the drain thread

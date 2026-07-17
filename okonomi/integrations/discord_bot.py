@@ -18,7 +18,6 @@ from discord import app_commands
 
 from ..agent import OkonomiAgent
 from ..config import load_env_or_die
-from ..session import SessionManager
 
 
 logger = logging.getLogger(__name__)
@@ -30,9 +29,8 @@ DISCORD_MAX_FILE_SIZE = 25 * 1024 * 1024
 class AgentSession:
     """Wraps an OkonomiAgent for a single Discord conversation context."""
 
-    def __init__(self, session_manager: SessionManager):
+    def __init__(self):
         self.agent = OkonomiAgent()
-        self.agent.session_manager = session_manager
         self.lock = asyncio.Lock()
         self._prev_output_count = 0
 
@@ -55,7 +53,6 @@ class OkonomiBot(discord.Client):
         intents.guild_messages = True
         super().__init__(intents=intents)
 
-        self.session_manager = SessionManager()
         self.tree = app_commands.CommandTree(self)
         self._sessions: dict[str, AgentSession] = {}
         self._allowed_users: set[int] = set()
@@ -92,7 +89,7 @@ class OkonomiBot(discord.Client):
 
     def _get_session(self, key: str) -> AgentSession:
         if key not in self._sessions:
-            self._sessions[key] = AgentSession(self.session_manager)
+            self._sessions[key] = AgentSession()
         return self._sessions[key]
 
     def _setup_commands(self) -> None:
@@ -121,10 +118,10 @@ class OkonomiBot(discord.Client):
                 await interaction.response.send_message("No active session.", ephemeral=True)
                 return
             agent = session.agent
-            usage = agent.state.info.tokens
+            usage = agent.session.tokens
             lines = [
-                f"**Session:** `{agent.state.info.session_id[:8]}`",
-                f"**Task:** {agent.state.info.task_input or 'N/A'}",
+                f"**Session:** `{agent.session.session_id[:8]}`",
+                f"**Task:** {agent.session.task_input or 'N/A'}",
                 f"**Artifacts:** {len(agent.state.artifacts)}",
                 f"**Tokens:** {usage.total_tokens:,} ({usage.requests} requests)",
             ]

@@ -12,6 +12,7 @@ import sys
 from typing import TYPE_CHECKING
 
 from ..events import EventEmitter, SystemNote
+from ..session import favorite
 from ..utils import copy_to_clipboard
 
 
@@ -70,7 +71,7 @@ def _heart_paths(paths: list[str], agent: "OkonomiAgent", emitter: EventEmitter)
         if artifact is None:
             continue
         try:
-            agent.session_manager.favorite(
+            favorite(
                 url=artifact.url or artifact.path or "",
                 artifact_type=artifact.artifact_type or "",
             )

@@ -1,12 +1,12 @@
 """Pydantic AI-based agent for Okonomi with code execution.
 
 This module provides the OkonomiAgent class that uses Pydantic AI for LLM
-interactions, along with its dependency container (``AgentDependencies``)
-and asset-download helpers. The class is assembled from focused modules:
-the turn loop and event wiring live here; code execution (``execution``)
-is a mixin; session persistence (``persistence``) is a composed
-``SessionStore``; system-prompt construction (``prompt``), provider glue
-(``provider``), tool wrappers (``wrappers``), and image-reference parsing
+interactions, along with its runtime state (``OkonomiState``), dependency
+container (``AgentDependencies``) and asset-download helpers. The class
+is assembled from focused modules: the turn loop, event wiring, and
+session save/load live here; code execution (``execution``) is a mixin;
+system-prompt construction (``prompt``), provider glue (``provider``),
+tool wrappers (``wrappers``), and image-reference parsing
 (``multimodal``) are plain modules.
 """
 
@@ -14,8 +14,10 @@ import asyncio
 import contextlib
 import inspect
 import json
+import pickle
 import threading
 import time
+import types
 from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import dataclass, field
 from datetime import datetime
@@ -28,17 +30,22 @@ from pydantic_ai import Agent
 from pydantic_ai.messages import ModelResponse, ToolCallPart
 from pydantic_ai.models.openrouter import OpenRouterModelSettings
 
-from ..context import _CHARS_PER_TOKEN, ContextManager, count_tokens
-from ..events import AssistantStream, EventEmitter, SystemNote, ToolCall, TurnEnd, TurnStart
-from ..session import (
-    Artifact,
-    OkonomiState,
-    SessionInfo,
-    SessionManager,
-    SessionStatus,
-    asset_subdir_for_file,
-    new_session_id,
+from ..context import _CHARS_PER_TOKEN, ContextManager, count_tokens, strip_unanswered_tool_calls
+from ..events import (
+    ApprovalRequest,
+    AssistantStream,
+    Event,
+    EventEmitter,
+    Interrupt,
+    JobFinished,
+    JobStarted,
+    StatusChanged,
+    SystemNote,
+    ToolCallDisplay,
+    TurnEnd,
+    TurnStart,
 )
+from ..session import Artifact, Session, SessionStatus, asset_subdir_for_file
 from ..tools import (
     AgentTools,
     BrowserRendererTools,
@@ -51,23 +58,46 @@ from ..tools import (
 )
 from .execution import CodeExecutionMixin
 from .multimodal import _parse_user_message
-from .persistence import SessionStore, strip_unanswered_tool_calls
 from .prompt import build_system_prompt
 from .provider import CachedOpenRouterModel
 from .wrappers import _short_repr
 
 
 @dataclass
+class OkonomiState:
+    """The live, mutable conversation state — the session's body,
+    attached as ``Session.state`` by the agent.
+
+    The persistent fields are written out by ``Session.save``; the
+    non-persistent ones are rebuilt on resume.
+    """
+
+    # ── persistent — written out on every save ───────────────────────────
+    # Append-only audit log: every message ever produced this session.
+    # Persisted as event rows (the new tail appended each save).
+    # Compression never touches it.
+    message_history: list[Any] = field(default_factory=list)
+    artifacts: list[Artifact] = field(default_factory=list)
+    # REPL state across execute_code turns (model-bound locals).
+    # Persisted best-effort to globals.pkl (picklable values only).
+    execution_globals: dict[str, Any] = field(default_factory=dict)
+
+    # ── non-persistent — recomputed on resume ────────────────────────────
+    # Working set sent to the LLM each turn. Sanitized and compressed
+    # as needed; recomputed from message_history on resume.
+    context: list[Any] = field(default_factory=list)
+
+
+@dataclass
 class AgentDependencies:
     """Dependencies injected into pydantic-ai tool calls and execute_code.
 
-    Holds a reference to the live ``OkonomiState`` so tool wrappers can
-    record artifacts and tool usage in one place, plus the session
-    manager (for path resolution) and the eager-download hook.
+    Holds a reference to the live ``Session`` — its attached state is
+    where tool wrappers record artifacts, and ``session.session_dir``
+    resolves paths — plus the eager-download hook.
     """
 
-    state: OkonomiState
-    session_manager: SessionManager
+    session: Session
     tools: dict[str, Any] = field(default_factory=dict)
     verbose: bool = False
     # Fired from add_artifact so the agent can kick off an eager
@@ -75,19 +105,19 @@ class AgentDependencies:
     # Signature: (artifact: Artifact) -> None, must not raise.
     on_artifact_added: Any | None = None
 
+    @property
+    def state(self) -> OkonomiState:
+        return self.session.state
+
     def add_artifact(self, artifact: Artifact) -> None:
         """Track an artifact (AI-generated media OR locally-written file).
 
-        Stamps a timestamp if missing, records the producing tool name,
-        and fires the eager-download hook for artifacts with a remote
-        ``url``.
+        Stamps a timestamp if missing and fires the eager-download hook
+        for artifacts with a remote ``url``.
         """
         if not artifact.timestamp:
             artifact.timestamp = datetime.now().isoformat()
         self.state.artifacts.append(artifact)
-
-        if artifact.tool_name:
-            self.state.tools_used.add(artifact.tool_name)
 
         if self.on_artifact_added is not None:
             try:
@@ -182,15 +212,13 @@ class OkonomiAgent(CodeExecutionMixin):
         model_id: str = "anthropic/claude-sonnet-4-5",
         timeout: float = 600.0,
         compress_at_tokens: int = 170_000,
-        storage_dir: Path | None = None,
         session_id: str | None = None,
         verbose: bool = False,
     ):
         self.model_id = model_id
         self.timeout = timeout
         self.compress_at_tokens = compress_at_tokens
-        self.session_manager = SessionManager(storage_dir=storage_dir)
-        self.state = OkonomiState(info=SessionInfo(session_id=session_id or new_session_id(), model=model_id))
+        self.session = Session(session_id or "", model=model_id, state=OkonomiState())
         self.verbose = verbose
         self._setup_tools()
 
@@ -209,20 +237,13 @@ class OkonomiAgent(CodeExecutionMixin):
             model_id=model_id,
             compress_at_tokens=compress_at_tokens,
         )
-        # Session persistence, composed rather than inherited — owns no
-        # agent state; the live state is passed per save/load call.
-        self.store = SessionStore(
-            self.session_manager,
-            self.context_manager,
-            tool_namespaces=set(self.programmatic_tools),
-        )
-        self.spinner_text: str = ""
+        self._spinner_text: str = ""
 
-        # Approval callback for expensive operations.
-        # Signature: async (code: str) -> bool | str
-        # Returns True to proceed, False to skip, or a string with revised code.
-        # If None, all code runs without approval.
-        self.approval_callback: Any = None
+        # When True, expensive code (see _expensive_patterns) suspends on
+        # an ApprovalRequest event until a subscriber answers via its
+        # ``respond`` handle. When False (default — headless/one-shot
+        # runs), everything executes without gating.
+        self.approvals_enabled: bool = False
         self.auto_approve: bool = False
 
         self._expensive_patterns = [
@@ -255,6 +276,11 @@ class OkonomiAgent(CodeExecutionMixin):
         # ``emitter.history()`` and nothing is rendered.
         self.emitter = EventEmitter()
         self._turn_count = 0
+        # Stream-event persistence cursors: system notes are flushed from
+        # the emitter's history at save (everything past this index);
+        # interrupts queue here until the next save.
+        self._persisted_note_count = 0
+        self._pending_stream_events: list[Event] = []
         # Let context compression surface its user-facing warning through the
         # same event pipe instead of a raw print (built before the emitter).
         self.context_manager.emitter = self.emitter
@@ -262,16 +288,10 @@ class OkonomiAgent(CodeExecutionMixin):
         # Tracks the ToolCall event for the in-flight execute_code so we can
         # attach its output/error back to the UI when the tool returns.
         self._pending_tool_calls: list[Any] = []
-        # Optional notification hook invoked from the bg-exec coroutine when a
-        # background code block finishes. Signature:
-        #   on_bg_complete(*, bg_id, error, output,
-        #                  new_outputs, new_artifacts,
-        #                  produced_outputs, produced_artifacts)
-        # produced_outputs/artifacts are the *actual* objects appended by
-        # this bg run (sliced from ctx.deps.* between before/after) so the
-        # callback can reference them by URL/path instead of asking the
-        # agent to scan session-wide state.
-        self.on_bg_complete: Any = None
+        # Background-job completions surface as JobFinished events on the
+        # emitter (see _job_finished) — subscribers react (e.g. the TUI
+        # injects a follow-up turn); nothing polls or registers callbacks.
+        self.terminal._on_bg_complete = self._job_finished
 
         # Skill creation nudge: after N tool-calling turns without skill
         # management, append a reminder to consider saving as a skill.
@@ -279,6 +299,67 @@ class OkonomiAgent(CodeExecutionMixin):
         self._skill_nudge_interval = 10
 
         self.agent = self._create_agent()
+
+    @property
+    def state(self) -> OkonomiState:
+        """The live conversation state — owned by ``self.session``."""
+        return self.session.state
+
+    @property
+    def spinner_text(self) -> str:
+        """Current working-state label. Assignments emit ``StatusChanged``
+        so subscribers get pushed the change; the attribute remains
+        readable for pull-style status bars."""
+        return self._spinner_text
+
+    @spinner_text.setter
+    def spinner_text(self, value: str) -> None:
+        if value == self._spinner_text:
+            return
+        self._spinner_text = value
+        emitter = getattr(self, "emitter", None)
+        if emitter is not None:
+            emitter.emit(StatusChanged(value))
+
+    async def _request_approval(self, code: str) -> bool | str:
+        """Emit an ``ApprovalRequest`` and suspend until a subscriber
+        answers via its ``respond`` handle (thread-safe, one-shot)."""
+        loop = asyncio.get_running_loop()
+        fut: asyncio.Future[bool | str] = loop.create_future()
+
+        def respond(decision: bool | str) -> None:
+            def _resolve() -> None:
+                if not fut.done():
+                    fut.set_result(decision)
+
+            loop.call_soon_threadsafe(_resolve)
+
+        self.emitter.emit(ApprovalRequest(code=code, respond=respond))
+        return await fut
+
+    def _job_finished(
+        self,
+        *,
+        bg_id: str,
+        error: str | None = None,
+        output: str | None = None,
+        new_artifacts: int = 0,
+        produced_artifacts: list | None = None,
+    ) -> None:
+        """Emit ``JobFinished`` for a completed background job (bg-exec
+        blocks and term commands both route here)."""
+        refs = [
+            {"artifact_type": a.artifact_type, "path": a.path, "url": a.url}
+            for a in produced_artifacts or []
+        ]
+        self.emitter.emit(JobFinished(
+            job_id=bg_id,
+            status="error" if error else "ok",
+            error=error,
+            output=output,
+            new_artifacts=new_artifacts,
+            artifact_refs=refs,
+        ))
 
     def reload(self) -> dict[str, int]:
         """Re-read skills from disk and rebuild the pydantic-ai Agent so
@@ -354,7 +435,6 @@ class OkonomiAgent(CodeExecutionMixin):
         return build_system_prompt(
             skills=self.skills,
             programmatic_tools=self.programmatic_tools,
-            session_manager=self.session_manager,
         )
 
     # Per-HTTP-request timeout for the OpenRouter client. Safety belt
@@ -454,21 +534,20 @@ class OkonomiAgent(CodeExecutionMixin):
 
     def _get_dependencies(self) -> AgentDependencies:
         return AgentDependencies(
-            state=self.state,
-            session_manager=self.session_manager,
+            session=self.session,
             tools=self.programmatic_tools,
             verbose=self.verbose,
             on_artifact_added=self._eager_download_artifact,
         )
 
-    def _register_bg_log(self, *, task_id: str, label: str, reader) -> None:
-        """Called by sub-tools (TerminalTools, AgentTools) when a bg job
-        starts. Records the job in the shared log registry so /jobs and
-        /logs <id> see it alongside the bg-exec-N execute_code path.
+    def _register_bg_log(self, *, task_id: str, label: str, reader, kind: str | None = None) -> None:
+        """Called when any bg job starts (bg-exec blocks, term commands,
+        launched agents, /bg tasks). Records the job in the shared log
+        registry so /jobs and /logs <id> see it.
 
-        Kind is inferred from the task_id prefix so /jobs renders the
-        right column without needing each call site to thread it through."""
-        prefix = task_id.split("-", 1)[0] if "-" in task_id else "task"
+        Kind defaults to the task_id prefix so /jobs renders the right
+        column without each call site threading it through."""
+        prefix = kind or (task_id.split("-", 1)[0] if "-" in task_id else "task")
         self._bg_logs[task_id] = {
             "kind": prefix,
             "label": label,
@@ -477,6 +556,7 @@ class OkonomiAgent(CodeExecutionMixin):
             "status": "running",
             "_reader": reader,
         }
+        self.emitter.emit(JobStarted(job_id=task_id, kind=prefix, label=label))
 
     def _mark_bg_log_done(self, *, task_id: str, status: str) -> None:
         """Called when a registered bg job (term-N) finishes."""
@@ -498,7 +578,7 @@ class OkonomiAgent(CodeExecutionMixin):
         downloads and prior sweeps are skipped). Returns the number added.
         """
         try:
-            session_dir = deps.session_manager.session_dir(deps.state.info.session_id)
+            session_dir = deps.session.session_dir
         except Exception:
             return 0
         if not session_dir.exists():
@@ -530,11 +610,17 @@ class OkonomiAgent(CodeExecutionMixin):
             if resolved in tracked:
                 continue
             tracked.add(resolved)
+            # Locally-written files carry no generation prompt, so stamp a
+            # cheap description at sweep time — filename + current task —
+            # or they'd be findable only by path substring.
+            task = deps.session.task_input
+            description = f"{p.name} — written during: {task[:200]}" if task else p.name
             deps.add_artifact(
                 Artifact(
                     artifact_type=artifact_type,
                     path=str(p),
                     tool_name=tool_name,
+                    description=description,
                     timestamp=datetime.now().isoformat(),
                 )
             )
@@ -554,7 +640,7 @@ class OkonomiAgent(CodeExecutionMixin):
 
         def _run() -> None:
             try:
-                session_dir = self.session_manager.session_dir(self.state.info.session_id)
+                session_dir = self.session.session_dir
                 session_dir.mkdir(parents=True, exist_ok=True)
                 local_path = download_asset(artifact.url, session_dir, artifact.artifact_type)
                 artifact.path = local_path
@@ -569,7 +655,7 @@ class OkonomiAgent(CodeExecutionMixin):
             _run()
 
     def _accumulate_usage(self, agent_run) -> None:
-        """Fold one ``agent_run`` worth of usage + cost into ``self.state.info.tokens``.
+        """Fold one ``agent_run`` worth of usage + cost into ``self.session.tokens``.
 
         Tokens: pydantic-ai's ``RunUsage.input_tokens`` is already the
         non-cached prompt count (cache hits/writes are reported
@@ -587,13 +673,8 @@ class OkonomiAgent(CodeExecutionMixin):
         usage = agent_run.usage()
         details = getattr(usage, "details", {}) or {}
         reasoning = int(details.get("reasoning_tokens") or details.get("output_reasoning_tokens") or 0)
-        # Back-compat: older pydantic-ai exposed request_tokens/response_tokens.
-        in_toks = getattr(usage, "input_tokens", None)
-        if in_toks is None:
-            in_toks = getattr(usage, "request_tokens", 0)
-        out_toks = getattr(usage, "output_tokens", None)
-        if out_toks is None:
-            out_toks = getattr(usage, "response_tokens", 0)
+        in_toks = usage.input_tokens or 0
+        out_toks = usage.output_tokens or 0
 
         cost = 0.0
         try:
@@ -605,7 +686,7 @@ class OkonomiAgent(CodeExecutionMixin):
         except Exception:
             pass
 
-        self.state.info.record_usage(
+        self.session.record_usage(
             input_tokens=in_toks or 0,
             output_tokens=out_toks or 0,
             requests=getattr(usage, "requests", 0) or 1,
@@ -650,12 +731,12 @@ class OkonomiAgent(CodeExecutionMixin):
             code = self._extract_code(part)
             if not code:
                 return
-            needs_approval = self.approval_callback is not None and any(p in code for p in self._expensive_patterns)
+            needs_approval = self.approvals_enabled and any(p in code for p in self._expensive_patterns)
             line_count = code.count("\n") + 1
             # Approval-gated code is expanded by default so the user can
             # read what they're about to authorize without hitting Ctrl+O.
             ev = self.emitter.emit(
-                ToolCall(
+                ToolCallDisplay(
                     "execute_code",
                     args=f"{line_count} lines",
                     details=code,
@@ -671,10 +752,10 @@ class OkonomiAgent(CodeExecutionMixin):
                 except json.JSONDecodeError:
                     pass
             name = args.get("name", args) if isinstance(args, dict) else args
-            ev = self.emitter.emit(ToolCall("load_skill", args=str(name), details=str(args), tool_call_id=call_id))
+            ev = self.emitter.emit(ToolCallDisplay("load_skill", args=str(name), details=str(args), tool_call_id=call_id))
         else:
             args_str = str(part.args) if part.args else ""
-            ev = self.emitter.emit(ToolCall(part.tool_name, args=args_str, details=args_str, tool_call_id=call_id))
+            ev = self.emitter.emit(ToolCallDisplay(part.tool_name, args=args_str, details=args_str, tool_call_id=call_id))
         self._pending_tool_calls.append(ev)
 
     async def run_async(self, user_message: str, reset: bool = False) -> str:
@@ -685,7 +766,7 @@ class OkonomiAgent(CodeExecutionMixin):
         same path as user-initiated cancel.
         """
         if reset:
-            self.state = OkonomiState(info=SessionInfo(session_id=self.state.info.session_id, model=self.model_id))
+            self.session = Session(self.session.session_id, model=self.model_id, state=OkonomiState())
 
         self._turn_count += 1
         turn = self._turn_count
@@ -698,7 +779,7 @@ class OkonomiAgent(CodeExecutionMixin):
         # "Approve all" applies to this turn only — a new user message
         # implicitly resets it.
         self.auto_approve = False
-        self.state.info.task_input = user_message
+        self.session.task_input = user_message
         deps = self._get_dependencies()
 
         if self.state.context:
@@ -755,7 +836,7 @@ class OkonomiAgent(CodeExecutionMixin):
 
             messages = result.all_messages()
             self._commit_turn(agent_run, deps, messages)
-            self._update_skill_nudge(messages, deps)
+            self._update_skill_nudge(messages)
             return result.output
 
         except Exception as e:
@@ -772,6 +853,7 @@ class OkonomiAgent(CodeExecutionMixin):
         """Commit partial state and surface a timeout note. Caller decides
         whether to re-raise CancelledError or return an empty string."""
         self._was_interrupted = True
+        self._pending_stream_events.append(Interrupt("timeout" if timed_out else "cancelled"))
         self._commit_turn(agent_run, deps, strip_unanswered_tool_calls(agent_run.all_messages()))
         if timed_out:
             self.emitter.emit(
@@ -818,23 +900,26 @@ class OkonomiAgent(CodeExecutionMixin):
         try:
             ctx_toks = count_tokens(self.state.context)
             system_toks = len(self._get_system_prompt()) // _CHARS_PER_TOKEN
-            self.state.info.tokens.context_tokens = ctx_toks + system_toks
+            self.session.tokens.context_tokens = ctx_toks + system_toks
         except Exception:
             pass
 
-    def _update_skill_nudge(self, messages: list, deps: AgentDependencies) -> None:
+    def _update_skill_nudge(self, messages: list) -> None:
         """Track tool-heavy turns so the periodic 'save as a skill' nudge
         fires at the right cadence."""
-        used_skill_manage = any(
-            isinstance(part, ToolCallPart)
-            and part.tool_name in ("create_skill", "write_skill_file", "patch_skill_file")
+        tool_calls = [
+            part
             for msg in messages
             if isinstance(msg, ModelResponse)
             for part in msg.parts
+            if isinstance(part, ToolCallPart)
+        ]
+        used_skill_manage = any(
+            part.tool_name in ("create_skill", "write_skill_file", "patch_skill_file") for part in tool_calls
         )
         if used_skill_manage:
             self._turns_since_skill = 0
-        elif deps.state.tools_used:
+        elif tool_calls:
             self._turns_since_skill += 1
 
     def run(self, user_message: str, reset: bool = False) -> str:
@@ -853,25 +938,151 @@ class OkonomiAgent(CodeExecutionMixin):
         self,
         status: SessionStatus = "completed",
         download_assets: bool = True,
-        skip_summary: bool = False,
     ) -> None:
-        """Persist the current state via the composed ``SessionStore``.
-        See :meth:`SessionStore.save` for parameter semantics."""
-        self.store.save(
-            self.state,
-            model_id=self.model_id,
-            status=status,
-            download_assets=download_assets,
-            skip_summary=skip_summary,
-        )
+        """Persist the live state.
+
+        Args:
+            status: Status of the session (completed, error, abandoned)
+            download_assets: When True (default), synchronously download
+                any tracked outputs that don't yet have a ``local_path``.
+                Set False on shutdown / atexit paths so quitting doesn't
+                wait on slow network downloads — the eager bg pool has
+                been pulling these all along, and any still-missing files
+                will be retried on the next session resume.
+        """
+        session = self.session
+
+        if download_assets:
+            download_session_assets(session.state.artifacts, session.session_dir)
+
+        # Stamp the run-owned fields onto the live session; identity
+        # fields (title / created_at) are write-once at the
+        # DB layer, so this is a plain write.
+        session.status = status
+        session.model = self.model_id
+
+        session.save()
+        self._flush_stream_events()
+        self._serialize_user_globals()
+
+        # Titles are generated out-of-band by a small model, fire-and-forget,
+        # so the agent never blocks on (or owns) titling. Refresh on every
+        # completed turn so the title tracks the whole conversation.
+        if status == "completed" and session.state.message_history:
+            from ..utils import _maybe_update_session_title_async
+
+            _maybe_update_session_title_async(session, session.state.message_history)
 
     def load_session(self, session_id: str) -> bool:
         """Load a saved session and install it as the live state.
 
-        Returns True if the session was loaded successfully. See
-        :meth:`SessionStore.load` for what restoration involves."""
-        state = self.store.load(session_id)
-        if state is None:
+        Restores the full message history so the model sees its prior
+        tool calls, intermediate reasoning, and produced artifacts
+        directly. The next-turn ``run_async`` already runs prune +
+        compress on the restored history, so oversized sessions get
+        trimmed there instead of being stripped here.
+
+        Returns True if the session was loaded successfully.
+        """
+        session = Session.load(session_id)
+        if session is None:
             return False
-        self.state = state
+        state = OkonomiState(
+            message_history=session.load_messages(),
+            artifacts=session.load_artifacts(),
+        )
+        session.state = state
+
+        # Raw log restored as-is (append-only audit record). Working set
+        # is a sanitized view — strip orphan tool calls at the tail from
+        # an interrupted save. Compression on the working set fires on
+        # the next turn if oversized.
+        state.context = strip_unanswered_tool_calls(list(state.message_history))
+        self.session = session
+        # Notes emitted before the switch belong to the previous session.
+        self._persisted_note_count = len(self.emitter.history())
+        self._pending_stream_events = []
+
+        # Restore Python locals the model bound during the prior session.
+        # Tool wrappers / helpers are re-injected on the next execute_code
+        # call, so we only need user-bound vars here.
+        self._restore_user_globals()
         return True
+
+    def _flush_stream_events(self) -> None:
+        """Persist stream events accumulated since the last save: system
+        notes gathered from the emitter, plus pending interrupts."""
+        history = self.emitter.history()
+        notes = [ev for ev in history[self._persisted_note_count:] if isinstance(ev, SystemNote)]
+        self._persisted_note_count = len(history)
+        pending, self._pending_stream_events = self._pending_stream_events, []
+        if notes or pending:
+            self.session.append_stream_events([*notes, *pending])
+
+    def _serialize_user_globals(self) -> None:
+        """Save picklable user-bound variables from ``execution_globals`` to
+        ``<session_dir>/globals.pkl``. Tool wrappers, modules, functions,
+        and anything that fails to pickle are silently skipped — the goal
+        is to recover the most-used patterns (URLs, paths, lists of
+        descriptions, intermediate dicts), not arbitrary live objects.
+        """
+        state = self.state
+        if not state.execution_globals:
+            return
+
+        SKIP_KEYS = {"__builtins__", "asyncio", "get_session_dir"}
+        SKIP_KEYS |= set(self.programmatic_tools)  # tool wrappers
+
+        candidates: dict[str, Any] = {}
+        for key, value in state.execution_globals.items():
+            if key in SKIP_KEYS or key.startswith("__"):
+                continue
+            if isinstance(value, (types.ModuleType, types.FunctionType, types.BuiltinFunctionType)):
+                continue
+            # ToolWrappers and Tool instances both carry _tool_instance
+            # or _set_deps — drop anything that smells tool-ish.
+            if hasattr(value, "_tool_instance") or hasattr(value, "_set_deps"):
+                continue
+            candidates[key] = value
+
+        if not candidates:
+            return
+
+        try:
+            session_dir = self.session.session_dir
+            session_dir.mkdir(parents=True, exist_ok=True)
+            path = session_dir / "globals.pkl"
+            try:
+                with open(path, "wb") as f:
+                    pickle.dump(candidates, f, protocol=pickle.HIGHEST_PROTOCOL)
+                return
+            except Exception:
+                pass
+            # One of the values is unpicklable — fall back to per-key.
+            clean: dict[str, Any] = {}
+            for key, value in candidates.items():
+                try:
+                    pickle.dumps(value)
+                except Exception:
+                    continue
+                clean[key] = value
+            with open(path, "wb") as f:
+                pickle.dump(clean, f, protocol=pickle.HIGHEST_PROTOCOL)
+        except Exception:
+            pass
+
+    def _restore_user_globals(self) -> None:
+        """Counterpart to ``_serialize_user_globals``. Reads
+        ``<session_dir>/globals.pkl`` if present and merges into
+        ``state.execution_globals``. Tool wrappers + helpers will be
+        reinstalled on the next ``execute_code`` call."""
+        try:
+            globals_path = self.session.session_dir / "globals.pkl"
+            if not globals_path.exists():
+                return
+            with open(globals_path, "rb") as f:
+                snapshot = pickle.load(f)
+            if isinstance(snapshot, dict):
+                self.state.execution_globals.update(snapshot)
+        except Exception:
+            pass

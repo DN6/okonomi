@@ -222,7 +222,7 @@ class GenmediaTools(ToolMetadataMixin):
         # Auto-track every URL the endpoint returned. Without deps
         # (e.g. unit-test invocation) this is a no-op.
         if self._deps is not None:
-            prompt = str(arguments.get("prompt", ""))[:500]
+            prompt = str(arguments.get("prompt", ""))
             for url, asset_type in _walk_urls(payload):
                 self._deps.add_artifact(
                     Artifact(
