@@ -1,34 +1,50 @@
-"""Session storage. SQLite is the single source of truth for metadata
-and artifacts; ``messages.jsonl`` (per-session) is the only on-disk
-sidecar — it holds the conversation transcript, which is large,
-append-friendly, and never queried.
+"""Session storage. SQLite is the single source of truth for everything:
+metadata, the event stream (conversation messages + system events), and
+artifacts. ``globals.pkl`` (binary, non-searchable) is the only remaining
+per-session file besides ``assets/``; a session can be dumped to JSONL
+with ``scripts/export_session.py``.
 
-``SessionInfo`` mirrors the sessions table 1:1 — pure metadata +
-accounting (an embedded ``TokenTracker``). Index reads
-(``list_sessions`` / ``search_sessions`` / ``resolve_session`` /
-``get_info``) return ``SessionInfo``. ``load_session`` returns the full
-``OkonomiState`` (info + artifacts + message history); ``save_session``
-persists one back.
+``Session`` is one sessions-table row that knows how to persist itself:
+metadata + accounting (an embedded ``TokenTracker``) plus the attached
+conversation body (``state``). ``save`` appends new events; resume reads
+the active conversation rows back. ``session_dir`` (assets + globals.pkl)
+is ``constants.OKONOMI_SESSIONS_DIR/<session_id>``, a pure function of
+the id, never renamed.
+
+Cross-session reads span all sessions, so they live as module-level
+functions (``list_sessions`` / ``search`` / ``resolve_session`` /
+``prune_empty_sessions`` / favorites), all sharing the store's cached
+connection via ``db.connection``.
 """
 
 from __future__ import annotations
 
 import json
-import re
 import shutil
 import uuid
 from dataclasses import asdict, dataclass, field, fields
 from datetime import datetime, timedelta
 from pathlib import Path
-from typing import Any, Literal
+from typing import TYPE_CHECKING, Any, Literal
+
+
+if TYPE_CHECKING:
+    from .agent.agent import OkonomiState
 
 
 SessionStatus = Literal["in_progress", "completed", "interrupted", "error", "abandoned"]
 
-from . import db as _db
-
-
-_DEFAULT_STORAGE_DIR = Path.home() / ".okonomi" / "sessions"
+from . import db
+from .constants import OKONOMI_SESSIONS_DIR
+from .events import (
+    CONVERSATION_TYPES,
+    Event,
+    EventType,
+    classify_message,
+    event_to_payload,
+    extract_content,
+    message_accounting,
+)
 
 
 @dataclass
@@ -87,14 +103,6 @@ _ASSET_EXTENSIONS = {
 }
 
 
-def _slugify(text: str, max_len: int = 50) -> str:
-    text = text.lower().strip()
-    text = re.sub(r"[^\w\s-]", "", text)
-    text = re.sub(r"[\s_]+", "-", text)
-    text = re.sub(r"-+", "-", text).strip("-")
-    return text[:max_len].rstrip("-")
-
-
 def asset_subdir_for_file(filename: str) -> str:
     ext = Path(filename).suffix.lower()
     for subdir, extensions in _ASSET_EXTENSIONS.items():
@@ -136,33 +144,90 @@ class Artifact:
 
 
 @dataclass
-class SessionInfo:
-    """Sessions table row 1:1 — pure metadata + accounting.
+class Session:
+    """One sessions-table row that knows how to persist itself.
 
-    Returned by index reads (``list_sessions`` / ``search_sessions`` /
-    ``resolve_session`` / ``get_info``) and composed into
-    :class:`OkonomiState` as the "permanent" half. The conversation body
-    (``artifacts`` / ``message_history``) lives on ``OkonomiState``, not
-    here. Token/cost accounting rides along as an embedded
-    :class:`TokenTracker`, flattened to columns only at the DB boundary.
+    Holds identity, display metadata, lifecycle, accounting (an embedded
+    :class:`TokenTracker`, flattened to columns only at the DB boundary),
+    and the conversation body as an attached :class:`OkonomiState`.
+    ``save`` persists the metadata plus ``state``'s persistent fields;
+    reads via :meth:`load` / :meth:`_from_row` return metadata with an
+    empty state — callers populate it with ``load_messages`` /
+    ``load_artifacts`` when they need the body.
+
+    ``title`` is display-only and owned by the title path (the
+    out-of-band titler and ``/title`` → :meth:`set_title`); ``save``
+    never writes it after the first insert, so a stale live object can't
+    clobber a concurrent retitle.
     """
 
-    session_id: str
+    session_id: str = ""  # generated in __post_init__ when empty
     parent_session_id: str | None = None  # set on sub-agent forks / compression splits
     # Display
     title: str = ""
     task_input: str = ""
-    dir_name: str = ""
     # Lifecycle
     status: SessionStatus = "completed"
     created_at: str = ""
     updated_at: str = ""
-    # Aggregates
-    num_artifacts: int = 0
     model: str = ""  # primary LLM model id (the agent's brain)
-    steps_summary: str = ""
     # Accounting — token counts + actual USD cost, summed across the run
     tokens: TokenTracker = field(default_factory=TokenTracker)
+    # The conversation body (messages, artifacts, execution globals,
+    # working set). Forward-referenced so this module never imports the
+    # agent package at runtime; the agent attaches it, and metadata-only
+    # reads (``load`` / ``_from_row``) leave it None.
+    state: "OkonomiState" = None
+
+    def __post_init__(self) -> None:
+        if not self.session_id:
+            self.session_id = new_session_id()
+
+    @property
+    def session_dir(self) -> Path:
+        """This session's folder (globals.pkl, assets/) —
+        a pure function of the id, never renamed."""
+        return OKONOMI_SESSIONS_DIR / self.session_id
+
+    # ── lookup ───────────────────────────────────────────────────────────
+
+    @classmethod
+    def load(cls, session_id: str) -> "Session | None":
+        """Metadata-only read: one row → :class:`Session`. No artifacts,
+        no events — use ``load_artifacts`` / ``load_messages`` for the
+        body."""
+        row = db.fetch_session(db.connection(), session_id)
+        return cls._from_row(row) if row else None
+
+    @classmethod
+    def _from_row(cls, row: dict[str, Any]) -> "Session":
+        """Build a Session from a DB row dict, folding the flat token
+        columns back into an embedded TokenTracker."""
+        g = row.get
+        in_toks = int(g("input_tokens") or 0)
+        out_toks = int(g("output_tokens") or 0)
+        return cls(
+            session_id=g("session_id") or "",
+            parent_session_id=g("parent_session_id"),
+            title=g("title") or "",
+            task_input=g("task_input") or "",
+            status=g("status") or "completed",
+            created_at=g("created_at") or "",
+            updated_at=g("updated_at") or "",
+            model=g("model") or "",
+            tokens=TokenTracker(
+                input_tokens=in_toks,
+                output_tokens=out_toks,
+                total_tokens=in_toks + out_toks,
+                cache_read_tokens=int(g("cache_read_tokens") or 0),
+                cache_write_tokens=int(g("cache_write_tokens") or 0),
+                reasoning_tokens=int(g("reasoning_tokens") or 0),
+                requests=int(g("requests") or 0),
+                cost_usd=float(g("cost_usd") or 0.0),
+            ),
+        )
+
+    # ── views ────────────────────────────────────────────────────────────
 
     @property
     def display_name(self) -> str:
@@ -182,11 +247,9 @@ class SessionInfo:
             "parent_session_id": self.parent_session_id,
             "title": self.title,
             "task_input": self.task_input,
-            "dir_name": self.dir_name,
             "status": self.status,
             "created_at": self.created_at,
             "updated_at": self.updated_at,
-            "num_artifacts": self.num_artifacts,
             "model": self.model,
             "input_tokens": t.input_tokens,
             "output_tokens": t.output_tokens,
@@ -195,335 +258,329 @@ class SessionInfo:
             "reasoning_tokens": t.reasoning_tokens,
             "requests": t.requests,
             "cost_usd": t.cost_usd or None,
-            "steps_summary": self.steps_summary,
         }
 
+    # ── persistence ──────────────────────────────────────────────────────
 
-@dataclass
-class OkonomiState:
-    """The live, mutable state the agent reads/writes every turn.
+    def save(self) -> None:
+        """Persist this session in one transaction: the metadata row, the
+        *new tail* of the conversation as event rows (the log grows by the
+        delta — never rewrites), and artifacts. Identity fields
+        (title / created_at) are write-once at the DB layer, so no
+        read-modify-write is needed."""
+        if not self.created_at:
+            self.created_at = datetime.now().isoformat()
+        self.updated_at = datetime.now().isoformat()
 
-    Single source of truth for a running session. Holds permanent data
-    (``info`` — identity, task, accounting, persisted metadata; plus the
-    ``message_history`` / ``artifacts`` body) alongside ephemeral runtime
-    (``context``, ``tools_used``, ``execution_globals``).
-    ``SessionManager.save_session`` writes this out;
-    ``SessionManager.load_session`` reconstructs it on resume.
-    """
+        self.session_dir.mkdir(parents=True, exist_ok=True)
+        (self.session_dir / "assets").mkdir(exist_ok=True)
 
-    # Permanent metadata + accounting (identity, task, tokens, …).
-    # Mirrors one sessions-table row; persisted as-is by SessionManager.
-    info: SessionInfo
-    # Append-only audit log: every message ever produced this session.
-    # Persisted to messages.jsonl. Compression never touches it.
-    message_history: list[Any] = field(default_factory=list)
-    # Working set sent to the LLM each turn. Sanitized and compressed
-    # as needed. Not persisted separately — recomputed from
-    # message_history on resume.
-    context: list[Any] = field(default_factory=list)
-    artifacts: list[Artifact] = field(default_factory=list)
-    tools_used: set[str] = field(default_factory=set)
-    # REPL state across execute_code turns (model-bound locals).
-    execution_globals: dict[str, Any] = field(default_factory=dict)
+        conn = db.connection()
+        with db.transaction(conn):
+            db.upsert_session(conn, self.metadata_dict())
+            self._sync_conversation(conn)
+            db.replace_artifacts(conn, self.session_id, [a.to_dict() for a in self.state.artifacts])
 
+    def _sync_conversation(self, conn) -> None:
+        """Append the new tail of ``state.message_history`` as event rows.
+        A live history *shorter* than the persisted active prefix means a
+        rewind (``/clear``): the old events are flagged inactive — kept in
+        the DAG, invisible to resume and search — then the history is
+        re-appended from scratch."""
+        history = self.state.message_history
+        persisted = db.count_events(conn, self.session_id, types=CONVERSATION_TYPES)
+        if persisted > len(history):
+            db.deactivate_events(conn, self.session_id)
+            persisted = 0
+        new = history[persisted:]
+        if new:
+            db.append_events(conn, self.session_id, [_message_row(m) for m in new])
 
-class SessionManager:
-    """Thin façade over the SQLite store + ``messages.jsonl`` sidecar.
-
-    Index reads (``list_sessions`` / ``search_sessions`` /
-    ``resolve_session`` / ``get_info``) return :class:`SessionInfo`
-    (metadata only). ``load_session`` returns a full :class:`OkonomiState`
-    (info + artifacts + message history); ``save_session`` persists one.
-    """
-
-    def __init__(self, storage_dir: Path | None = None):
-        self.storage_dir = Path(storage_dir) if storage_dir else _DEFAULT_STORAGE_DIR
-        self.storage_dir.mkdir(parents=True, exist_ok=True)
-        self._db = _db.open_db(self.storage_dir / _db.DB_FILENAME)
-
-    # ── creation ─────────────────────────────────────────────────────────
-
-    def create_session(self, task_input: str) -> OkonomiState:
-        now = datetime.now().isoformat()
-        return OkonomiState(
-            info=SessionInfo(
-                session_id=new_session_id(),
-                task_input=task_input,
-                status="in_progress",
-                created_at=now,
-                updated_at=now,
-            )
-        )
-
-    # ── reads ────────────────────────────────────────────────────────────
-
-    def list_sessions(self, *, limit: int | None = None, status: str | None = None) -> list[SessionInfo]:
-        return [_info_from_row(r) for r in _db.list_sessions(self._db, status=status, limit=limit)]
-
-    def search_sessions(self, query: str, *, limit: int | None = None) -> list[SessionInfo]:
-        return [_info_from_row(r) for r in _db.search_sessions_fts(self._db, query, limit=limit or 50)]
-
-    def search_artifacts(
-        self, query: str, *, artifact_type: str | None = None, limit: int = 50
-    ) -> list[dict[str, Any]]:
-        return _db.search_artifacts_fts(self._db, query, artifact_type=artifact_type, limit=limit)
-
-    def get_artifacts(self, session_id: str) -> list[Artifact]:
-        return [Artifact.from_dict(r) for r in _db.fetch_artifacts(self._db, session_id)]
-
-    def resolve_session(self, query: str) -> SessionInfo | None:
-        """Match free-form input to a session. Tries exact id, id prefix,
-        title substring, then BM25 FTS. First hit wins."""
-        q = query.strip()
-        if not q:
-            return None
-
-        if row := _db.fetch_session(self._db, q):
-            return _info_from_row(row)
-
-        row = self._db.execute(
-            "SELECT * FROM sessions WHERE session_id LIKE ? OR LOWER(title) LIKE LOWER(?) "
-            "ORDER BY updated_at DESC LIMIT 1",
-            (q + "%", f"%{q}%"),
-        ).fetchone()
-        if row:
-            return _info_from_row(dict(row))
-
-        hits = _db.search_sessions_fts(self._db, q, limit=1)
-        return _info_from_row(hits[0]) if hits else None
-
-    def get_info(self, session_id: str) -> SessionInfo | None:
-        """Metadata-only read: one row → :class:`SessionInfo`. No artifacts,
-        no ``messages.jsonl``. For callers that just need title / status /
-        token totals without paying for the body."""
-        row = _db.fetch_session(self._db, session_id)
-        return _info_from_row(row) if row else None
-
-    def load_session(self, session_id: str) -> OkonomiState | None:
-        """Full load: metadata row + artifacts + message history → a fresh
-        :class:`OkonomiState`. ``context`` and ``execution_globals`` are
-        left empty for the agent to populate on resume."""
-        row = _db.fetch_session(self._db, session_id)
-        if row is None:
-            return None
-        info = _info_from_row(row)
-        artifacts = [Artifact.from_dict(r) for r in _db.fetch_artifacts(self._db, session_id)]
-        info.num_artifacts = len(artifacts)
-
-        message_history: list[Any] = []
-        dir_name = row.get("dir_name") or session_id
-        messages_file = self.storage_dir / dir_name / "messages.jsonl"
-        try:
-            raw = [json.loads(line) for line in messages_file.read_text().splitlines() if line.strip()]
-            from pydantic_ai.messages import ModelMessagesTypeAdapter
-
-            message_history = list(ModelMessagesTypeAdapter.validate_python(raw))
-        except Exception:
-            message_history = []
-
-        return OkonomiState(info=info, message_history=message_history, artifacts=artifacts)
-
-    # ── writes ───────────────────────────────────────────────────────────
-
-    def save_session(self, state: OkonomiState) -> None:
-        """Persist ``state``: metadata + artifacts to SQLite, transcript to
-        ``messages.jsonl``.
-
-        Identity-shaping fields are preserved across saves: the
-        out-of-band ``title``, the original ``dir_name`` and ``created_at``
-        are carried forward from the existing row so mid-session title
-        regen never relocates the directory or resets creation time.
-        """
-        info = state.info
-
-        existing = _db.fetch_session(self._db, info.session_id)
-        if existing:
-            info.title = existing.get("title") or info.title
-            info.created_at = existing.get("created_at") or info.created_at
-            if existing.get("dir_name"):
-                info.dir_name = existing["dir_name"]
-        if not info.created_at:
-            info.created_at = datetime.now().isoformat()
-        if not info.dir_name:
-            info.dir_name = _derive_dir_name(info.session_id, info.title)
-
-        info.updated_at = datetime.now().isoformat()
-        info.num_artifacts = len(state.artifacts)
-
-        session_dir = self.storage_dir / info.dir_name
-        session_dir.mkdir(parents=True, exist_ok=True)
-        (session_dir / "assets").mkdir(exist_ok=True)
-
-        if state.message_history:
-            from pydantic_ai.messages import ModelMessagesTypeAdapter
-
-            serialized = json.loads(ModelMessagesTypeAdapter.dump_json(state.message_history))
-            with open(session_dir / "messages.jsonl", "w") as f:
-                for msg in serialized:
-                    f.write(json.dumps(msg, ensure_ascii=False) + "\n")
-
-        with _db.transaction(self._db):
-            _db.upsert_session(self._db, info.metadata_dict())
-            _db.replace_artifacts(self._db, info.session_id, [a.to_dict() for a in state.artifacts])
-
-        # Titles are generated out-of-band by a small model, fire-and-forget,
-        # so the agent never blocks on (or owns) titling. Refresh on every
-        # completed turn so the title tracks the whole conversation.
-        if info.status == "completed" and state.message_history:
-            from .utils import _maybe_update_session_title_async
-
-            _maybe_update_session_title_async(self, info.session_id, state.message_history)
-
-    def update_title(self, session_id: str, title: str) -> bool:
-        """Update only the stored title, preserving the existing dir_name (no
-        directory rename). Used by the out-of-band titler."""
-        row = _db.fetch_session(self._db, session_id)
-        if row is None:
-            return False
-        with _db.transaction(self._db):
-            _db.update_session_title(self._db, session_id, title, row.get("dir_name") or session_id)
-        return True
-
-    def set_title(self, session_id: str, title: str) -> bool:
-        """Set a title and rename the session directory accordingly."""
-        row = _db.fetch_session(self._db, session_id)
-        if row is None:
-            return False
-        old_dir = self.storage_dir / (row.get("dir_name") or session_id)
-        new_dir_name = _derive_dir_name(session_id, title)
-        new_dir = self.storage_dir / new_dir_name
-        if new_dir.exists() and new_dir != old_dir:
-            return False
-        if old_dir.exists() and old_dir != new_dir:
-            old_dir.rename(new_dir)
-
-        with _db.transaction(self._db):
-            _db.update_session_title(self._db, session_id, title, new_dir_name)
-        return True
-
-    # ── delete / prune ───────────────────────────────────────────────────
-
-    def delete_session(self, session_id: str) -> bool:
-        row = _db.fetch_session(self._db, session_id)
-        session_dir = self.storage_dir / ((row or {}).get("dir_name") or session_id)
-        if row is None and not session_dir.exists():
-            return False
-        shutil.rmtree(session_dir, ignore_errors=True)
-        with _db.transaction(self._db):
-            _db.delete_session(self._db, session_id)
-        return True
-
-    def prune_empty_sessions(self, *, min_age_hours: int = 24) -> int:
-        """Delete sessions with no artifacts.
-
-        Truly empty rows (no task_input, no title) go regardless of age —
-        they never got past the prompt. Rows with content but no
-        artifacts get ``min_age_hours`` of grace so an in-flight
-        generation isn't killed.
-        """
-        cutoff = (datetime.now() - timedelta(hours=min_age_hours)).isoformat()
-        rows = self._db.execute(
-            "SELECT session_id, dir_name FROM sessions WHERE num_artifacts = 0 "
-            "AND ((task_input = '' AND title = '') OR created_at < ?)",
-            (cutoff,),
-        ).fetchall()
+    def append_stream_events(self, events: list[Event]) -> None:
+        """Persist non-conversation events (system notes, titles,
+        interrupts) onto this session's stream."""
+        rows = [_event_row(ev) for ev in events]
         if not rows:
-            return 0
+            return
+        conn = db.connection()
+        with db.transaction(conn):
+            db.append_events(conn, self.session_id, rows)
 
-        with _db.transaction(self._db):
-            for r in rows:
-                shutil.rmtree(self.storage_dir / (r["dir_name"] or r["session_id"]), ignore_errors=True)
-                _db.delete_session(self._db, r["session_id"])
-        return len(rows)
+    def rewind(self) -> int:
+        """Flag every event inactive — history preserved in the DAG,
+        invisible to resume and search. Returns the number rewound."""
+        conn = db.connection()
+        with db.transaction(conn):
+            return db.deactivate_events(conn, self.session_id)
 
-    # ── favorites ────────────────────────────────────────────────────────
+    def load_messages(self, *, around_event_id: int | None = None, window: int = 5) -> list[Any]:
+        """The active conversation, rebuilt from event rows through the
+        pydantic-ai adapter. With ``around_event_id``, only the ±``window``
+        slice — for quoting a past moment without loading the transcript."""
+        from pydantic_ai.messages import ModelMessagesTypeAdapter
 
-    def favorite(
-        self,
-        *,
-        artifact_id: int | None = None,
-        url: str = "",
-        artifact_type: str = "",
-    ) -> int:
-        """Heart an asset — internal (``artifact_id``) or external (``url``,
-        which accepts URLs or bare local paths). Idempotent; returns the
-        favorite row id."""
-        with _db.transaction(self._db):
-            return _db.add_favorite(
-                self._db,
-                artifact_id=artifact_id,
-                url=url,
-                artifact_type=artifact_type,
+        conn = db.connection()
+        if around_event_id is not None:
+            rows = db.fetch_events_window(
+                conn, self.session_id, around_event_id, window, types=CONVERSATION_TYPES
             )
+        else:
+            rows = db.fetch_events(conn, self.session_id, types=CONVERSATION_TYPES)
+        try:
+            raw = [json.loads(r["payload"]) for r in rows]
+            return list(ModelMessagesTypeAdapter.validate_python(raw))
+        except Exception:
+            return []
 
-    def unfavorite(self, favorite_id: int) -> bool:
-        with _db.transaction(self._db):
-            return _db.remove_favorite(self._db, favorite_id)
+    def load_artifacts(self) -> list[Artifact]:
+        return [Artifact.from_dict(r) for r in db.fetch_artifacts(db.connection(), self.session_id)]
 
-    def list_favorites(
-        self,
-        *,
-        artifact_type: str | None = None,
-        artifact_source: str | None = None,
-        limit: int | None = None,
-    ) -> list[dict[str, Any]]:
-        """Newest-first favorites joined with artifact + session context.
+    def artifact_id(self, *, url: str = "", path: str = "") -> int | None:
+        """Row id of this session's artifact matching ``url`` or ``path``,
+        or None if not yet indexed."""
+        return db.find_artifact_id(db.connection(), self.session_id, url=url, path=path)
 
-        Returns plain dicts (not Artifact) since each row carries
-        cross-session fields (``session_id``, ``session_title``,
-        ``favorited_at``, ``note``) that don't fit the Artifact dataclass.
-        """
-        return _db.list_favorites(
-            self._db,
-            artifact_type=artifact_type,
-            artifact_source=artifact_source,
-            limit=limit,
-        )
+    # ── title / delete ───────────────────────────────────────────────────
 
-    # ── paths ────────────────────────────────────────────────────────────
+    def set_title(self, title: str) -> bool:
+        """Set the display title (never touches the session folder) and
+        record the retitle as a ``title`` event in the stream."""
+        from .events import Title
 
-    def session_dir(self, session_id: str) -> Path:
-        row = _db.fetch_session(self._db, session_id)
-        name = (row or {}).get("dir_name") or session_id
-        return self.storage_dir / name
+        conn = db.connection()
+        if db.fetch_session(conn, self.session_id) is None:
+            return False
+        with db.transaction(conn):
+            db.update_session_title(conn, self.session_id, title)
+            db.append_events(conn, self.session_id, [_event_row(Title(title))])
+        self.title = title
+        return True
+
+    def delete(self) -> bool:
+        conn = db.connection()
+        row = db.fetch_session(conn, self.session_id)
+        if row is None and not self.session_dir.exists():
+            return False
+        shutil.rmtree(self.session_dir, ignore_errors=True)
+        with db.transaction(conn):
+            db.delete_session(conn, self.session_id)
+        return True
 
 
-def _info_from_row(row: dict[str, Any]) -> SessionInfo:
-    """Build a SessionInfo from a DB row dict, folding the flat token
-    columns back into an embedded TokenTracker."""
-    g = row.get
-    in_toks = int(g("input_tokens") or 0)
-    out_toks = int(g("output_tokens") or 0)
-    return SessionInfo(
-        session_id=g("session_id") or "",
-        parent_session_id=g("parent_session_id"),
-        title=g("title") or "",
-        task_input=g("task_input") or "",
-        dir_name=g("dir_name") or "",
-        status=g("status") or "completed",
-        created_at=g("created_at") or "",
-        updated_at=g("updated_at") or "",
-        num_artifacts=int(g("num_artifacts") or 0),
-        model=g("model") or "",
-        steps_summary=g("steps_summary") or "",
-        tokens=TokenTracker(
-            input_tokens=in_toks,
-            output_tokens=out_toks,
-            total_tokens=in_toks + out_toks,
-            cache_read_tokens=int(g("cache_read_tokens") or 0),
-            cache_write_tokens=int(g("cache_write_tokens") or 0),
-            reasoning_tokens=int(g("reasoning_tokens") or 0),
-            requests=int(g("requests") or 0),
-            cost_usd=float(g("cost_usd") or 0.0),
-        ),
+# ── event-row builders ───────────────────────────────────────────────────
+
+
+def _message_row(message: Any) -> dict[str, Any]:
+    """Event row for one pydantic-ai message: whole message as payload,
+    semantic type from its part composition, extracted text for FTS, and
+    per-message accounting on model responses."""
+    from pydantic_ai.messages import ModelMessagesTypeAdapter
+
+    payload = json.loads(ModelMessagesTypeAdapter.dump_json([message]))[0]
+    ts = getattr(message, "timestamp", None)
+    if ts is None and getattr(message, "parts", None):
+        ts = getattr(message.parts[0], "timestamp", None)
+    row: dict[str, Any] = {
+        "type": classify_message(message),
+        "payload": json.dumps(payload, ensure_ascii=False),
+        "content": extract_content(message),
+        "timestamp": ts.isoformat() if ts is not None else datetime.now().isoformat(),
+    }
+    accounting = message_accounting(message)
+    if accounting:
+        row.update(accounting)
+    return row
+
+
+def _event_row(event: Event) -> dict[str, Any]:
+    """Event row for a persistable stream event (system note / title /
+    interrupt): the typed object's dict as payload, its user-facing text
+    as searchable content."""
+    payload = event_to_payload(event)
+    content = payload.get("text") or payload.get("title") or payload.get("reason") or ""
+    return {
+        "type": EventType(event.type),
+        "payload": json.dumps(payload, ensure_ascii=False),
+        "content": str(content),
+        "timestamp": datetime.now().isoformat(),
+    }
+
+
+# ── cross-session reads ──────────────────────────────────────────────────
+
+
+def list_sessions(*, limit: int | None = None, status: str | None = None) -> list[Session]:
+    rows = db.list_sessions(db.connection(), status=status, limit=limit)
+    return [Session._from_row(r) for r in rows]
+
+
+def search_sessions(query: str, *, limit: int = 50) -> list[dict[str, Any]]:
+    """BM25-ranked FTS5 hits as lean dicts (session_id, title, truncated
+    task_input, score, …). Drill into one with ``Session.load``."""
+    return db.search_sessions_fts(db.connection(), query, limit=limit)
+
+
+def search_artifacts(query: str, *, artifact_type: str | None = None, limit: int = 50) -> list[dict[str, Any]]:
+    return db.search_artifacts_fts(db.connection(), query, artifact_type=artifact_type, limit=limit)
+
+
+def search_events(
+    query: str,
+    *,
+    types: tuple[EventType, ...] = (EventType.USER_MESSAGE, EventType.ASSISTANT_MESSAGE),
+    limit: int = 20,
+) -> list[dict[str, Any]]:
+    """Conversation-content hits with highlighted snippets. Defaults to
+    what the user and assistant actually said; tool activity and system
+    notes are opt-in via ``types``."""
+    return db.search_events_fts(db.connection(), query, types=types, limit=limit)
+
+
+def search(query: str, *, limit: int = 20) -> list[dict[str, Any]]:
+    """One query over everything: conversation content, session
+    titles/tasks, and artifacts, interleaved by BM25 (ascending — FTS
+    scores are negative-better; LIKE-fallback artifact hits score 0.0 and
+    sort last). Every hit carries enough to act on without a second
+    lookup: ``source`` (event | session | artifact), ``session_id``,
+    ``session_title``, and the event_id / artifact_id / path / url /
+    snippet that pins the thing itself."""
+    hits: list[dict[str, Any]] = []
+    for h in search_events(query, limit=limit):
+        hits.append({
+            "source": "event",
+            "session_id": h["session_id"],
+            "session_title": h.get("session_title") or "",
+            "event_id": h["event_id"],
+            "snippet": h.get("snippet") or "",
+            "timestamp": h.get("timestamp") or "",
+            "score": h.get("score") or 0.0,
+        })
+    for h in search_sessions(query, limit=limit):
+        hits.append({
+            "source": "session",
+            "session_id": h["session_id"],
+            "session_title": h.get("title") or "",
+            "snippet": h.get("task_input") or "",
+            "num_artifacts": h.get("num_artifacts") or 0,
+            "timestamp": h.get("created_at") or "",
+            "score": h.get("score") or 0.0,
+        })
+    for h in search_artifacts(query, limit=limit):
+        hits.append({
+            "source": "artifact",
+            "session_id": h["session_id"],
+            "session_title": h.get("title") or "",
+            "artifact_id": h.get("artifact_id"),
+            "artifact_type": h.get("artifact_type") or "",
+            "path": h.get("path") or "",
+            "url": h.get("url") or "",
+            "snippet": h.get("prompt") or h.get("description") or "",
+            "timestamp": h.get("created_at") or "",
+            "score": h.get("score") or 0.0,
+        })
+    hits.sort(key=lambda h: h["score"])
+    return hits[:limit]
+
+
+def read_window(session_id: str, around_event_id: int, *, window: int = 5) -> list[dict[str, Any]]:
+    """Lean conversation rows around one event — for scrolling from a
+    search hit without loading payloads."""
+    rows = db.fetch_events_window(
+        db.connection(), session_id, around_event_id, window, types=CONVERSATION_TYPES
     )
+    return [_lean_event(r) for r in rows]
 
 
-def _derive_dir_name(session_id: str, title: str = "") -> str:
-    if not title:
-        return session_id
-    slug = _slugify(title)
-    if not slug:
-        return session_id
-    date_part = session_id[:10] if len(session_id) > 10 else f"{datetime.now():%Y-%m-%d}"
-    return f"{date_part}_{slug}"
+def _lean_event(r: dict[str, Any]) -> dict[str, Any]:
+    return {"event_id": r["event_id"], "type": r["type"], "content": r["content"], "timestamp": r["timestamp"]}
+
+
+def session_bookends(session_id: str, *, first_n: int = 3, last_n: int = 3) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    """First/last user+assistant exchanges of a session — the goal and
+    the resolution, as lean dicts with ``content`` text."""
+    first, last = db.fetch_bookends(
+        db.connection(),
+        session_id,
+        first_n=first_n,
+        last_n=last_n,
+        types=(EventType.USER_MESSAGE, EventType.ASSISTANT_MESSAGE),
+    )
+    return [_lean_event(r) for r in first], [_lean_event(r) for r in last]
+
+
+def resolve_session(query: str) -> Session | None:
+    """Match free-form input to a session. Tries exact id, id prefix,
+    title substring, then BM25 FTS. First hit wins."""
+    q = query.strip()
+    if not q:
+        return None
+
+    conn = db.connection()
+
+    if row := db.fetch_session(conn, q):
+        return Session._from_row(row)
+
+    if row := db.resolve_session_loose(conn, q):
+        return Session._from_row(row)
+
+    hits = db.search_sessions_fts(conn, q, limit=1)
+    return Session.load(hits[0]["session_id"]) if hits else None
+
+
+def prune_empty_sessions(*, min_age_hours: int = 24) -> int:
+    """Delete sessions with no artifacts.
+
+    Truly empty rows (no task_input, no title) go regardless of age —
+    they never got past the prompt. Rows with content but no
+    artifacts get ``min_age_hours`` of grace so an in-flight
+    generation isn't killed.
+    """
+    conn = db.connection()
+    cutoff = (datetime.now() - timedelta(hours=min_age_hours)).isoformat()
+    rows = db.find_prunable_sessions(conn, cutoff)
+    if not rows:
+        return 0
+
+    with db.transaction(conn):
+        for r in rows:
+            shutil.rmtree(OKONOMI_SESSIONS_DIR / r["session_id"], ignore_errors=True)
+            db.delete_session(conn, r["session_id"])
+    return len(rows)
+
+
+# ── favorites ────────────────────────────────────────────────────────────
+
+
+def favorite(*, artifact_id: int | None = None, url: str = "", artifact_type: str = "") -> int:
+    """Heart an asset — internal (``artifact_id``) or external (``url``,
+    which accepts URLs or bare local paths). Idempotent; returns the
+    favorite row id."""
+    conn = db.connection()
+    with db.transaction(conn):
+        return db.add_favorite(conn, artifact_id=artifact_id, url=url, artifact_type=artifact_type)
+
+
+def unfavorite(favorite_id: int) -> bool:
+    conn = db.connection()
+    with db.transaction(conn):
+        return db.remove_favorite(conn, favorite_id)
+
+
+def list_favorites(
+    *,
+    artifact_type: str | None = None,
+    artifact_source: str | None = None,
+    limit: int | None = None,
+) -> list[dict[str, Any]]:
+    """Newest-first favorites joined with artifact + session context.
+
+    Returns plain dicts (not Artifact) since each row carries
+    cross-session fields (``session_id``, ``session_title``,
+    ``favorited_at``, ``note``) that don't fit the Artifact dataclass.
+    """
+    return db.list_favorites(
+        db.connection(),
+        artifact_type=artifact_type,
+        artifact_source=artifact_source,
+        limit=limit,
+    )

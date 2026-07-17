@@ -119,7 +119,7 @@ class ToolWrapper:
     @property
     def session_dir(self) -> str:
         """Get the current session directory path, creating it if needed."""
-        session_dir = self._deps.session_manager.session_dir(self._deps.state.info.session_id)
+        session_dir = self._deps.session.session_dir
         session_dir.mkdir(parents=True, exist_ok=True)
         return str(session_dir)
 
@@ -148,8 +148,6 @@ class ToolWrapper:
                 except TypeError as e:
                     sig = inspect.signature(attr)
                     raise TypeError(f"{tool_name}() {e}. Expected signature: {name}{sig}") from None
-
-                self._deps.state.tools_used.add(tool_name)
 
                 if isinstance(result, dict):
                     result = ToolResult(result)

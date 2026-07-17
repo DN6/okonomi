@@ -7,7 +7,7 @@ paths / image URLs become genuine OSC 8 hyperlinks.
 
 The single event renderer for both front-ends — the interactive REPL and the
 one-shot ``--task`` CLI (``cli._run_single_task``). Handles Banner / UserMessage
-/ AssistantStream / ToolCall / SystemNote / Divider, with inline
+/ AssistantStream / ToolCallDisplay / SystemNote / Divider, with inline
 non-collapsible tool rendering (compact/verbose toggle) and OSC 8 link emission.
 
 ``replay_history`` re-emits a resumed session's pydantic-ai message history as
@@ -31,16 +31,14 @@ from rich.text import Text
 
 from ..events import (
     AssistantStream,
-    Banner,
-    Divider,
     Event,
     EventEmitter,
     SystemNote,
-    ToolCall,
+    ToolCallDisplay,
     TurnEnd,
-    UserMessage,
 )
 from ..utils import format_elapsed
+from .events import Banner, Divider, UserMessage
 from .palette import ACCENT as _ACCENT, AMBER as _WARN, ERROR as _ERROR, MUTED as _RULE
 
 
@@ -122,7 +120,7 @@ class ReplTranscript:
         if isinstance(ev, AssistantStream):
             self._render_stream(ev)
             return
-        if isinstance(ev, ToolCall):
+        if isinstance(ev, ToolCallDisplay):
             self._render_tool_call(ev)
             return
         # One-shot events: render exactly once even if a history replay and a
@@ -174,7 +172,7 @@ class ReplTranscript:
         # Real OSC 8 links via the Console; LLM-gray base, links ride within.
         self.console.print(text_with_path_links(line), style=_ASSISTANT_STYLE)
 
-    def _render_tool_call(self, ev: ToolCall) -> None:
+    def _render_tool_call(self, ev: ToolCallDisplay) -> None:
         prior = self._tool_status_seen.get(ev.id)
         if prior == ev.status:
             return  # already rendered this state
@@ -204,7 +202,7 @@ class ReplTranscript:
         if ev.output:
             self._print_output(ev.output)
 
-    def _print_details(self, ev: ToolCall) -> None:
+    def _print_details(self, ev: ToolCallDisplay) -> None:
         if ev.tool_name == "execute_code":
             self.console.print(
                 Syntax(ev.details, "python", theme="monokai", background_color="default", word_wrap=True)
@@ -393,7 +391,7 @@ def replay_history(history: list, emitter: EventEmitter) -> None:
     except Exception:
         return
 
-    pending_tool_calls: dict[str, ToolCall] = {}
+    pending_tool_calls: dict[str, ToolCallDisplay] = {}
     any_emitted = False
     for msg in history:
         if isinstance(msg, ModelRequest):
@@ -430,7 +428,7 @@ def replay_history(history: list, emitter: EventEmitter) -> None:
                 elif isinstance(part, ToolCallPart):
                     args_repr = repr(part.args) if not isinstance(part.args, str) else part.args
                     tc = emitter.emit(
-                        ToolCall(
+                        ToolCallDisplay(
                             tool_name=part.tool_name,
                             args=args_repr[:80],
                             details=args_repr[:5000],

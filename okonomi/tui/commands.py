@@ -13,6 +13,8 @@ from dataclasses import dataclass
 from enum import Enum
 from typing import TYPE_CHECKING, Callable
 
+from .. import session as session_store
+from ..constants import OKONOMI_LOVED_DIR
 from ..events import AssistantStream, EventEmitter, SystemNote
 from ..utils import copy_to_clipboard
 from . import assets
@@ -136,7 +138,8 @@ def _btw(arg: str, agent: "OkonomiAgent", emitter: EventEmitter) -> "CommandResu
 def _clear(arg: str, agent: "OkonomiAgent", emitter: EventEmitter) -> None:
     agent.state.message_history = []
     agent.state.context = []
-    emitter.emit(SystemNote("Conversation cleared."))
+    rewound = agent.session.rewind()
+    emitter.emit(SystemNote(f"Conversation cleared ({rewound} events rewound)."))
 
 
 @_command("/session", "Browse and resume a past session")
@@ -146,7 +149,7 @@ def _session(arg: str, agent: "OkonomiAgent", emitter: EventEmitter) -> "Command
 
 @_command("/last", "Resume the most recent session")
 def _last(arg: str, agent: "OkonomiAgent", emitter: EventEmitter) -> None:
-    sessions = agent.session_manager.list_sessions(limit=1)
+    sessions = session_store.list_sessions(limit=1)
     if not sessions:
         emitter.emit(SystemNote("No previous sessions.", level="warn"))
         return
@@ -159,15 +162,13 @@ def _last(arg: str, agent: "OkonomiAgent", emitter: EventEmitter) -> None:
 @_command("/title", "Set/show session title")
 def _title(arg: str, agent: "OkonomiAgent", emitter: EventEmitter) -> None:
     if arg:
-        if agent.session_manager.set_title(agent.state.info.session_id, arg):
+        if agent.session.set_title(arg):
             emitter.emit(SystemNote(f"Title set: {arg}"))
         else:
-            emitter.emit(SystemNote(
-                "Failed to set title (conflict or session not saved yet).",
-                level="error",
-            ))
+            emitter.emit(SystemNote("Failed to set title (session not saved yet).", level="error"))
     else:
-        meta = agent.session_manager.get_info(agent.state.info.session_id)
+        # Re-fetch: the out-of-band titler writes to the DB, not the live object.
+        meta = session_store.Session.load(agent.session.session_id)
         emitter.emit(SystemNote(f"Title: {(meta.title if meta else '') or '(none)'}"))
 
 
@@ -183,7 +184,7 @@ def _loved(arg: str, agent: "OkonomiAgent", emitter: EventEmitter) -> None:
 
 @_command("/prune", "Delete empty sessions older than 24h")
 def _prune(arg: str, agent: "OkonomiAgent", emitter: EventEmitter) -> None:
-    count = agent.session_manager.prune_empty_sessions()
+    count = session_store.prune_empty_sessions()
     emitter.emit(SystemNote(f"Pruned {count} empty session{'s' if count != 1 else ''}."))
 
 

@@ -3,7 +3,7 @@
 The old ``OkonomiConfig`` aggregated nested dataclasses (AgentConfig,
 TimeoutConfig, ContextConfig, SessionConfig) that almost no one read.
 Defaults now live on the components themselves (``OkonomiAgent``,
-``ContextManager``, ``SessionManager``); this module is just the env
+``ContextManager``, ``Session``); this module is just the env
 loader + required-var check.
 """
 

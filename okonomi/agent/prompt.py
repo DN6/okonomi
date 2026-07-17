@@ -6,9 +6,14 @@ is passed in, nothing is read off the agent.
 """
 
 import inspect
-import os
-from pathlib import Path
 from typing import Any
+
+from ..constants import (
+    OKONOMI_FAVOURITES_DIR,
+    OKONOMI_RESEARCH_DIR,
+    OKONOMI_SESSIONS_DIR,
+    OKONOMI_SKILLS_DIR,
+)
 
 
 def _build_skills_index(skills) -> str:
@@ -108,31 +113,26 @@ def _build_tool_index(programmatic_tools: dict[str, Any]) -> str:
     return "\n".join(sections).rstrip()
 
 
-def _build_storage_paths(session_manager) -> dict[str, str]:
+def _build_storage_paths() -> dict[str, str]:
     """Resolve the storage directories the agent should know about.
 
-    Honors $OKONOMI_HOME and any session-storage override in config.
-    The model reads these paths, so they must reflect the user's
-    actual filesystem layout — not the documented defaults.
+    Honors $OKONOMI_HOME (via ``okonomi.constants``). The model reads
+    these paths, so they must reflect the user's actual filesystem
+    layout — not the documented defaults.
     """
-    okonomi_home = Path(os.getenv("OKONOMI_HOME", str(Path.home() / ".okonomi")))
-    # SessionManager already resolved its own storage_dir using the
-    # config override. Reuse that string so the prompt always matches
-    # where sessions are *actually* being written.
-    sessions_dir = str(session_manager.storage_dir)
     return {
-        "sessions": sessions_dir,
-        "research": str(okonomi_home / "research"),
-        "skills": str(okonomi_home / "skills"),
-        "favourites": str(okonomi_home / "favourites"),
+        "sessions": str(OKONOMI_SESSIONS_DIR),
+        "research": str(OKONOMI_RESEARCH_DIR),
+        "skills": str(OKONOMI_SKILLS_DIR),
+        "favourites": str(OKONOMI_FAVOURITES_DIR),
     }
 
 
-def build_system_prompt(*, skills, programmatic_tools: dict[str, Any], session_manager) -> str:
+def build_system_prompt(*, skills, programmatic_tools: dict[str, Any]) -> str:
     """Build the full system prompt for the agent."""
     tool_index = _build_tool_index(programmatic_tools)
     skills_index = _build_skills_index(skills)
-    paths = _build_storage_paths(session_manager)
+    paths = _build_storage_paths()
     # f-string can't subscript with bare keys (`{paths[sessions]}` is
     # a NameError), so bind each path to its own local.
     sessions_dir = paths["sessions"]
@@ -210,7 +210,7 @@ Examples:
 5. **NEVER re-run `genmedia.run`, `browser.render`, or any other expensive call to recover from a parsing error.** These calls are expensive, slow, and cost money. The generation result is still sitting in your previous `result` variable — globals persist across `execute_code` calls. If the previous call failed with a `KeyError` / `AttributeError` / `TypeError` after the generation, write a *new* `execute_code` block that does `print(result)` and fixes the access pattern. If the generation call itself raised (network error, 500), inform the user and ask before retrying — do not silently re-run. Re-running a successful generation because of a parsing bug is the single most wasteful mistake you can make.
 6. **The Programmatic Tools section above has every method's signature, parameter types, and return-dict shape.** Read it before writing code that calls a tool. Never guess `image_url` / `videos` / `url` — the literal return keys are right there. Use `inspect.getdoc(method)` only when you need the prose docstring (longer explanations, examples, edge-case notes); for signatures and return shapes the prompt is authoritative.
 7. **Saving files**: `get_session_dir()` is in scope inside `execute_code` and returns the absolute path to the current session folder — use it for any file you create. Methods with `output_path` parameters (e.g. `browser.render_screenshot`) auto-save into that folder when `output_path=None`.
-8. **Standalone tools** (`bash`, `search`, `web_search`, `web_fetch`, `search_sessions`, `search_artifacts`, `get_session`, `read_file`, `write_file`, `edit_file`, `list_skills`, `load_skill`, `load_skill_section`, `load_skill_reference`, `create_skill`, `write_skill_file`, `patch_skill_file`, `delete_skill`, `launch_agent`, `list_agents`) — call directly, NOT through `execute_code`. **File ops**: prefer `read_file` over `bash(command="cat ...")` (paginated, bounded, line-numbered); `write_file` / `edit_file` require a prior `read_file` on the path so concurrent edits aren't stomped. For long-running shell commands (yt-dlp, ffmpeg, anything >30s), call `bash(command=..., background=True)` — the tool returns immediately with a `term-N` task id and you'll get a system note with the output when it finishes. **Cross-session memory ladder** (use in this order to keep token cost bounded): 1) `search_sessions(query)` / `search_artifacts(query, artifact_type=..., since_days=...)` — BM25-ranked FTS5 over a SQLite index, returns lean hit summaries; 2) `get_session(session_id)` — drill into one match for full metadata + artifacts list (NOT message history); 3) `bash(command="head -50 <dir>/messages.jsonl | jq ...")` — read specific portions of message history when the structured tools don't cover it. **Don't `cat` whole session.json files** — they can be 20-50KB; use `get_session` instead. **Skills are progressively disclosed**: `load_skill(name)` returns a TOC (intro + section slugs + reference filenames). Drill in with `load_skill_section(name, slug)` or `load_skill_reference(name, ref)` — only pull what the current task actually needs.
+8. **Standalone tools** (`bash`, `search`, `web_search`, `web_fetch`, `read_file`, `write_file`, `edit_file`, `list_skills`, `load_skill`, `load_skill_section`, `load_skill_reference`, `create_skill`, `write_skill_file`, `patch_skill_file`, `delete_skill`, `launch_agent`, `list_agents`, and the sessions `recall`) — call directly, NOT through `execute_code`. **File ops**: prefer `read_file` over `bash(command="cat ...")` (paginated, bounded, line-numbered); `write_file` / `edit_file` require a prior `read_file` on the path so concurrent edits aren't stomped. For long-running shell commands (yt-dlp, ffmpeg, anything >30s), call `bash(command=..., background=True)` — the tool returns immediately with a `term-N` task id and you'll get a system note with the output when it finishes. **Cross-session memory** — one tool, `recall`, four shapes: `recall(query=...)` finds past work by conversation content, session titles, or media prompts/URLs (BM25-ranked, with snippets and goal/resolution bookends); `recall(session_id=..., around_event_id=...)` scrolls the conversation around a hit; `recall(session_id=...)` reads one session's metadata + artifacts + capped conversation; `recall()` browses recent sessions. Results are lean references — never re-read whole transcripts by hand. **Skills are progressively disclosed**: `load_skill(name)` returns a TOC (intro + section slugs + reference filenames). Drill in with `load_skill_section(name, slug)` or `load_skill_reference(name, ref)` — only pull what the current task actually needs.
 9. **Programmatic tools** (`browser`, `genmedia`) — use inside `execute_code` only. Image / video / audio / 3D generation flows through `genmedia.run("fal-ai/...", **kwargs)`. For local image / frame loading, just `from PIL import Image` or `import imageio.v3 as iio` directly — no wrapper needed. To *interpret* an image, mention its URL or path in your reply text — okonomi auto-attaches image references as multimodal content for you.
 10. **Background agents**: Use `launch_agent(task, description)` to delegate independent work (e.g., generating multiple images in parallel). Check progress with `list_agents()`. Outputs are automatically merged back into the session.
 11. **Media/expensive code always runs in the background after approval.** Any `execute_code` block touching `genmedia.`, `browser.render`, or `fal_client` is auto-dispatched as a background task (returns a `bg-exec-N` handle, no stdout, no `result` variable). After dispatch, **acknowledge in one short sentence and stop.** Do NOT write expected-output prose ("this will give you a vibrant cinematic look", "should produce a moody noir aesthetic", etc.) — those claims are wrong on failure and unnecessary on success. You'll be re-invoked with a completion notice when it finishes; describe the actual output then. You may also pass `background=True` explicitly for other long-running code.
