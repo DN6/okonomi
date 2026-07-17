@@ -398,9 +398,9 @@ class TuiSession:
 
     def _spinner_label(self) -> str:
         """Working-state label with elapsed timer. Always shows liveness
-        while a turn is in flight (even when ``agent.spinner_text`` is
+        while a turn is in flight (even when ``agent.status`` is
         briefly empty between tool calls)."""
-        txt = self.agent.spinner_text or ""
+        txt = self.agent.status or ""
         if not txt and self._agent_running:
             txt = "Working..."
         if not txt:

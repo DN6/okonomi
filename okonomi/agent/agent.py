@@ -237,7 +237,7 @@ class OkonomiAgent(CodeExecutionMixin):
             model_id=model_id,
             compress_at_tokens=compress_at_tokens,
         )
-        self._spinner_text: str = ""
+        self._status: str = ""
 
         # When True, expensive code (see _expensive_patterns) suspends on
         # an ApprovalRequest event until a subscriber answers via its
@@ -301,17 +301,17 @@ class OkonomiAgent(CodeExecutionMixin):
         return self.session.state
 
     @property
-    def spinner_text(self) -> str:
+    def status(self) -> str:
         """Current working-state label. Assignments emit ``StatusChanged``
         so subscribers get pushed the change; the attribute remains
         readable for pull-style status bars."""
-        return self._spinner_text
+        return self._status
 
-    @spinner_text.setter
-    def spinner_text(self, value: str) -> None:
-        if value == self._spinner_text:
+    @status.setter
+    def status(self, value: str) -> None:
+        if value == self._status:
             return
-        self._spinner_text = value
+        self._status = value
         emitter = getattr(self, "emitter", None)
         if emitter is not None:
             emitter.emit(StatusChanged(value))
@@ -343,18 +343,17 @@ class OkonomiAgent(CodeExecutionMixin):
     ) -> None:
         """Emit ``JobFinished`` for a completed background job (bg-exec
         blocks and term commands both route here)."""
-        refs = [
-            {"artifact_type": a.artifact_type, "path": a.path, "url": a.url}
-            for a in produced_artifacts or []
-        ]
-        self.emitter.emit(JobFinished(
-            job_id=bg_id,
-            status="error" if error else "ok",
-            error=error,
-            output=output,
-            new_artifacts=new_artifacts,
-            artifact_refs=refs,
-        ))
+        refs = [{"artifact_type": a.artifact_type, "path": a.path, "url": a.url} for a in produced_artifacts or []]
+        self.emitter.emit(
+            JobFinished(
+                job_id=bg_id,
+                status="error" if error else "ok",
+                error=error,
+                output=output,
+                new_artifacts=new_artifacts,
+                artifact_refs=refs,
+            )
+        )
 
     def reload(self) -> dict[str, int]:
         """Re-read skills from disk and rebuild the pydantic-ai Agent so
@@ -479,7 +478,7 @@ class OkonomiAgent(CodeExecutionMixin):
 
             def make_wrapper(m, s, tn, agent_self=self):
                 def wrapper(*args, **kwargs):
-                    agent_self.spinner_text = f"Running {tn}..."
+                    agent_self.status = f"Running {tn}..."
                     pending = agent_self._pending_tool_calls.pop(0) if agent_self._pending_tool_calls else None
                     try:
                         result = m(*args, **kwargs)
@@ -512,7 +511,7 @@ class OkonomiAgent(CodeExecutionMixin):
                                 pass
                         raise
                     finally:
-                        agent_self.spinner_text = ""
+                        agent_self.status = ""
 
                 wrapper.__name__ = tn
                 wrapper.__qualname__ = tn
@@ -743,10 +742,14 @@ class OkonomiAgent(CodeExecutionMixin):
                 except json.JSONDecodeError:
                     pass
             name = args.get("name", args) if isinstance(args, dict) else args
-            ev = self.emitter.emit(ToolCallDisplay("load_skill", args=str(name), details=str(args), tool_call_id=call_id))
+            ev = self.emitter.emit(
+                ToolCallDisplay("load_skill", args=str(name), details=str(args), tool_call_id=call_id)
+            )
         else:
             args_str = str(part.args) if part.args else ""
-            ev = self.emitter.emit(ToolCallDisplay(part.tool_name, args=args_str, details=args_str, tool_call_id=call_id))
+            ev = self.emitter.emit(
+                ToolCallDisplay(part.tool_name, args=args_str, details=args_str, tool_call_id=call_id)
+            )
         self._pending_tool_calls.append(ev)
 
     async def run_async(self, user_message: str, reset: bool = False) -> str:
@@ -807,7 +810,7 @@ class OkonomiAgent(CodeExecutionMixin):
                         async for node in agent_run:
                             if not Agent.is_model_request_node(node):
                                 continue
-                            self.spinner_text = "Thinking..."
+                            self.status = "Thinking..."
                             await self._stream_model_response(node, agent_run.ctx)
 
                 except (asyncio.CancelledError, TimeoutError) as exc:
@@ -830,7 +833,7 @@ class OkonomiAgent(CodeExecutionMixin):
             # The turn is over on every exit path (normal, cancel, timeout,
             # error). Clear the spinner so the status bar can't get stuck on
             # a stale "Thinking..." while the agent is actually idle.
-            self.spinner_text = ""
+            self.status = ""
             self.emitter.emit(TurnEnd(turn=turn))
 
     def _handle_interruption(self, agent_run, deps: AgentDependencies, timed_out: bool) -> None:
@@ -853,14 +856,14 @@ class OkonomiAgent(CodeExecutionMixin):
         accompanying tool calls."""
         async with node.stream(ctx) as stream:
             async for text in stream.stream_text(delta=True, debounce_by=None):
-                if self.spinner_text:
-                    self.spinner_text = ""
+                if self.status:
+                    self.status = ""
                 if self._current_stream is None:
                     self._current_stream = AssistantStream()
                 self._current_stream.text += text
                 self.emitter.emit(self._current_stream)
 
-            self.spinner_text = ""
+            self.status = ""
             if self._current_stream is not None:
                 self._current_stream.done = True
                 self.emitter.emit(self._current_stream)
@@ -979,7 +982,7 @@ class OkonomiAgent(CodeExecutionMixin):
         """Persist stream events accumulated since the last save: system
         notes gathered from the emitter, plus pending interrupts."""
         history = self.emitter.history()
-        notes = [ev for ev in history[self._persisted_note_count:] if isinstance(ev, SystemNote)]
+        notes = [ev for ev in history[self._persisted_note_count :] if isinstance(ev, SystemNote)]
         self._persisted_note_count = len(history)
         pending, self._pending_stream_events = self._pending_stream_events, []
         if notes or pending:

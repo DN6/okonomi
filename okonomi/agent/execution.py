@@ -101,7 +101,7 @@ class CodeExecutionMixin:
             is_expensive = any(p in code for p in self._expensive_patterns)
 
             if self.approvals_enabled and not self.auto_approve and is_expensive:
-                self.spinner_text = ""
+                self.status = ""
                 decision = await self._request_approval(code)
                 if decision is False:
                     self._finish_pending_tool_call(error="skipped by user")
@@ -116,7 +116,7 @@ class CodeExecutionMixin:
             if is_expensive:
                 background = True
 
-            self.spinner_text = "Running..."
+            self.status = "Running..."
 
             def _exec_in_thread():
                 stdout_capture = io.StringIO()
@@ -241,7 +241,7 @@ class CodeExecutionMixin:
                 # noticeably stalling successful long-running jobs (which
                 # take 10–90s on fal endpoints).
                 thread.join(timeout=2.0)
-                self.spinner_text = ""
+                self.status = ""
 
                 log_entry = self._bg_logs.get(bg_id, {})
                 if not thread.is_alive() and log_entry.get("status") == "error":
@@ -308,7 +308,7 @@ class CodeExecutionMixin:
                 return "Code executed successfully (no output)"
 
             except asyncio.CancelledError:
-                self.spinner_text = ""
+                self.status = ""
                 raise
             finally:
-                self.spinner_text = ""
+                self.status = ""

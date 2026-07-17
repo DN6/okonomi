@@ -288,7 +288,7 @@ class ApprovalRequest(Event):
 class StatusChanged(Event):
     """The agent's working-state label changed ("Thinking...",
     "Running genmedia.run...", "" when idle). Replaces polling
-    ``agent.spinner_text`` — subscribers render the latest label."""
+    ``agent.status`` — subscribers render the latest label."""
 
     type: ClassVar[str] = "status_changed"
 
