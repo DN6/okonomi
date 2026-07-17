@@ -1,22 +1,139 @@
-"""Typed events produced by the agent and rendered by the TUI.
+"""Agent events: the bounded event taxonomy plus the live event pipe.
 
-The agent pushes events onto an ``EventEmitter``; subscribers render them
-(the REPL transcript for both interactive and one-shot modes). By making
-every user-visible artifact a structured record, rendering is decoupled
-from the agent loop.
+Two related things live here:
 
-Every event carries a ``type`` discriminator (tau-style tagged events):
-``TurnStart``/``TurnEnd`` bracket each agent turn and
-``ToolCall.tool_call_id`` correlates with the model transcript.
+1. **The persistence taxonomy** — ``EventType`` is the closed universe of
+   events that can appear in the DB's ``events`` table. The four
+   conversation types carry whole pydantic-ai messages as payloads
+   (classified by ``classify_message``, indexed via ``extract_content``);
+   the rest serialize the typed objects below (``SystemNote``, ``Title``,
+   ``Interrupt``) through ``event_to_payload``/``event_from_payload``.
+
+2. **Live-rendering events** the agent emits through ``EventEmitter``
+   for the TUI to draw (``TurnStart``/``TurnEnd``, ``AssistantStream``,
+   ``ToolCallDisplay``). These are never persisted — their content is
+   already in the conversation rows.
+
+UI-produced chrome (banner, divider, the echo of typed input) lives in
+``okonomi.tui.events`` — the TUI imports from here, never the reverse.
 """
 
 from __future__ import annotations
 
 import itertools
-from dataclasses import dataclass, field
+import re
+from dataclasses import asdict, dataclass, field
+from enum import Enum
 from threading import Lock
-from typing import Callable, ClassVar
+from typing import Any, Callable, ClassVar
 
+
+class EventType(str, Enum):
+    """Closed set of event types persisted to the ``events`` table."""
+
+    # Conversation — payload is one whole pydantic-ai message.
+    USER_MESSAGE = "user_message"  # ModelRequest containing a user prompt
+    TOOL_RESPONSE = "tool_response"  # ModelRequest containing only tool returns
+    ASSISTANT_MESSAGE = "assistant_message"  # ModelResponse, text only
+    TOOL_CALL = "tool_call"  # ModelResponse containing tool calls
+    # Stream events — payload is the matching typed object below.
+    SYSTEM_NOTE = "system_note"
+    TITLE = "title"
+    INTERRUPT = "interrupt"
+
+
+CONVERSATION_TYPES = (
+    EventType.USER_MESSAGE,
+    EventType.TOOL_RESPONSE,
+    EventType.ASSISTANT_MESSAGE,
+    EventType.TOOL_CALL,
+)
+
+
+def classify_message(message: Any) -> EventType:
+    """Semantic event type of one pydantic-ai message, derived from its
+    part composition. The message itself is stored unmodified."""
+    from pydantic_ai.messages import ModelRequest, ToolCallPart, UserPromptPart
+
+    if isinstance(message, ModelRequest):
+        if any(isinstance(p, UserPromptPart) for p in message.parts):
+            return EventType.USER_MESSAGE
+        return EventType.TOOL_RESPONSE
+    if any(isinstance(p, ToolCallPart) for p in message.parts):
+        return EventType.TOOL_CALL
+    return EventType.ASSISTANT_MESSAGE
+
+
+# ── content extraction (what FTS indexes) ────────────────────────────────
+
+# Per-event cap on indexed text — a pasted novel shouldn't bloat the index.
+CONTENT_CAP_CHARS = 4000
+
+_BASE64_PATTERN = re.compile(r"data:image/[^;]+;base64,[A-Za-z0-9+/=]{100,}")
+_HTML_PREFIX_PATTERN = re.compile(r"^\s*(<(!DOCTYPE|html)\b)", re.IGNORECASE)
+
+
+def _strip_base64(text: str) -> str:
+    def _replace(m):
+        kb = len(m.group(0)) * 3 // 4 // 1024
+        return f"[embedded image, ~{kb}KB]"
+
+    return _BASE64_PATTERN.sub(_replace, text)
+
+
+def _strip_large_content(text: str) -> str:
+    text = _strip_base64(text)
+    if len(text) > 500 and _HTML_PREFIX_PATTERN.match(text):
+        return f"[HTML content, {len(text)} chars — saved to file]"
+    return text
+
+
+def extract_content(message: Any) -> str:
+    """Searchable text of one pydantic-ai message: user-prompt text and
+    assistant ``TextPart``s only. System prompts, tool-call args, tool
+    returns, base64 blobs, and HTML dumps never reach the index —
+    filtering happens here, at write time, not at query time."""
+    from pydantic_ai.messages import ModelRequest, ModelResponse, TextPart, UserPromptPart
+
+    texts: list[str] = []
+    if isinstance(message, ModelRequest):
+        for part in message.parts:
+            if isinstance(part, UserPromptPart):
+                content = part.content if isinstance(part.content, str) else str(part.content)
+                texts.append(content)
+    elif isinstance(message, ModelResponse):
+        for part in message.parts:
+            if isinstance(part, TextPart) and part.content:
+                texts.append(part.content)
+
+    text = _strip_large_content("\n".join(t for t in texts if t))
+    return text[:CONTENT_CAP_CHARS]
+
+
+def message_accounting(message: Any) -> dict[str, Any] | None:
+    """Per-message token/cost values for a ``ModelResponse`` (the events
+    table's accounting columns); ``None`` for requests, which incur none."""
+    from pydantic_ai.messages import ModelResponse
+
+    if not isinstance(message, ModelResponse):
+        return None
+    usage = getattr(message, "usage", None)
+    details = getattr(usage, "details", {}) or {}
+    cost = None
+    provider_details = getattr(message, "provider_details", None)
+    if provider_details and provider_details.get("cost") is not None:
+        cost = float(provider_details["cost"])
+    return {
+        "input_tokens": getattr(usage, "input_tokens", 0) or 0,
+        "output_tokens": getattr(usage, "output_tokens", 0) or 0,
+        "cache_read_tokens": getattr(usage, "cache_read_tokens", 0) or 0,
+        "cache_write_tokens": getattr(usage, "cache_write_tokens", 0) or 0,
+        "reasoning_tokens": int(details.get("reasoning_tokens") or details.get("output_reasoning_tokens") or 0),
+        "cost_usd": cost,
+    }
+
+
+# ── live events ──────────────────────────────────────────────────────────
 
 _id_counter = itertools.count(1)
 _id_lock = Lock()
@@ -27,6 +144,12 @@ def _next_id() -> str:
         return f"evt-{next(_id_counter)}"
 
 
+# type tag → Event subclass, auto-populated by Event.__init_subclass__.
+# The wire-format contract: a frame is {"type": ev.type, "id": ev.id,
+# "payload": event_to_payload(ev)} and rebuilds via event_from_payload.
+EVENT_REGISTRY: dict[str, type["Event"]] = {}
+
+
 @dataclass
 class Event:
     """Base event. All events carry a unique id for addressing and a
@@ -35,32 +158,22 @@ class Event:
     (e.g. ``SystemNote("saved.")``)."""
 
     type: ClassVar[str] = "event"
-
     id: str = field(default_factory=_next_id, kw_only=True)
 
-
-@dataclass
-class Banner(Event):
-    """Static welcome banner shown at session start."""
-
-    type: ClassVar[str] = "banner"
-
-
-@dataclass
-class Divider(Event):
-    """Visual turn separator — a horizontal rule between user turns."""
-
-    type: ClassVar[str] = "divider"
+    def __init_subclass__(cls, **kwargs: Any) -> None:
+        super().__init_subclass__(**kwargs)
+        tag = cls.__dict__.get("type")
+        if isinstance(tag, str):
+            EVENT_REGISTRY[tag] = cls
 
 
 @dataclass
 class TurnStart(Event):
     """An agent turn began. With ``TurnEnd`` this brackets everything the
     agent emits while handling one user message, so a trace can be sliced
-    per turn (the visual ``Divider`` is UI chrome, not a reliable marker)."""
+    per turn."""
 
     type: ClassVar[str] = "turn_start"
-
     turn: int = 0
 
 
@@ -70,15 +183,7 @@ class TurnEnd(Event):
     interrupted, timed out, errored)."""
 
     type: ClassVar[str] = "turn_end"
-
     turn: int = 0
-
-
-@dataclass
-class UserMessage(Event):
-    type: ClassVar[str] = "user_message"
-
-    text: str = ""
 
 
 @dataclass
@@ -90,35 +195,35 @@ class AssistantStream(Event):
     """
 
     type: ClassVar[str] = "assistant_stream"
-
     text: str = ""
     done: bool = False
 
 
 @dataclass
-class ToolCall(Event):
-    """A tool call and its result.
+class ToolCallDisplay(Event):
+    """A collapsible tool call widget. Starts collapsed. Live rendering
+    only — the canonical tool call is the pydantic-ai message that becomes
+    an ``EventType.TOOL_CALL`` row.
 
-    args: short one-line summary (shown in the compact view).
-    details: full args/code — the original input, so the renderer can
-        syntax-highlight it in the verbose view.
+    args: short one-line summary (shown in collapsed view).
+    details: full args/code (shown when expanded — kept as the original
+        input so the widget can syntax-highlight just this part).
     output: text appended after the call returns (stdout, summary, etc.).
-        Kept separate from details so the UI can render it with plain
-        styling below the highlighted code block.
     tool_call_id: the model's tool-call id, correlating this event with
-        the pydantic-ai transcript in ``messages.jsonl``.
+        the persisted transcript.
     """
 
-    type: ClassVar[str] = "tool_call"
+    type: ClassVar[str] = "tool_call_display"
 
     tool_name: str = ""
     args: str = ""
     details: str = ""
     output: str = ""
+    expanded: bool = False
     status: str = "running"  # running | ok | error
     tool_call_id: str = ""
 
-    def finish(self, output: str = "", error: str | None = None) -> ToolCall:
+    def finish(self, output: str = "", error: str | None = None) -> ToolCallDisplay:
         """Mark the call complete, folding an error into ``output``.
         Returns self so the transition can be emitted in one expression:
         ``emitter.emit(ev.finish(output=...))``."""
@@ -138,6 +243,111 @@ class SystemNote(Event):
 
     text: str = ""
     level: str = "info"  # info | warn | error
+
+
+@dataclass
+class Title(Event):
+    """A session retitle (out-of-band titler or ``/title``)."""
+
+    type: ClassVar[str] = "title"
+
+    title: str = ""
+
+
+@dataclass
+class Interrupt(Event):
+    """The user or a timeout cut a turn short."""
+
+    type: ClassVar[str] = "interrupt"
+
+    reason: str = ""  # cancelled | timeout
+
+
+@dataclass
+class ApprovalRequest(Event):
+    """The agent wants permission to run expensive code and has suspended
+    until someone answers via ``respond``:
+
+    - ``True`` — run it
+    - ``False`` — skip
+    - ``"__auto_approve__"`` — run it and stop asking this turn
+    - any other ``str`` — feedback sent back to the model instead of running
+
+    ``respond`` is an in-process resolve handle (thread-safe, one-shot;
+    extra calls are ignored). It is excluded from payloads — a wire layer
+    maps it to an RPC keyed by the event ``id``.
+    """
+
+    type: ClassVar[str] = "approval_request"
+
+    code: str = ""
+    respond: Callable[[bool | str], None] | None = field(default=None, repr=False, compare=False)
+
+
+@dataclass
+class StatusChanged(Event):
+    """The agent's working-state label changed ("Thinking...",
+    "Running genmedia.run...", "" when idle). Replaces polling
+    ``agent.spinner_text`` — subscribers render the latest label."""
+
+    type: ClassVar[str] = "status_changed"
+
+    label: str = ""
+
+
+@dataclass
+class JobStarted(Event):
+    """A background job began (bg-exec-N execute_code block, term-N shell
+    command, task-N sub-agent)."""
+
+    type: ClassVar[str] = "job_started"
+
+    job_id: str = ""
+    kind: str = ""
+    label: str = ""
+
+
+@dataclass
+class JobFinished(Event):
+    """A background job completed. Carries what the job produced so a
+    subscriber can act (e.g. inject a follow-up turn) without scanning
+    session state; full logs stay pull-based via the job registry."""
+
+    type: ClassVar[str] = "job_finished"
+
+    job_id: str = ""
+    status: str = "ok"  # ok | error
+    error: str | None = None
+    output: str | None = None
+    new_artifacts: int = 0
+    # Lean refs of artifacts this job produced: {artifact_type, path, url}
+    artifact_refs: list[dict[str, str]] = field(default_factory=list)
+
+
+# Event classes whose instances persist to the events table, keyed by the
+# EventType they row as. Conversation types are absent on purpose — their
+# payloads are pydantic-ai messages, not these objects.
+PERSISTABLE_EVENTS: dict[EventType, type[Event]] = {
+    EventType.SYSTEM_NOTE: SystemNote,
+    EventType.TITLE: Title,
+    EventType.INTERRUPT: Interrupt,
+}
+
+
+def event_to_payload(event: Event) -> dict[str, Any]:
+    """Serialize an event to its JSON-safe payload dict. ``id`` is
+    excluded (store identity is (session_id, event_id); wire identity
+    travels beside the payload), as is any non-serializable resolve
+    handle (``ApprovalRequest.respond``)."""
+    data = asdict(event)
+    data.pop("id", None)
+    return {k: v for k, v in data.items() if not callable(v)}
+
+
+def event_from_payload(event_type: str, payload: dict[str, Any]) -> Event:
+    """Rebuild an event object from its type tag + payload dict."""
+    cls = EVENT_REGISTRY[str(event_type)]
+    return cls(**payload)
 
 
 class EventEmitter:

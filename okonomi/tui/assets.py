@@ -13,6 +13,8 @@ import sys
 from pathlib import Path
 from typing import TYPE_CHECKING
 
+from .. import session as _session
+from ..constants import OKONOMI_LOVED_DIR
 from ..events import EventEmitter, SystemNote
 from ..utils import copy_to_clipboard
 
@@ -21,7 +23,7 @@ if TYPE_CHECKING:
     from ..agent import OkonomiAgent
 
 
-LOVED_DIR = Path.home() / ".okonomi" / "loved"
+LOVED_DIR = OKONOMI_LOVED_DIR
 
 # Extensions where stdlib `mimetypes` either lacks an entry or classifies
 # them as application/* even though they're plain text. Override here so
@@ -82,7 +84,7 @@ def _favorite_ref(
     file, symlink it into the loved directory. Returns the artifact_type used
     (guessed from the ref when not supplied)."""
     kind = artifact_type or guess_artifact_type(ref)
-    agent.session_manager.favorite(url=ref, artifact_type=kind)
+    _session.favorite(url=ref, artifact_type=kind)
     p = Path(ref)
     try:
         is_file = p.is_file()
@@ -142,18 +144,14 @@ def _heart_last_artifact(agent: "OkonomiAgent", emitter: EventEmitter) -> None:
         emitter.emit(SystemNote("Last output has no local file yet — wait for the download to finish.", level="warn"))
         return
 
-    sm = agent.session_manager
-    row = sm._db.execute(
-        "SELECT id FROM artifacts WHERE session_id = ? AND (url = ? OR path = ?) ORDER BY id DESC LIMIT 1",
-        (agent.state.info.session_id, last.url or "", last.path or ""),
-    ).fetchone()
-    if row is None:
+    artifact_id = agent.session.artifact_id(url=last.url or "", path=last.path or "")
+    if artifact_id is None:
         emitter.emit(SystemNote("Asset not yet indexed — try again in a moment.", level="warn"))
         return
 
-    sm.favorite(artifact_id=row["id"])
+    _session.favorite(artifact_id=artifact_id)
     src = Path(last.path).resolve()
-    _symlink_into_loved(src, agent.state.info.session_id)
+    _symlink_into_loved(src, agent.session.session_id)
     emitter.emit(SystemNote(f"♥ {src.name}"))
 
 
@@ -193,9 +191,7 @@ def list_loved(agent: "OkonomiAgent", emitter: EventEmitter, *, filter_arg: str 
             artifact_source = value
         label = f" {filter_arg}"
 
-    favs = agent.session_manager.list_favorites(
-        artifact_type=artifact_type, artifact_source=artifact_source
-    )
+    favs = _session.list_favorites(artifact_type=artifact_type, artifact_source=artifact_source)
     if not favs:
         msg = f"Nothing loved matching {filter_arg!r}." if filter_arg else "Nothing loved yet. Use /heart to start."
         emitter.emit(SystemNote(msg))
@@ -261,7 +257,7 @@ def _copy_paths(paths: list[str], emitter: EventEmitter) -> None:
 
 def _heart_paths(paths: list[str], agent: "OkonomiAgent", emitter: EventEmitter) -> None:
     n = 0
-    label = agent.state.info.session_id
+    label = agent.session.session_id
     for p in paths:
         artifact = next((a for a in agent.state.artifacts if (a.path or a.url) == p), None)
         ref = (artifact.url or artifact.path) if artifact else p

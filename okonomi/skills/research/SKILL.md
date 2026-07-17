@@ -28,7 +28,7 @@ The six-step process and the pitfalls below are each their own ``## H2``. Pull t
 Six-step process; each is a drillable section:
 
 1. **Listen and clarify** — surface intent, destination, emotional target, references, constraints. See `listen-and-clarify`.
-2. **Check prior research** — `search_sessions(query)` and `search_artifacts(query, since_days=...)` first; then `bash` over `$OKONOMI_HOME/research/`. See `check-prior-research`.
+2. **Check prior research** — `recall(query=...)` (one call covers conversation content, session titles, and media prompts) first; then `bash` over `$OKONOMI_HOME/research/`. See `check-prior-research`.
 3. **Apply creative strategies** — push beyond the obvious (conceptual blending, forced connections, assumption reversal). See `apply-creative-strategies`.
 4. **Research and explore** — `web_search` / `web_fetch` for artists, movements, references. Pursue visual language, reference mapping, cross-pollination. **For 2-4 genuinely independent strands (e.g. "films + comics + photography" for a noir brief), fan out via `launch_agent` instead of serial tool calls** — cuts a 5-min serial session to ~2 min of parallel work. See `research-and-explore` for the pattern.
 5. **Synthesize and structure** — pick a format (concept brief, prompt package, exploration document, photography direction). See `synthesize-and-structure`.
@@ -54,14 +54,14 @@ Infer what you can; ask about the rest. Bias toward asking rather than assuming.
 
 Before starting fresh, search for existing work. Use the cross-session memory ladder (cheap → fall-back):
 
-1. `search_sessions(query)` and `search_artifacts(query, since_days=...)` — BM25-ranked FTS5 over every saved session and artifact. The right starting point for "have we explored X before?".
+1. `recall(query=...)` — BM25-ranked FTS5 over every saved conversation, session title, and artifact. Hits carry snippets and goal/resolution bookends. The right starting point for "have we explored X before?".
 2. Saved research files on disk:
    ```python
    bash(command='ls $OKONOMI_HOME/research/')
    search(pattern='<keyword>', path='$OKONOMI_HOME/research/', file_glob='*.md')
    ```
    Read promising files to assess relevance.
-3. `get_session(session_id)` — drill into one promising hit for the full artifacts list.
+3. `recall(session_id=...)` — drill into one promising hit for full metadata + artifacts + the conversation head/tail.
 
 Try synonyms, related styles, artist names. If relevant prior work exists, surface it: *"You explored something similar when you worked on X — want to build from that?"*
 

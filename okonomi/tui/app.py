@@ -45,7 +45,8 @@ from prompt_toolkit.layout.menus import CompletionsMenu
 from prompt_toolkit.patch_stdout import patch_stdout
 from prompt_toolkit.widgets import Frame
 
-from ..events import EventEmitter, SystemNote, UserMessage
+from ..events import EventEmitter, SystemNote
+from .events import UserMessage
 from .completion import SlashCompleter
 from .style import REPL_STYLE
 from .transcript import ReplTranscript
@@ -356,6 +357,7 @@ class ReplApp:
     def show_asset_picker(self, artifacts, on_action) -> None:
         self._pending_modal = ("asset", on_action, list(artifacts))
         self._stop_app()
+
 
     async def _run_modal(self) -> None:
         modal = self._pending_modal

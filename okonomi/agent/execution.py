@@ -92,7 +92,7 @@ class CodeExecutionMixin:
                     with open(html_path, "w") as f:
                         f.write(html)
                 """
-                session_dir = ctx.deps.session_manager.session_dir(ctx.deps.state.info.session_id)
+                session_dir = ctx.deps.session.session_dir
                 session_dir.mkdir(parents=True, exist_ok=True)
                 return str(session_dir)
 
@@ -100,9 +100,9 @@ class CodeExecutionMixin:
 
             is_expensive = any(p in code for p in self._expensive_patterns)
 
-            if self.approval_callback and not self.auto_approve and is_expensive:
+            if self.approvals_enabled and not self.auto_approve and is_expensive:
                 self.spinner_text = ""
-                decision = await self.approval_callback(code)
+                decision = await self._request_approval(code)
                 if decision is False:
                     self._finish_pending_tool_call(error="skipped by user")
                     return "Code execution skipped by user."
@@ -160,14 +160,7 @@ class CodeExecutionMixin:
                         parts.append(f"\n--- stderr ---\n{e}")
                     return "".join(parts) if parts else "(no output yet)"
 
-                self._bg_logs[bg_id] = {
-                    "kind": "bg-exec",
-                    "label": _extract_bg_label(code),
-                    "started_at": time.time(),
-                    "ended_at": None,
-                    "status": "running",
-                    "_reader": _reader,
-                }
+                self._register_bg_log(task_id=bg_id, label=_extract_bg_label(code), reader=_reader, kind="bg-exec")
 
                 # Hand the ToolCall event from _display_tool_call to the bg
                 # thread so it can resolve (ok/error + output) in-place when
@@ -226,17 +219,16 @@ class CodeExecutionMixin:
                     finally:
                         self._bg_execs.pop(bg_id, None)
                         produced_artifacts = list(ctx.deps.state.artifacts[before_artifacts:])
-                        if self.on_bg_complete is not None:
-                            try:
-                                self.on_bg_complete(
-                                    bg_id=bg_id,
-                                    error=error,
-                                    output=output,
-                                    new_artifacts=new_artifacts,
-                                    produced_artifacts=produced_artifacts,
-                                )
-                            except Exception as cb_err:
-                                self.emitter.emit(SystemNote(f"on_bg_complete callback failed: {cb_err}", level="error"))
+                        try:
+                            self._job_finished(
+                                bg_id=bg_id,
+                                error=error,
+                                output=output,
+                                new_artifacts=new_artifacts,
+                                produced_artifacts=produced_artifacts,
+                            )
+                        except Exception as cb_err:
+                            self.emitter.emit(SystemNote(f"JobFinished emit failed: {cb_err}", level="error"))
 
                 thread = threading.Thread(target=_run_bg, daemon=True, name=f"okonomi-{bg_id}")
                 self._bg_execs[bg_id] = thread
