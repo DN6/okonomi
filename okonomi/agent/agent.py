@@ -717,16 +717,8 @@ class OkonomiAgent(CodeExecutionMixin):
                 "Stop what you were doing and focus on this message.]\n\n" + user_message
             )
 
-        if self._skill_nudge_interval > 0 and self._turns_since_skill >= self._skill_nudge_interval:
-            user_message += (
-                "\n\n[System note: You've completed several tool-heavy turns. "
-                "If you developed a reusable approach, consider saving it as a "
-                "skill with create_skill().]"
-            )
-            self._turns_since_skill = 0
-
         prompt = _parse_user_message(user_message, emitter=self.emitter)
-        timeout_manager = asyncio.timeout(self.timeout) if self.timeout > 0 else contextlib.nullcontext()
+        timeout = asyncio.timeout(self.timeout) if self.timeout > 0 else contextlib.nullcontext()
 
         try:
             async with self.agent.iter(
@@ -735,23 +727,24 @@ class OkonomiAgent(CodeExecutionMixin):
                 message_history=self.state.context or None,
             ) as agent_run:
                 try:
-                    async with timeout_manager:
+                    async with timeout:
                         async for node in agent_run:
                             if not Agent.is_model_request_node(node):
                                 continue
                             self.spinner_text = "Thinking..."
                             await self._stream_model_response(node, agent_run.ctx)
+
                 except (asyncio.CancelledError, TimeoutError) as exc:
                     self._handle_interruption(agent_run, deps, isinstance(exc, TimeoutError))
                     if isinstance(exc, asyncio.CancelledError):
                         raise
+
                     return ""
 
                 result = agent_run.result
 
             messages = result.all_messages()
             self._commit_turn(agent_run, deps, messages)
-            self._update_skill_nudge(messages, deps)
             return result.output
 
         except Exception as e:
