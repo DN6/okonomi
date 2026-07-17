@@ -23,21 +23,19 @@ def resolve_session(args: argparse.Namespace) -> str | None:
     if not (args.resume or args.session):
         return None
 
-    from .session import SessionManager
-
-    manager = SessionManager()
+    from .session import Session, list_sessions
 
     if args.resume:
-        recent = manager.list_sessions(limit=1)
+        recent = list_sessions(limit=1)
         if recent:
             print(f"{BOLD}{GREEN}Resuming: {recent[0].display_name}{RST}\n")
             return recent[0].session_id
         print(f"{YELLOW}No previous sessions found. Starting new session.{RST}\n")
         return None
 
-    info = manager.get_info(args.session)
-    if info:
-        print(f"{BOLD}{GREEN}Loaded: {info.display_name}{RST}\n")
+    session = Session.load(args.session)
+    if session:
+        print(f"{BOLD}{GREEN}Loaded: {session.display_name}{RST}\n")
         return args.session
 
     print(f"{RED}Session {args.session} not found. Starting new session.{RST}\n")

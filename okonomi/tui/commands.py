@@ -12,6 +12,8 @@ from __future__ import annotations
 from pathlib import Path
 from typing import TYPE_CHECKING
 
+from .. import session as _session
+from ..constants import OKONOMI_LOVED_DIR
 from ..events import AssistantStream, EventEmitter, SystemNote
 from ..utils import copy_to_clipboard
 
@@ -103,7 +105,8 @@ def handle(
     if low == "/clear":
         agent.state.message_history = []
         agent.state.context = []
-        emitter.emit(SystemNote("Conversation cleared."))
+        rewound = agent.session.rewind()
+        emitter.emit(SystemNote(f"Conversation cleared ({rewound} events rewound)."))
         return None
 
     if low == "/jobs":
@@ -190,7 +193,7 @@ def handle(
         return None
 
     if low == "/prune":
-        count = agent.session_manager.prune_empty_sessions()
+        count = _session.prune_empty_sessions()
         emitter.emit(SystemNote(f"Pruned {count} empty session{'s' if count != 1 else ''}."))
         return None
 
@@ -200,7 +203,7 @@ def handle(
         return None
 
     if low == "/last":
-        sessions = agent.session_manager.list_sessions(limit=1)
+        sessions = _session.list_sessions(limit=1)
         if not sessions:
             emitter.emit(SystemNote("No previous sessions.", level="warn"))
             return None
@@ -213,7 +216,7 @@ def handle(
     if low.startswith("/title"):
         title_text = cmd[len("/title") :].strip()
         if title_text:
-            if agent.session_manager.set_title(agent.state.info.session_id, title_text):
+            if agent.session.set_title(title_text):
                 emitter.emit(SystemNote(f"Title set: {title_text}"))
             else:
                 emitter.emit(SystemNote(
@@ -221,7 +224,9 @@ def handle(
                     level="error",
                 ))
         else:
-            meta = agent.session_manager.get_info(agent.state.info.session_id)
+            # Re-fetch: the out-of-band titler writes to the DB, not the
+            # live object.
+            meta = _session.Session.load(agent.session.session_id)
             emitter.emit(SystemNote(f"Title: {(meta.title if meta else '') or '(none)'}"))
         return None
 
@@ -277,8 +282,6 @@ def handle(
     return None
 
 
-_LOVED_DIR = Path.home() / ".okonomi" / "loved"
-
 # Extensions where stdlib `mimetypes` either lacks an entry or classifies
 # them as application/* even though they're plain text. Override here so
 # they land in the "text" bucket. 3D formats are similarly missing from
@@ -321,8 +324,8 @@ def _symlink_into_loved(src: Path, label: str) -> Path:
     Returns the symlink path; idempotent — re-hearting reuses an
     existing link.
     """
-    _LOVED_DIR.mkdir(parents=True, exist_ok=True)
-    link = _LOVED_DIR / f"{label}_{src.name}"
+    OKONOMI_LOVED_DIR.mkdir(parents=True, exist_ok=True)
+    link = OKONOMI_LOVED_DIR / f"{label}_{src.name}"
     if not link.exists():
         link.symlink_to(src)
     return link
@@ -375,31 +378,28 @@ def _heart_last_artifact(agent: "OkonomiAgent", emitter: EventEmitter) -> None:
         emitter.emit(SystemNote("Last output has no local file yet — wait for the download to finish.", level="warn"))
         return
 
-    sm = agent.session_manager
-    row = sm._db.execute(
-        "SELECT id FROM artifacts WHERE session_id = ? AND (url = ? OR path = ?) ORDER BY id DESC LIMIT 1",
-        (agent.state.info.session_id, last.url or "", last.path or ""),
-    ).fetchone()
-    if row is None:
+    session = agent.session
+    artifact_id = session.artifact_id(url=last.url or "", path=last.path or "")
+    if artifact_id is None:
         emitter.emit(SystemNote("Asset not yet indexed — try again in a moment.", level="warn"))
         return
 
-    sm.favorite(artifact_id=row["id"])
+    _session.favorite(artifact_id=artifact_id)
     src = Path(last.path).resolve()
-    _symlink_into_loved(src, agent.state.info.session_id)
+    _symlink_into_loved(src, session.session_id)
     emitter.emit(SystemNote(f"♥ {src.name}"))
 
 
 def _heart_url(agent: "OkonomiAgent", emitter: EventEmitter, url: str) -> None:
     artifact_type = _guess_artifact_type(url)
-    agent.session_manager.favorite(url=url, artifact_type=artifact_type)
+    _session.favorite(url=url, artifact_type=artifact_type)
     emitter.emit(SystemNote(f"♥ {url}  [{artifact_type}]"))
 
 
 def _heart_local_path(agent: "OkonomiAgent", emitter: EventEmitter, path: Path) -> None:
     resolved = path.resolve()
     artifact_type = _guess_artifact_type(resolved.name)
-    agent.session_manager.favorite(url=str(resolved), artifact_type=artifact_type)
+    _session.favorite(url=str(resolved), artifact_type=artifact_type)
     _symlink_into_loved(resolved, "local")
     emitter.emit(SystemNote(f"♥ {resolved.name}  [{artifact_type}]  ({resolved})"))
 
@@ -438,14 +438,15 @@ def _list_loved(agent: "OkonomiAgent", emitter: EventEmitter, *, filter_arg: str
             artifact_source = value
         label = f" {filter_arg}"
 
-    favs = agent.session_manager.list_favorites(
-        artifact_type=artifact_type, artifact_source=artifact_source
-    )
+    favs = _session.list_favorites(
+        artifact_type=artifact_type,
+        artifact_source=artifact_source,
+            )
     if not favs:
         msg = f"Nothing loved matching {filter_arg!r}." if filter_arg else "Nothing loved yet. Use /heart to start."
         emitter.emit(SystemNote(msg))
         return
-    lines = [f"Loved{label} ({len(favs)}) — browse in {_LOVED_DIR}:"]
+    lines = [f"Loved{label} ({len(favs)}) — browse in {OKONOMI_LOVED_DIR}:"]
     for f in favs:
         target = f.get("url") or ""
         name = Path(target).name or target or "(no target)"

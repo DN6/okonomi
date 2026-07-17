@@ -11,12 +11,14 @@ from __future__ import annotations
 import asyncio
 import threading
 import time
+from collections import deque
 from concurrent.futures import TimeoutError as FutureTimeout
 
 from ..agent import OkonomiAgent
-from ..events import Banner, Divider, EventEmitter, SystemNote, ToolCall, UserMessage, replay_history
-from ..session import SessionStatus
+from ..events import ApprovalRequest, Event, EventEmitter, JobFinished, SystemNote, ToolCallDisplay
+from ..session import SessionStatus, prune_empty_sessions
 from .asset_actions import handle_asset_action
+from .events import Banner, Divider, UserMessage, replay_history
 from .repl.app import ReplApp
 
 
@@ -39,14 +41,16 @@ class TuiSession:
         self._current_task: asyncio.Task | None = None
         self._worker_loop_future = asyncio.run_coroutine_threadsafe(self._worker_loop(), self._loop)
 
-        # The inline approval UI is single-slot (one input box), so
-        # concurrent approvals — e.g. a background task and the foreground
-        # turn — must serialize. A thread lock, not asyncio.Lock: the
-        # callers may run on different loops/threads (bg-task agents).
-        self._approval_ui_lock = threading.Lock()
-        self.agent.approval_callback = self._approval_callback
-        self.agent.on_bg_complete = self._on_bg_exec_complete
-        self.agent.terminal._on_bg_complete = self._on_bg_exec_complete
+        # The agent surfaces approvals and background-job completions as
+        # events; this session subscribes and reacts. The inline approval
+        # UI is single-slot (one input box), so concurrent requests —
+        # e.g. a background agent and the foreground turn — queue and
+        # show one at a time.
+        self._approval_queue: deque[ApprovalRequest] = deque()
+        self._approval_active = False
+        self._approval_lock = threading.Lock()
+        self.agent.approvals_enabled = True
+        self.emitter.subscribe(self._on_agent_event)
 
         # First-turn reset wipes message_history/artifacts/etc. for a
         # fresh start. Skip it if the agent was already loaded (CLI
@@ -107,15 +111,15 @@ class TuiSession:
             status = "error"
             tb = traceback.format_exc()
             self.emitter.emit(SystemNote(f"Agent error: {type(e).__name__}: {e}", level="error"))
-            trace_event = self.emitter.emit(ToolCall("traceback", args="agent failure", details=tb))
+            trace_event = self.emitter.emit(ToolCallDisplay("traceback", args="agent failure", details=tb))
             self.emitter.emit(trace_event.finish(error="see traceback above"))
         finally:
             self._current_task = None
             self._turn_started_at = None
-            # Off-load to a thread — save can do an LLM call (steps
-            # summary) and a pickle dump that easily takes seconds.
-            # Blocking the consumer here would stall queued submits and
-            # cancellations marshalled through the same loop.
+            # Off-load to a thread — save does file + DB writes and a
+            # pickle dump that can take a moment. Blocking the consumer
+            # here would stall queued submits and cancellations
+            # marshalled through the same loop.
             await asyncio.to_thread(self._safe_save_session, status=status)
 
     def _safe_save_session(
@@ -123,7 +127,6 @@ class TuiSession:
         *,
         status: SessionStatus,
         download_assets: bool = False,
-        skip_summary: bool = False,
     ) -> None:
         """Save the session swallowing any exception.
 
@@ -131,14 +134,11 @@ class TuiSession:
         so it must never raise — a save error must not crash the session.
         ``download_assets`` defaults to False because the agent's eager
         background download pool keeps assets up to date independently.
-        ``skip_summary`` skips the LLM steps-summary call (set True on
-        shutdown so exit doesn't block on a 10–60s OpenRouter request).
         """
         try:
             self.agent.save_session(
                 status=status,
                 download_assets=download_assets,
-                skip_summary=skip_summary,
             )
         except Exception:  # noqa: BLE001
             pass
@@ -240,33 +240,54 @@ class TuiSession:
         self._bg_counter += 1
         task_id = f"bg-{self._bg_counter}"
         parent = self.agent
-        approval_cb = parent.approval_callback
-        on_bg_complete_cb = parent.on_bg_complete
 
         self.emitter.emit(SystemNote(f"Background task {task_id} started: {task_input[:80]}"))
 
+        def _forward(ev: Event) -> None:
+            # Approvals and job completions from the bg agent surface on
+            # the foreground emitter (the events carry their own resolve
+            # handles / payloads); everything else stays isolated.
+            if isinstance(ev, (ApprovalRequest, JobFinished)):
+                self.emitter.emit(ev)
+
+        # Register in the shared job registry so /jobs and /logs see /bg
+        # tasks alongside bg-exec-N and term-N.
+        progress = {"status": "running", "detail": ""}
+
+        def _reader() -> str:
+            return f"task: {task_input}\nstatus: {progress['status']}" + (
+                f"\n{progress['detail']}" if progress["detail"] else ""
+            )
+
+        parent._register_bg_log(task_id=task_id, label=task_input[:60], reader=_reader)
+
         def _run() -> None:
+            status = "ok"
             bg_agent = OkonomiAgent(
                 model_id=parent.model_id,
                 timeout=parent.timeout,
                 compress_at_tokens=parent.compress_at_tokens,
-                session_id=parent.state.info.session_id,
+                session_id=parent.session.session_id,
             )
-            bg_agent.approval_callback = approval_cb
-            bg_agent.on_bg_complete = on_bg_complete_cb
             # Isolated emitter — the bg agent's tool calls and streaming
-            # text don't show up in the foreground history; only the
-            # completion note (below) surfaces to the user.
+            # text don't show up in the foreground history; only approvals,
+            # job completions, and the note below surface to the user.
             bg_agent.emitter = EventEmitter()
+            bg_agent.approvals_enabled = True
+            bg_agent.emitter.subscribe(_forward)
             try:
                 asyncio.run(bg_agent.run_async(task_input, reset=True))
                 parent.state.artifacts.extend(bg_agent.state.artifacts)
-                parent.state.tools_used.update(bg_agent.state.tools_used)
                 n = len(bg_agent.state.artifacts)
+                progress["detail"] = f"artifacts produced: {n}"
                 self.emitter.emit(SystemNote(f"Background task {task_id} done — {n} artifact{'s' if n != 1 else ''}"))
             except Exception as e:  # noqa: BLE001
+                status = "error"
+                progress["detail"] = f"error: {e}"
                 self.emitter.emit(SystemNote(f"Background task {task_id} failed: {e}", level="error"))
             finally:
+                progress["status"] = status
+                parent._mark_bg_log_done(task_id=task_id, status=status)
                 self._bg_tasks.pop(task_id, None)
 
         label = task_input[:50] + "…" if len(task_input) > 50 else task_input
@@ -288,47 +309,52 @@ class TuiSession:
         self._next_reset = False
 
         replay_history(self.agent.state.message_history, self.emitter)
-        meta = self.agent.session_manager.get_info(session_id)
-        title = (meta.title if meta else "") or ""
+        title = self.agent.session.title
         label = f"{session_id[:10]} · {title}" if title else session_id
         self.emitter.emit(SystemNote(f"↑ Resumed: {label}"))
 
-    async def _approval_callback(self, code: str) -> bool | str:
-        """Agent asks: is this expensive code ok to run?
+    def _on_agent_event(self, ev: Event) -> None:
+        """React to agent events that need more than rendering. Runs
+        synchronously on the emitting thread — must never block."""
+        if isinstance(ev, ApprovalRequest):
+            self._enqueue_approval(ev)
+        elif isinstance(ev, JobFinished):
+            self._on_job_finished(ev)
 
-        Each request gets a private Future captured in the resolve closure
-        so a decision can never be delivered to the wrong waiter. The UI
-        lock serializes requests because only one approval prompt can be
-        shown at a time; a concurrent caller (a background task agent)
-        waits for its turn.
-        """
-        loop = asyncio.get_running_loop()
-        fut: asyncio.Future[bool | str] = loop.create_future()
+    def _enqueue_approval(self, request: ApprovalRequest) -> None:
+        """Queue an approval request for the single-slot inline UI; show
+        it immediately if nothing else is on screen. The event carries its
+        own resolve handle, so requests from background agents (forwarded
+        onto this emitter) resolve their own waiters."""
+        with self._approval_lock:
+            if self._approval_active:
+                self._approval_queue.append(request)
+                return
+            self._approval_active = True
+        self._show_approval(request)
 
+    def _show_approval(self, request: ApprovalRequest) -> None:
         def _resolve(decision: bool | str) -> None:
-            loop.call_soon_threadsafe(fut.set_result, decision)
+            try:
+                if request.respond is not None:
+                    request.respond(decision)
+            finally:
+                with self._approval_lock:
+                    nxt = self._approval_queue.popleft() if self._approval_queue else None
+                    if nxt is None:
+                        self._approval_active = False
+                if nxt is not None:
+                    self._show_approval(nxt)
 
-        await asyncio.to_thread(self._approval_ui_lock.acquire)
-        try:
-            self._app.call_from_thread(self._app.show_approval, code, _resolve)
-            return await fut
-        finally:
-            self._approval_ui_lock.release()
+        self._app.call_from_thread(self._app.show_approval, request.code, _resolve)
 
-    def _on_bg_exec_complete(
-        self,
-        *,
-        bg_id: str,
-        error: str | None,
-        output: str | None,
-        new_artifacts: int,
-        produced_artifacts: list | None = None,
-    ) -> None:
+    def _on_job_finished(self, ev: JobFinished) -> None:
         """Inject a synthetic turn so the agent can surface completed media.
 
         Names the *specific* assets this bg task produced so the agent
         doesn't grab unrelated older items from session state.
         """
+        bg_id, error = ev.job_id, ev.error
         if error:
             msg = (
                 f"[system] Background task {bg_id} failed:\n{error}\n\n"
@@ -346,11 +372,9 @@ class TuiSession:
             return
 
         asset_lines: list[str] = []
-        for a in produced_artifacts or []:
-            path = getattr(a, "path", "") or ""
-            url = getattr(a, "url", "") or ""
-            kind = getattr(a, "artifact_type", "") or "artifact"
-            ref = path or url
+        for ref_info in ev.artifact_refs:
+            ref = ref_info.get("path") or ref_info.get("url") or ""
+            kind = ref_info.get("artifact_type") or "artifact"
             if ref:
                 asset_lines.append(f"  - {kind}: {ref}")
         produced_block = "\n".join(asset_lines) if asset_lines else "  (none)"
@@ -386,7 +410,7 @@ class TuiSession:
         return f"{txt}  ({stamp})"
 
     def _usage_label(self) -> str:
-        usage = self.agent.state.info.tokens
+        usage = self.agent.session.tokens
         if not usage.total_tokens:
             return ""
         return str(usage)
@@ -413,10 +437,10 @@ class TuiSession:
 
         # Last-ditch save: atexit fires before interpreter exit even on
         # SIGTERM / uncaught exception / Textual hang.
-        atexit.register(self._safe_save_session, status="abandoned", skip_summary=True)
+        atexit.register(self._safe_save_session, status="abandoned")
 
         try:
-            self.agent.session_manager.prune_empty_sessions()
+            prune_empty_sessions()
         except Exception:  # noqa: BLE001
             pass
 
@@ -425,6 +449,16 @@ class TuiSession:
             "type a message or /help. Ctrl+D to exit. Scroll and select text "
             "natively; /verbose toggles full tool output.",
         ))
+
+        # A preloaded session (CLI --resume / --session) renders its prior
+        # conversation into the scrollback, same as the /session picker —
+        # otherwise the model has context the user can't see.
+        if self.agent.state.message_history:
+            replay_history(self.agent.state.message_history, self.emitter)
+            title = self.agent.session.title
+            sid = self.agent.session.session_id
+            label = f"{sid[:10]} · {title}" if title else sid
+            self.emitter.emit(SystemNote(f"↑ Resumed: {label}"))
 
         if shutil.which("genmedia") is None:
             self.emitter.emit(SystemNote(
@@ -464,4 +498,4 @@ class TuiSession:
             self.agent._asset_dl_pool.shutdown(wait=False, cancel_futures=True)
         except Exception:  # noqa: BLE001
             pass
-        self._safe_save_session(status="completed", download_assets=False, skip_summary=True)
+        self._safe_save_session(status="completed", download_assets=False)

@@ -67,7 +67,7 @@ class AgentTools:
 
         parent = self._parent_agent
 
-        approval_callback = parent.approval_callback
+        approvals_enabled = parent.approvals_enabled
 
         # Register in the parent agent's shared bg-log registry so /jobs
         # and /logs see launched agents alongside bg-exec-N and term-N.
@@ -104,16 +104,24 @@ class AgentTools:
                     model_id=parent.model_id,
                     timeout=parent.timeout,
                     compress_at_tokens=parent.compress_at_tokens,
-                    session_id=parent.state.info.session_id,
+                    session_id=parent.session.session_id,
                 )
-                agent.approval_callback = approval_callback
+                # Sub-agent approval requests forward to the parent's
+                # emitter — the event carries its own resolve handle, so
+                # whoever answers there resolves the sub-agent's wait.
+                if approvals_enabled:
+                    agent.approvals_enabled = True
+                    from okonomi.events import ApprovalRequest
+
+                    agent.emitter.subscribe(
+                        lambda ev: parent.emitter.emit(ev) if isinstance(ev, ApprovalRequest) else None
+                    )
 
                 loop = asyncio.new_event_loop()
                 asyncio.set_event_loop(loop)
                 try:
                     loop.run_until_complete(agent.run_async(task, reset=True))
                     parent.state.artifacts.extend(agent.state.artifacts)
-                    parent.state.tools_used.update(agent.state.tools_used)
                     bg_task.outputs = len(agent.state.artifacts)
                     bg_task.status = "done"
                     parent.emitter.emit(SystemNote(

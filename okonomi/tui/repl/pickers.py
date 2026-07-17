@@ -21,7 +21,8 @@ from prompt_toolkit.layout import HSplit, Layout, Window
 from prompt_toolkit.layout.controls import BufferControl, FormattedTextControl
 from prompt_toolkit.output.defaults import create_output
 
-from ...session import SessionManager
+from ...session import list_sessions
+from ...session import search as content_search
 from ...utils import fuzzy_match
 from .style import REPL_STYLE
 
@@ -34,7 +35,7 @@ async def pick_session() -> str | None:
     """Full-screen fuzzy session picker → chosen session_id or None."""
     rows_all = [
         s
-        for s in SessionManager().list_sessions(limit=500)
+        for s in list_sessions(limit=500)
         if (getattr(s, "title", "") or "").strip() or (getattr(s, "task_input", "") or "").strip()
     ]
     state = {"idx": 0, "rows": rows_all}
@@ -48,6 +49,15 @@ async def pick_session() -> str | None:
     def _refilter(_=None) -> None:
         q = search.text.strip().lower()
         state["rows"] = rows_all if not q else [s for s in rows_all if fuzzy_match(q, _hay(s))]
+        if q and len(q) >= 3 and not state["rows"]:
+            # Title fuzzy-match found nothing — fall through to content
+            # search over conversations and artifact prompts.
+            try:
+                by_id = {s.session_id: s for s in rows_all}
+                hit_ids = dict.fromkeys(h["session_id"] for h in content_search(q, limit=20))
+                state["rows"] = [by_id[i] for i in hit_ids if i in by_id]
+            except Exception:
+                pass
         state["idx"] = 0
 
     search.on_text_changed += _refilter

@@ -7,7 +7,7 @@ paths / image URLs become genuine OSC 8 hyperlinks.
 
 The single event renderer for both front-ends — the interactive REPL and the
 one-shot ``--task`` CLI (``cli._run_single_task``). Handles Banner / UserMessage
-/ AssistantStream / ToolCall / SystemNote / Divider, with inline
+/ AssistantStream / ToolCallDisplay / SystemNote / Divider, with inline
 non-collapsible tool rendering (compact/verbose toggle) and OSC 8 link emission.
 """
 
@@ -23,14 +23,12 @@ from rich.text import Text
 
 from ...events import (
     AssistantStream,
-    Banner,
-    Divider,
     Event,
     SystemNote,
-    ToolCall,
+    ToolCallDisplay,
     TurnEnd,
-    UserMessage,
 )
+from ..events import Banner, Divider, UserMessage
 from ..rich_helpers import render_welcome_banner, text_with_path_links
 
 
@@ -116,7 +114,7 @@ class ReplTranscript:
         if isinstance(ev, AssistantStream):
             self._render_stream(ev)
             return
-        if isinstance(ev, ToolCall):
+        if isinstance(ev, ToolCallDisplay):
             self._render_tool_call(ev)
             return
         # One-shot events: render exactly once even if a history replay and a
@@ -168,7 +166,7 @@ class ReplTranscript:
         # Real OSC 8 links via the Console; LLM-gray base, links ride within.
         self.console.print(text_with_path_links(line), style=_ASSISTANT_STYLE)
 
-    def _render_tool_call(self, ev: ToolCall) -> None:
+    def _render_tool_call(self, ev: ToolCallDisplay) -> None:
         prior = self._tool_status_seen.get(ev.id)
         if prior == ev.status:
             return  # already rendered this state
@@ -198,7 +196,7 @@ class ReplTranscript:
         if ev.output:
             self._print_output(ev.output)
 
-    def _print_details(self, ev: ToolCall) -> None:
+    def _print_details(self, ev: ToolCallDisplay) -> None:
         if ev.tool_name == "execute_code":
             self.console.print(
                 Syntax(ev.details, "python", theme="monokai", background_color="default", word_wrap=True)
