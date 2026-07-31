@@ -13,6 +13,7 @@ from dataclasses import dataclass
 from enum import Enum
 from typing import TYPE_CHECKING, Callable
 
+from .. import db
 from .. import session as session_store
 from ..constants import OKONOMI_LOVED_DIR
 from ..events import AssistantStream, EventEmitter, SystemNote
@@ -31,6 +32,7 @@ class Action(str, Enum):
     VERBOSE = "verbose"
     SESSION_PICKER = "session_picker"
     ASSET_PICKER = "asset_picker"
+    TREE_PICKER = "tree_picker"
     BG = "bg"
     BTW = "btw"
     FORWARD = "forward"  # send payload to the agent as the next user message
@@ -145,6 +147,14 @@ def _clear(arg: str, agent: "OkonomiAgent", emitter: EventEmitter) -> None:
 @_command("/session", "Browse and resume a past session")
 def _session(arg: str, agent: "OkonomiAgent", emitter: EventEmitter) -> "CommandResult":
     return CommandResult(Action.SESSION_PICKER)
+
+
+@_command("/tree", "Browse the session tree — jump back, edit & resubmit to branch")
+def _tree(arg: str, agent: "OkonomiAgent", emitter: EventEmitter) -> "CommandResult | None":
+    if db.count_events(db.connection(), agent.session.session_id, active_only=False) == 0:
+        emitter.emit(SystemNote("No history yet."))
+        return None
+    return CommandResult(Action.TREE_PICKER)
 
 
 @_command("/last", "Resume the most recent session")
