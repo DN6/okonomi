@@ -1,27 +1,55 @@
-"""The execute_code tool: sandboxed Python with tool namespaces injected,
-foreground and background (bg-exec-N) dispatch, and approval gating.
-``CodeExecutionMixin`` is mixed into ``OkonomiAgent``."""
+"""The execute_code tool: Python with tool namespaces injected, foreground
+and background (bg-exec-N) dispatch, and approval gating. ``CodeExecutor``
+is composed into ``OkonomiAgent``."""
 
 import asyncio
 import io
+import re
 import threading
 import time
 import traceback
 from contextlib import redirect_stderr, redirect_stdout
+from typing import TYPE_CHECKING
 
 from pydantic_ai import Agent, RunContext
 
 from ..events import SystemNote
-from .wrappers import ToolWrapper, _extract_bg_label
 
 
-class CodeExecutionMixin:
-    """Registers and runs the execute_code tool. Expects the attributes
-    set up in ``OkonomiAgent.__init__`` (emitter, approval flow, bg-exec
-    registries, expensive patterns)."""
+if TYPE_CHECKING:
+    from .agent import OkonomiAgent
 
-    def _register_code_execution_tool(self, agent: Agent) -> None:
-        """Register the code execution tool with the agent."""
+
+def _extract_bg_label(code: str) -> str:
+    """A short human label for a background code block — its first
+    ``namespace.method(...)`` call, else "code block"."""
+    match = re.search(r"\b(\w+)\.(\w+)\s*\(", code)
+    if match:
+        return f"{match.group(1)}.{match.group(2)}"
+    return "code block"
+
+
+class CodeExecutor:
+    """Owns execute_code: a persistent-state Python REPL plus background
+    (bg-exec-N) dispatch.
+
+    The model's code runs in ``execution_globals``, which persists across
+    turns; ``get_session_dir`` and the asset sweep are the output path.
+    Conversational surfaces (emitter, pending tool-call widgets, job
+    registry, asset sync) belong to the owning agent and are reached
+    through it.
+    """
+
+    def __init__(self, agent: "OkonomiAgent") -> None:
+        self.agent = agent
+        # Live background execute_code jobs keyed by bg_id. Plain threads
+        # (not asyncio tasks) so they survive the per-turn event loop
+        # teardown in the CLI. Public: the TUI lists in-flight jobs from it.
+        self.threads: dict[str, threading.Thread] = {}
+        self._counter = 0
+
+    def register_tool(self, agent: Agent) -> None:
+        """Register the execute_code tool on the pydantic-ai agent."""
         # Imported here, not at module top: agent.py defines AgentDependencies
         # and imports this module, so a top-level import would be circular.
         # By the time this method runs (agent construction) both are loaded.
@@ -33,50 +61,36 @@ class CodeExecutionMixin:
             code: str,
             background: bool = False,
         ) -> str:
-            """Execute Python code with access to all tool objects.
+            """Execute Python code in a persistent REPL environment.
 
-            The code runs in an environment with these tool objects available:
-            - browser: Headless browser rendering (screenshot and video capture of HTML/JS)
-            - genmedia: Run any fal.ai endpoint — image, video, audio, 3D — auto-tracks outputs
+            Variables persist across calls — ``execution_globals`` is kept
+            between `execute_code` invocations, so state you build up (loaded
+            data, intermediate results) is available in later blocks. Use
+            `print()` to see output. Import libraries directly (PIL, imageio,
+            numpy, subprocess, urllib, ...).
 
-            For local image / frame work (PIL ops, imageio), just import
-            the libraries directly from inside `execute_code`. For image
-            interpretation (one or many), include the URLs / data URIs / local
-            paths in your conversation reply or in your next user-facing
-            message — okonomi extracts image references from text and
-            attaches them to the model as multimodal content automatically.
-
-            For past-session info, use the `search` tool (not a programmatic
-            namespace) — e.g. `search(pattern="<keyword>", path="~/.okonomi/sessions/")`
-            — instead of any sessions.* methods, which no longer exist.
+            To interpret an image, include its URL / data URI / local path in
+            your reply text — okonomi attaches image references as multimodal
+            content automatically.
 
             Args:
                 code: Python code to execute. Use print() for output.
-                background: When True, approval (if required) still happens in the foreground,
-                    but execution is dispatched as a background task and the tool returns
-                    immediately. A completion notification is injected as a new turn when the
-                    task finishes. Use for long media generations when you don't need the
-                    result to chain into the next code block. Defaults to False.
+                background: When True, execution is dispatched as a background
+                    task and the tool returns immediately with a `bg-exec-N`
+                    handle; a completion notice arrives as a new turn. Use for
+                    long-running code you don't need to chain from. Defaults
+                    to False.
 
             Returns:
-                The stdout output from the code execution, or error message.
-                When background=True, returns a handle like "Dispatched as bg-exec-N ..."
+                The stdout output, or an error message. When background=True,
+                returns a handle like "Dispatched to background as bg-exec-N".
             """
             # Mutate execution_globals in place — `ctx.deps.state.execution_globals`
             # is the same object as `self.state.execution_globals` on the agent, so
             # rebinding (`= {...}`) would silently break cross-turn variable
             # persistence (the agent would keep the empty original).
-            #
-            # Tool wrappers and helpers are reinstalled every call. They
-            # close over the current ctx.deps (different on every turn);
-            # gating reinstallation on "dict is empty" would mean a session
-            # resume with restored user vars never installs them at all.
-            # Cheap to re-create, identical to user vars in keyspace, no
-            # collisions in practice.
             ctx.deps.state.execution_globals.setdefault("__builtins__", __builtins__)
             ctx.deps.state.execution_globals.setdefault("asyncio", asyncio)
-            for namespace, tool_instance in ctx.deps.tools.items():
-                ctx.deps.state.execution_globals[namespace] = ToolWrapper(tool_instance, ctx.deps, namespace)
 
             def get_session_dir() -> str:
                 """Get the current session's directory path.
@@ -98,25 +112,7 @@ class CodeExecutionMixin:
 
             ctx.deps.state.execution_globals["get_session_dir"] = get_session_dir
 
-            is_expensive = any(p in code for p in self._expensive_patterns)
-
-            if self.approvals_enabled and not self.auto_approve and is_expensive:
-                self.status = ""
-                decision = await self._request_approval(code)
-                if decision is False:
-                    self._finish_pending_tool_call(error="skipped by user")
-                    return "Code execution skipped by user."
-                if decision == "__auto_approve__":
-                    self.auto_approve = True
-                elif isinstance(decision, str):
-                    self._finish_pending_tool_call(error=f"feedback: {decision}")
-                    return f"User feedback before execution: {decision}\n\nRevise the code and try again."
-
-            # Media/expensive code always backgrounds after approval passes.
-            if is_expensive:
-                background = True
-
-            self.status = "Running..."
+            self.agent.status = "Running..."
 
             def _exec_in_thread():
                 stdout_capture = io.StringIO()
@@ -137,11 +133,11 @@ class CodeExecutionMixin:
                 except Exception:
                     return None, traceback.format_exc()
                 finally:
-                    self._sync_session_assets(ctx.deps)
+                    self.agent._sync_session_assets(ctx.deps)
 
             if background:
-                self._bg_exec_counter += 1
-                bg_id = f"bg-exec-{self._bg_exec_counter}"
+                self._counter += 1
+                bg_id = f"bg-exec-{self._counter}"
                 before_artifacts = len(ctx.deps.state.artifacts)
 
                 # Long-lived buffers so /logs can snapshot during and after
@@ -160,17 +156,19 @@ class CodeExecutionMixin:
                         parts.append(f"\n--- stderr ---\n{e}")
                     return "".join(parts) if parts else "(no output yet)"
 
-                self._register_bg_log(task_id=bg_id, label=_extract_bg_label(code), reader=_reader, kind="bg-exec")
+                self.agent._register_bg_log(
+                    task_id=bg_id, label=_extract_bg_label(code), reader=_reader, kind="bg-exec"
+                )
 
                 # Hand the ToolCall event from _display_tool_call to the bg
                 # thread so it can resolve (ok/error + output) in-place when
                 # the code finishes. This gives the user a single foreground
                 # widget that represents the bg job throughout its lifetime.
-                bound_tool_call = self._pending_tool_calls.pop(0) if self._pending_tool_calls else None
+                bound_tool_call = self.agent._pending_tool_calls.pop(0) if self.agent._pending_tool_calls else None
                 if bound_tool_call is not None:
                     try:
                         bound_tool_call.args = f"{bound_tool_call.args} → {bg_id} running"
-                        self.emitter.emit(bound_tool_call)
+                        self.agent.emitter.emit(bound_tool_call)
                     except Exception:
                         pass
 
@@ -188,21 +186,21 @@ class CodeExecutionMixin:
                         except Exception:
                             error = traceback.format_exc()
                             output = _reader().strip() or None
-                        self._sync_session_assets(ctx.deps)
+                        self.agent._sync_session_assets(ctx.deps)
                         new_artifacts = len(ctx.deps.state.artifacts) - before_artifacts
-                        log_entry = self._bg_logs.get(bg_id)
+                        log_entry = self.agent._bg_logs.get(bg_id)
                         if log_entry is not None:
                             log_entry["status"] = "error" if error else "ok"
                             log_entry["ended_at"] = time.time()
                         if error:
-                            self.emitter.emit(SystemNote(f"✗ {bg_id} failed:\n{error}", level="error"))
+                            self.agent.emitter.emit(SystemNote(f"✗ {bg_id} failed:\n{error}", level="error"))
                         else:
                             tail = (
                                 f" — {new_artifacts} artifact{'s' if new_artifacts != 1 else ''}"
                                 if new_artifacts
                                 else ""
                             )
-                            self.emitter.emit(SystemNote(f"✓ {bg_id} done{tail}"))
+                            self.agent.emitter.emit(SystemNote(f"✓ {bg_id} done{tail}"))
                         # Update the original ToolCall event so the user
                         # sees the bg job's result in-place in history.
                         if bound_tool_call is not None:
@@ -213,14 +211,14 @@ class CodeExecutionMixin:
                                     else "done"
                                 )
                                 merged_output = f"{bg_id} {summary_str}" + (f"\n\n{output}" if output else "")
-                                self.emitter.emit(bound_tool_call.finish(output=merged_output, error=error))
+                                self.agent.emitter.emit(bound_tool_call.finish(output=merged_output, error=error))
                             except Exception:
                                 pass
                     finally:
-                        self._bg_execs.pop(bg_id, None)
+                        self.threads.pop(bg_id, None)
                         produced_artifacts = list(ctx.deps.state.artifacts[before_artifacts:])
                         try:
-                            self._job_finished(
+                            self.agent._job_finished(
                                 bg_id=bg_id,
                                 error=error,
                                 output=output,
@@ -228,10 +226,10 @@ class CodeExecutionMixin:
                                 produced_artifacts=produced_artifacts,
                             )
                         except Exception as cb_err:
-                            self.emitter.emit(SystemNote(f"JobFinished emit failed: {cb_err}", level="error"))
+                            self.agent.emitter.emit(SystemNote(f"JobFinished emit failed: {cb_err}", level="error"))
 
                 thread = threading.Thread(target=_run_bg, daemon=True, name=f"okonomi-{bg_id}")
-                self._bg_execs[bg_id] = thread
+                self.threads[bg_id] = thread
                 thread.start()
 
                 # Brief wait so fast failures (KeyError, fal arg validation,
@@ -241,9 +239,9 @@ class CodeExecutionMixin:
                 # noticeably stalling successful long-running jobs (which
                 # take 10–90s on fal endpoints).
                 thread.join(timeout=2.0)
-                self.status = ""
+                self.agent.status = ""
 
-                log_entry = self._bg_logs.get(bg_id, {})
+                log_entry = self.agent._bg_logs.get(bg_id, {})
                 if not thread.is_alive() and log_entry.get("status") == "error":
                     reader = log_entry.get("_reader")
                     snapshot = ""
@@ -278,24 +276,10 @@ class CodeExecutionMixin:
                 # Attach output/error back to the UI's ToolCall event so the
                 # user sees failures without having to ask the model what
                 # happened. The widget auto-expands on error status.
-                self._finish_pending_tool_call(output=output or "", error=error)
+                self.agent._finish_pending_tool_call(output=output or "", error=error)
 
                 if error:
-                    hint = ""
-                    # If the code hit a parsing error *after* touching an
-                    # expensive tool, remind the model that globals persist
-                    # and it should NOT re-run the expensive call.
-                    if any(p in code for p in self._expensive_patterns) and any(
-                        kind in error for kind in ("KeyError", "AttributeError", "TypeError", "IndexError")
-                    ):
-                        hint = (
-                            "\n\nHINT: The generation call likely succeeded — "
-                            "the `result` variable is still in globals. DO NOT "
-                            "re-run genmedia.run/browser.render/fal_client. Write a new "
-                            "execute_code block with `print(result)` to inspect "
-                            "its shape, then fix the access pattern."
-                        )
-                    return f"Error executing code:\n{error}{hint}"
+                    return f"Error executing code:\n{error}"
 
                 if output:
                     from ..context import _strip_large_content
@@ -308,7 +292,7 @@ class CodeExecutionMixin:
                 return "Code executed successfully (no output)"
 
             except asyncio.CancelledError:
-                self.status = ""
+                self.agent.status = ""
                 raise
             finally:
-                self.status = ""
+                self.agent.status = ""
