@@ -366,7 +366,7 @@ def render_welcome_banner(label: str = "okonomi") -> Text:
 # Session-resume replay
 # =============================================================================
 
-_SYNTHETIC_REPLAY_PREFIXES = ("[Resumed", "[system]", "[The user interrupted")
+_SYNTHETIC_REPLAY_PREFIXES = ("[Resumed", "[system]", "[The user interrupted", "[Branch summary")
 
 
 def replay_history(history: list, emitter: EventEmitter) -> None:

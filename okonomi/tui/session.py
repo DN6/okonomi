@@ -79,6 +79,7 @@ class TuiSession:
             spinner_label_fn=self._spinner_label,
             usage_fn=self._usage_label,
             bg_tasks_fn=self._bg_tasks_list,
+            on_double_escape=self._open_tree,
         )
 
     # --- Agent worker ---
@@ -191,6 +192,9 @@ class TuiSession:
                 return
             if result.action is Action.SESSION_PICKER:
                 self._app.show_session_picker(self._resume_session)
+                return
+            if result.action is Action.TREE_PICKER:
+                self._open_tree()
                 return
             if result.action is Action.ASSET_PICKER:
                 self._app.show_asset_picker(
@@ -317,6 +321,77 @@ class TuiSession:
         title = self.agent.session.title
         label = f"{session_id[:10]} · {title}" if title else session_id
         self.emitter.emit(SystemNote(f"↑ Resumed: {label}"))
+
+    def _open_tree(self) -> None:
+        """Open the session-tree navigator (from /tree or double-Esc)."""
+        if self._agent_running:
+            self.emitter.emit(SystemNote("Finish or interrupt the current turn before browsing the tree.", level="warn"))
+            return
+        self._app.show_tree_picker(self.agent.session.session_id, self._checkout_branch)
+
+    def _checkout_branch(self, target_event_id: int | None, prefill: str, summarize: bool) -> None:
+        """Callback from the tree picker: optionally summarize the branch
+        being abandoned, flip the active path in the DB, reload the agent
+        from it, replay the transcript, and prefill the editor for
+        edit-and-resubmit.
+
+        Only reachable while idle (``_open_tree`` gates on a running
+        turn), so no turn-end save can race the flag flip. A message
+        already sitting in the input queue is an accepted residual race.
+        """
+        import json
+
+        from pydantic_ai.messages import ModelMessagesTypeAdapter, ModelRequest, UserPromptPart
+
+        from .. import db
+        from ..events import CONVERSATION_TYPES
+
+        session_id = self.agent.session.session_id
+        conn = db.connection()
+
+        summary = None
+        if summarize:
+            rows = db.fetch_events(conn, session_id, active_only=False)
+            parents = {r["event_id"]: r["parent_id"] for r in rows}
+            path: set[int] = set()
+            node = target_event_id
+            while node is not None:
+                path.add(node)
+                node = parents.get(node)
+            conv_types = {t.value for t in CONVERSATION_TYPES}
+            abandoned = [r for r in rows if r["active"] and r["type"] in conv_types and r["event_id"] not in path]
+            if abandoned:
+                self.emitter.emit(SystemNote("Summarizing abandoned branch…"))
+                try:
+                    raw = [json.loads(r["payload"]) for r in abandoned]
+                    msgs = list(ModelMessagesTypeAdapter.validate_python(raw))
+                    summary = self.agent.context_manager.summarize_branch(msgs)
+                except Exception:
+                    summary = None
+                if summary is None:
+                    self.emitter.emit(SystemNote("Branch summary failed — continuing without it.", level="warn"))
+
+        with db.transaction(conn):
+            db.checkout_events(conn, session_id, target_event_id)
+
+        if not self.agent.load_session(session_id):
+            self.emitter.emit(SystemNote(f"Failed to reload session after checkout: {session_id}", level="error"))
+            return
+        self._next_reset = False
+
+        if summary:
+            # Persisted as a plain USER_MESSAGE by the next save's
+            # _sync_conversation delta — same pattern as compaction summaries.
+            msg = ModelRequest(parts=[UserPromptPart(content=summary)])
+            self.agent.state.message_history.append(msg)
+            self.agent.state.context.append(msg)
+
+        replay_history(self.agent.state.message_history, self.emitter)
+        if prefill:
+            self.emitter.emit(SystemNote("↷ Checked out — edit the restored prompt and submit to branch."))
+            self._app.prefill_input(prefill)
+        else:
+            self.emitter.emit(SystemNote("↷ Checked out — continue from here to branch."))
 
     def _on_agent_event(self, ev: Event) -> None:
         """React to agent events that need more than rendering. Runs
