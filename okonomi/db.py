@@ -480,7 +480,8 @@ def fetch_events_window(
     types: Iterable[Any] | None = None,
 ) -> list[dict[str, Any]]:
     """±k events around one event — contiguous per-session numbering makes
-    this a plain BETWEEN range."""
+    this a plain BETWEEN range. Near a branch point the range may hold
+    inactive ids and under-fill; walking ``parent_id`` would fix that."""
     sql = "SELECT * FROM events WHERE session_id = ? AND event_id BETWEEN ? AND ? AND active = 1"
     params: list[Any] = [session_id, around_event_id - k, around_event_id + k]
     if types:
@@ -522,6 +523,31 @@ def deactivate_events(conn: sqlite3.Connection, session_id: str, from_event_id: 
         (session_id, from_event_id),
     )
     return cur.rowcount
+
+
+def checkout_events(conn: sqlite3.Connection, session_id: str, target_event_id: int | None) -> int:
+    """Materialize root→``target_event_id`` as the session's active path;
+    every other event goes inactive. ``None`` empties the path (all
+    inactive), matching a full rewind. Returns the active-path length."""
+    rows = conn.execute(
+        "SELECT event_id, parent_id FROM events WHERE session_id = ?", (session_id,)
+    ).fetchall()
+    parents = {r["event_id"]: r["parent_id"] for r in rows}
+    path: list[int] = []
+    node = target_event_id
+    while node is not None:
+        if node not in parents:
+            raise ValueError(f"Event {node} does not exist in session {session_id!r} — cannot check out.")
+        path.append(node)
+        node = parents[node]
+    conn.execute("UPDATE events SET active = 0 WHERE session_id = ? AND active = 1", (session_id,))
+    if path:
+        placeholders = ", ".join("?" for _ in path)
+        conn.execute(
+            f"UPDATE events SET active = 1 WHERE session_id = ? AND event_id IN ({placeholders})",
+            [session_id, *path],
+        )
+    return len(path)
 
 
 def sum_session_usage(conn: sqlite3.Connection, session_id: str) -> dict[str, Any]:

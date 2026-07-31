@@ -14,7 +14,8 @@ approval answer is not, so it leaves no residue.
 
 Exposes the same surface ``TuiSession`` calls on the app: ``run_async``,
 ``exit``, ``call_from_thread``, ``show_approval``, ``show_session_picker``,
-``show_asset_picker``, ``toggle_verbose``.
+``show_asset_picker``, ``show_tree_picker``, ``prefill_input``,
+``toggle_verbose``.
 """
 
 from __future__ import annotations
@@ -27,6 +28,7 @@ from typing import Callable
 from prompt_toolkit.application import Application
 from prompt_toolkit.buffer import Buffer
 from prompt_toolkit.completion import FuzzyCompleter
+from prompt_toolkit.document import Document
 from prompt_toolkit.filters import Condition
 from prompt_toolkit.history import FileHistory
 from prompt_toolkit.key_binding import KeyBindings, merge_key_bindings
@@ -65,12 +67,14 @@ class ReplApp:
         spinner_label_fn: Callable[[], str] | None = None,
         usage_fn: Callable[[], str] | None = None,
         bg_tasks_fn: Callable[[], list] | None = None,
+        on_double_escape: Callable[[], None] | None = None,
     ) -> None:
         self.emitter = emitter
         self.on_submit_cb = on_submit
         # Ctrl+C hook: return True if a running turn was cancelled, False if
         # there was nothing to interrupt (so the app clears the draft instead).
         self.on_interrupt_cb = on_interrupt
+        self.on_double_escape = on_double_escape
         self.spinner_label_fn = spinner_label_fn
         self.usage_fn = usage_fn
         self.bg_tasks_fn = bg_tasks_fn
@@ -240,6 +244,19 @@ class ReplApp:
             if not self.input.text:
                 self.exit()
 
+        @kb.add(
+            "escape",
+            "escape",
+            filter=Condition(
+                lambda: not self.input.text
+                and self._approval_resolve is None
+                and self.input.complete_state is None
+            ),
+        )
+        def _(event):
+            if self.on_double_escape is not None:
+                self.on_double_escape()
+
         return kb
 
     # --- main loop ---
@@ -358,6 +375,15 @@ class ReplApp:
         self._pending_modal = ("asset", on_action, list(artifacts))
         self._stop_app()
 
+    def show_tree_picker(self, session_id: str, on_select) -> None:
+        self._pending_modal = ("tree", on_select, session_id)
+        self._stop_app()
+
+    def prefill_input(self, text: str) -> None:
+        """Put text in the input box, cursor at the end — the buffer
+        survives the modal round-trip, so this lands after re-entry."""
+        self.input.document = Document(text, cursor_position=len(text))
+
 
     async def _run_modal(self) -> None:
         modal = self._pending_modal
@@ -377,6 +403,12 @@ class ReplApp:
                 result = await pick_assets(modal[2])
                 if result is not None:
                     modal[1](result[0], result[1])  # on_action(action, paths)
+            elif modal[0] == "tree":
+                from .pickers import pick_tree
+
+                result = await pick_tree(modal[2])
+                if result is not None:
+                    modal[1](*result)  # on_select(target_event_id, prefill, summarize)
         except Exception as e:  # noqa: BLE001
             self.emitter.emit(SystemNote(f"Picker error: {e}", level="warn"))
 
