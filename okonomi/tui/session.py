@@ -420,7 +420,7 @@ class TuiSession:
         that have finished but not yet been popped from their dicts are
         filtered (race around thread.is_alive during shutdown)."""
         out: list[tuple[str, str]] = []
-        for bg_id, thread in list(self.agent._bg_execs.items()):
+        for bg_id, thread in list(self.agent.executor.threads.items()):
             if thread and thread.is_alive():
                 label = (self.agent._bg_logs.get(bg_id) or {}).get("label", "")
                 out.append((bg_id, label))

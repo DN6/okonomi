@@ -4,10 +4,11 @@ This module provides the OkonomiAgent class that uses Pydantic AI for LLM
 interactions, along with its runtime state (``OkonomiState``), dependency
 container (``AgentDependencies``) and asset-download helpers. The class
 is assembled from focused modules: the turn loop, event wiring, and
-session save/load live here; code execution (``execution``) is a mixin;
-system-prompt construction (``prompt``), provider glue (``provider``),
-tool wrappers (``wrappers``), and image-reference parsing
-(``multimodal``) are plain modules.
+session save/load live here; code execution is a composed
+``CodeExecutor`` (``execute_code``); system-prompt construction
+(``prompt``), provider glue (``provider``), tool wrappers
+(``wrappers``), and image-reference parsing (``multimodal``) are plain
+modules.
 """
 
 import asyncio
@@ -15,7 +16,6 @@ import contextlib
 import inspect
 import json
 import pickle
-import threading
 import time
 import types
 from concurrent.futures import Future, ThreadPoolExecutor
@@ -48,19 +48,37 @@ from ..events import (
 from ..session import Artifact, Session, SessionStatus, asset_subdir_for_file
 from ..tools import (
     AgentTools,
-    BrowserRendererTools,
     FileTools,
-    GenmediaTools,
     SessionsTools,
     SkillTools,
     TerminalTools,
     WebTools,
 )
-from .execution import CodeExecutionMixin
+from .execute_code import CodeExecutor
 from .multimodal import _parse_user_message
 from .prompt import build_system_prompt
 from .provider import CachedOpenRouterModel
-from .wrappers import _short_repr
+
+
+def _short_repr(obj: Any, limit: int = 2000) -> str:
+    """Compact repr for tool return values shown in the UI.
+
+    Tools commonly return dicts with URLs, IDs, and sometimes large payloads.
+    Keep the dict shape readable but avoid multi-megabyte strings landing in
+    the history pane.
+    """
+    try:
+        if isinstance(obj, (dict, list, tuple)):
+            s = json.dumps(obj, indent=2, default=str)
+        else:
+            s = str(obj)
+    except Exception:
+        s = repr(obj)
+    if len(s) > limit:
+        head = int(limit * 0.7)
+        tail = limit - head
+        s = f"{s[:head]}\n...[truncated {len(s):,} chars]...\n{s[-tail:]}"
+    return s
 
 
 @dataclass
@@ -98,7 +116,6 @@ class AgentDependencies:
     """
 
     session: Session
-    tools: dict[str, Any] = field(default_factory=dict)
     verbose: bool = False
     # Fired from add_artifact so the agent can kick off an eager
     # background download for artifacts with a remote ``url``.
@@ -197,7 +214,7 @@ def download_session_assets(artifacts: list[Artifact], session_dir: Path) -> Non
             artifact.path = local_path
 
 
-class OkonomiAgent(CodeExecutionMixin):
+class OkonomiAgent:
     """Pydantic AI-based agent with local code execution.
 
     This agent provides:
@@ -239,30 +256,18 @@ class OkonomiAgent(CodeExecutionMixin):
         )
         self._status: str = ""
 
-        # When True, expensive code (see _expensive_patterns) suspends on
-        # an ApprovalRequest event until a subscriber answers via its
-        # ``respond`` handle. When False (default — headless/one-shot
-        # runs), everything executes without gating.
+        # Approval gating flags + ApprovalRequest flow. Currently unused:
+        # execute_code no longer gates (the expensive-tool path it guarded
+        # was removed). The flow is still wired to the TUI; kept pending a
+        # decision to remove the approval system entirely.
         self.approvals_enabled: bool = False
         self.auto_approve: bool = False
 
-        self._expensive_patterns = [
-            # Local Playwright capture is non-trivial; treat as expensive.
-            "browser.render",
-            # Any genmedia namespace call (run / search / schema). Cheap
-            # methods get gated too — acceptable cost for the simpler rule.
-            "genmedia.",
-            # Legacy direct CLI usage: run("genmedia run ...").
-            "genmedia run",
-            # Direct fal_client calls in raw user code (rare, but still
-            # flagged so the user sees what's running).
-            "fal_client",
-        ]
+        # Owns execute_code: in-process exec, approval gating, bg-exec-N
+        # threads. Composed rather than inherited so its state (live
+        # threads, dispatch counter) has a single owner.
+        self.executor = CodeExecutor(self)
 
-        self._bg_exec_counter = 0
-        # Background execute_code jobs keyed by bg_id. Plain threads (not asyncio
-        # tasks) so they survive the per-turn event loop teardown in the CLI.
-        self._bg_execs: dict[str, threading.Thread] = {}
         # Per-job log registry covering bg-exec-N (Python execute_code jobs)
         # and term-N (terminal.bash background jobs). Survives completion so
         # /logs <id> can read after a job finishes. Each entry:
@@ -375,21 +380,10 @@ class OkonomiAgent(CodeExecutionMixin):
         """Create all tool instances.
 
         Tools are split into two categories:
-        - **Programmatic tools**: Available inside ``execute_code`` via ToolWrapper.
-          The model writes Python that calls these in loops, filters results, etc.
-        - **Standalone tools**: Registered directly on the agent. Each call is a
-          separate model round-trip.
+        Standalone tools are registered directly on the agent (one call per
+        model round-trip). ``execute_code`` is a plain Python REPL — the
+        model imports libraries directly; no tool objects are injected.
         """
-        # Programmatic tools — called from inside execute_code.
-        # Image / video / audio / 3D generation flows through `genmedia`
-        # (any fal endpoint, single namespace). Local image / frame
-        # loading is no longer wrapped — the model uses PIL / imageio
-        # directly via Python imports inside `execute_code`.
-        self.programmatic_tools: dict[str, Any] = {
-            "browser": BrowserRendererTools(),
-            "genmedia": GenmediaTools(),
-        }
-
         # Standalone tools — direct agent tools (one call per round-trip)
         self.terminal = TerminalTools()
         self.terminal._on_bg_register = self._register_bg_log
@@ -399,7 +393,7 @@ class OkonomiAgent(CodeExecutionMixin):
         self.agents = AgentTools()
         self.files = FileTools()
         self.skills = SkillTools(
-            available_tools=set(self.programmatic_tools.keys()) | {"terminal", "web", "sessions", "skills", "files"},
+            available_tools={"terminal", "web", "sessions", "skills", "files"},
         )
 
     def _create_agent(self) -> Agent[AgentDependencies, str]:
@@ -420,16 +414,13 @@ class OkonomiAgent(CodeExecutionMixin):
         self.agents._bind(self)
         self._register_tool(agent, self.agents, rename={"launch": "launch_agent", "list_agents": "list_agents"})
 
-        # Programmatic tools (available inside execute_code)
-        self._register_code_execution_tool(agent)
+        # The execute_code REPL tool
+        self.executor.register_tool(agent)
 
         return agent
 
     def _get_system_prompt(self) -> str:
-        return build_system_prompt(
-            skills=self.skills,
-            programmatic_tools=self.programmatic_tools,
-        )
+        return build_system_prompt(skills=self.skills)
 
     # Per-HTTP-request timeout for the OpenRouter client. Safety belt
     # against a single hung API call — distinct from ``self.timeout``
@@ -529,7 +520,6 @@ class OkonomiAgent(CodeExecutionMixin):
     def _get_dependencies(self) -> AgentDependencies:
         return AgentDependencies(
             session=self.session,
-            tools=self.programmatic_tools,
             verbose=self.verbose,
             on_artifact_added=self._eager_download_artifact,
         )
@@ -1000,7 +990,6 @@ class OkonomiAgent(CodeExecutionMixin):
             return
 
         SKIP_KEYS = {"__builtins__", "asyncio", "get_session_dir"}
-        SKIP_KEYS |= set(self.programmatic_tools)  # tool wrappers
 
         candidates: dict[str, Any] = {}
         for key, value in state.execution_globals.items():
@@ -1008,9 +997,9 @@ class OkonomiAgent(CodeExecutionMixin):
                 continue
             if isinstance(value, (types.ModuleType, types.FunctionType, types.BuiltinFunctionType)):
                 continue
-            # ToolWrappers and Tool instances both carry _tool_instance
-            # or _set_deps — drop anything that smells tool-ish.
-            if hasattr(value, "_tool_instance") or hasattr(value, "_set_deps"):
+            # Tool instances expose __get_metadata__ (ToolMetadataMixin) —
+            # never pickle them; they're re-bound fresh each execute_code call.
+            if hasattr(value, "__get_metadata__"):
                 continue
             candidates[key] = value
 
