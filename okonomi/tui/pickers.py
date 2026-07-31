@@ -1,4 +1,4 @@
-"""On-demand full-screen pickers for the REPL (session + asset).
+"""On-demand full-screen pickers for the REPL (session + asset + tree).
 
 Each is a transient ``prompt_toolkit`` ``Application`` run on the alternate
 screen and awaited; selecting exits with the chosen value, Esc / Ctrl-C exit
@@ -12,15 +12,20 @@ buffer, so it omits live search for now and navigates with the arrow keys.
 
 from __future__ import annotations
 
+import json
 import sys
 
 from prompt_toolkit.application import Application
+from prompt_toolkit.application.current import get_app
 from prompt_toolkit.buffer import Buffer
+from prompt_toolkit.filters import Condition
 from prompt_toolkit.key_binding import KeyBindings
 from prompt_toolkit.layout import HSplit, Layout, Window
 from prompt_toolkit.layout.controls import BufferControl, FormattedTextControl
 from prompt_toolkit.output.defaults import create_output
 
+from .. import db
+from ..events import CONVERSATION_TYPES, EventType
 from ..session import list_sessions
 from ..session import search as content_search
 from ..utils import fuzzy_match
@@ -197,6 +202,191 @@ async def pick_assets(artifacts) -> tuple[str, list[str]] | None:
     body = HSplit(
         [
             Window(FormattedTextControl(lambda: [("class:prompt", "Assets — ↑↓ to move, Space to select")]), height=1),
+            list_win,
+            Window(FormattedTextControl(_footer), height=1),
+        ]
+    )
+    app: Application = Application(
+        layout=Layout(body, focused_element=list_win),
+        key_bindings=kb,
+        full_screen=True,
+        mouse_support=False,
+        style=REPL_STYLE,
+        output=create_output(stdout=sys.__stdout__),  # real terminal, bypass patch_stdout
+    )
+    return await app.run_async()
+
+
+def _prompt_text(payload: str) -> str:
+    """Exact user text of a persisted USER_MESSAGE payload — the editor
+    prefill for edit-and-resubmit. The ``content`` column can't serve here:
+    it's capped and stripped at write time."""
+    try:
+        msg = json.loads(payload)
+        texts: list[str] = []
+        for part in msg.get("parts", []):
+            if part.get("part_kind") != "user-prompt":
+                continue
+            content = part.get("content", "")
+            if isinstance(content, str):
+                texts.append(content)
+            elif isinstance(content, list):
+                texts.extend(c for c in content if isinstance(c, str))
+        return "\n".join(t for t in texts if t).strip()
+    except Exception:
+        return ""
+
+
+def _tree_rows(events: list[dict]) -> list[dict]:
+    """Flatten a session's event forest into display rows for ``pick_tree``.
+
+    Only user/assistant messages become rows — tool calls, tool results,
+    and stream events stay hidden, which collapses long tool runs with no
+    folding logic while keeping every fork point visible (branches start
+    at resubmitted user messages). Depth grows below any node with more
+    than one child. ``checkout_target`` bakes in the selection semantics:
+    a user row checks out to its *parent* (edit and resubmit the prefilled
+    text), an assistant row checks out to itself (continue from there).
+    """
+    by_id = {e["event_id"]: e for e in events}
+    children: dict[int | None, list[int]] = {}
+    for e in events:
+        children.setdefault(e["parent_id"], []).append(e["event_id"])
+    for ids in children.values():
+        ids.sort()
+
+    current_id = max(
+        (e["event_id"] for e in events if e["active"] and e["type"] in (EventType.USER_MESSAGE.value, EventType.ASSISTANT_MESSAGE.value)),
+        default=None,
+    )
+
+    rows: list[dict] = []
+    stack = [(eid, 0) for eid in reversed(children.get(None, []))]
+    while stack:
+        eid, depth = stack.pop()
+        e = by_id[eid]
+        if e["type"] == EventType.USER_MESSAGE.value:
+            rows.append({
+                "event_id": eid,
+                "type": e["type"],
+                "depth": depth,
+                "preview": (e["content"] or "").splitlines()[0] if e["content"] else "(empty)",
+                "active": bool(e["active"]),
+                "is_current": eid == current_id,
+                "checkout_target": e["parent_id"],
+                "prefill": _prompt_text(e["payload"]),
+            })
+        elif e["type"] == EventType.ASSISTANT_MESSAGE.value:
+            rows.append({
+                "event_id": eid,
+                "type": e["type"],
+                "depth": depth,
+                "preview": (e["content"] or "").splitlines()[0] if e["content"] else "(empty)",
+                "active": bool(e["active"]),
+                "is_current": eid == current_id,
+                "checkout_target": eid,
+                "prefill": "",
+            })
+        kids = children.get(eid, [])
+        child_depth = depth + 1 if len(kids) > 1 else depth
+        for k in reversed(kids):
+            stack.append((k, child_depth))
+    return rows
+
+
+async def pick_tree(session_id: str) -> tuple[int | None, str, bool] | None:
+    """Full-screen session-tree navigator → (checkout_target_event_id,
+    prefill_text, summarize_abandoned_branch) or None on cancel.
+
+    Selecting a target that abandons active turns first asks whether to
+    LLM-summarize them into the new branch's context (y/n, Esc backs out).
+    """
+    events = db.fetch_events(db.connection(), session_id, active_only=False)
+    rows = _tree_rows(events)
+    state = {"idx": 0, "confirm": False}
+    for n, r in enumerate(rows):
+        if r["is_current"]:
+            state["idx"] = n
+
+    parents = {e["event_id"]: e["parent_id"] for e in events}
+    conv_types = {t.value for t in CONVERSATION_TYPES}
+
+    def _abandoned_count(target: int | None) -> int:
+        path: set[int] = set()
+        node = target
+        while node is not None:
+            path.add(node)
+            node = parents.get(node)
+        return sum(1 for e in events if e["active"] and e["type"] in conv_types and e["event_id"] not in path)
+
+    def _render():
+        if not rows:
+            return [("class:dim", "  (no messages yet)")]
+        try:
+            height = max(get_app().output.get_size().rows - 3, 5)
+        except Exception:
+            height = 30
+        start = max(0, min(state["idx"] - height // 2, len(rows) - height))
+        out = []
+        for n, r in enumerate(rows[start : start + height], start=start):
+            glyph = "●" if r["type"] == EventType.USER_MESSAGE.value else "○"
+            marker = "  ◀" if r["is_current"] else ""
+            cur = n == state["idx"]
+            style = "class:picker-highlight" if cur else ("" if r["active"] else "class:dim")
+            out.append((style, f"{'›' if cur else ' '} {'  ' * r['depth']}{glyph} {r['preview'][:100]}{marker}\n"))
+        return out
+
+    def _footer():
+        if state["confirm"]:
+            return [("class:prompt", " Summarize the branch you're leaving?  y yes · n no · Esc back")]
+        return [("class:dim", "  ↑↓ move · Enter checkout (user msg → edit & resubmit) · Esc")]
+
+    in_confirm = Condition(lambda: state["confirm"])
+    kb = KeyBindings()
+
+    @kb.add("up", eager=True, filter=~in_confirm)
+    def _(e):
+        if rows:
+            state["idx"] = (state["idx"] - 1) % len(rows)
+
+    @kb.add("down", eager=True, filter=~in_confirm)
+    def _(e):
+        if rows:
+            state["idx"] = (state["idx"] + 1) % len(rows)
+
+    @kb.add("enter", eager=True, filter=~in_confirm)
+    def _(e):
+        if not rows:
+            e.app.exit(result=None)
+            return
+        r = rows[state["idx"]]
+        if _abandoned_count(r["checkout_target"]):
+            state["confirm"] = True
+        else:
+            e.app.exit(result=(r["checkout_target"], r["prefill"], False))
+
+    @kb.add("y", filter=in_confirm)
+    def _(e):
+        r = rows[state["idx"]]
+        e.app.exit(result=(r["checkout_target"], r["prefill"], True))
+
+    @kb.add("n", filter=in_confirm)
+    def _(e):
+        r = rows[state["idx"]]
+        e.app.exit(result=(r["checkout_target"], r["prefill"], False))
+
+    @kb.add("escape")
+    @kb.add("c-c")
+    def _(e):
+        if state["confirm"]:
+            state["confirm"] = False
+        else:
+            e.app.exit(result=None)
+
+    list_win = Window(FormattedTextControl(_render, focusable=True))
+    body = HSplit(
+        [
+            Window(FormattedTextControl(lambda: [("class:prompt", "Session tree — dim rows are inactive branches, ◀ is the current leaf")]), height=1),
             list_win,
             Window(FormattedTextControl(_footer), height=1),
         ]

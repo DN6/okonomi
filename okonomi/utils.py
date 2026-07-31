@@ -12,7 +12,7 @@ def create_chat_client():
     return OpenAI(base_url="https://openrouter.ai/api/v1", api_key=os.environ.get("OPENROUTER_API_KEY"))
 
 
-_SYNTHETIC_PROMPT_PREFIXES = ("[Resumed", "[system]", "[The user interrupted")
+_SYNTHETIC_PROMPT_PREFIXES = ("[Resumed", "[system]", "[The user interrupted", "[Branch summary")
 
 
 # Title generation — kept out of the agent loop. A title is a one-sentence

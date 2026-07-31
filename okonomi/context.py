@@ -31,6 +31,13 @@ SUMMARY_PREFIX = (
     "off — don't repeat work."
 )
 
+BRANCH_SUMMARY_PREFIX = (
+    "[Branch summary] The user rewound this conversation to an earlier "
+    "point and abandoned the branch summarized below. Files or artifacts "
+    "it created may still exist on disk. Don't repeat its work unless "
+    "asked."
+)
+
 _CHARS_PER_TOKEN = 4
 _SUMMARY_MAX_TOKENS = 4000
 _TRUNCATE_AT_CHARS = 3000  # per-part cap in serialization for summarizer
@@ -247,6 +254,22 @@ class ContextManager:
         )
         summary = self._chat(prompt, max_tokens=_SUMMARY_MAX_TOKENS)
         return f"{SUMMARY_PREFIX}\n{summary}" if summary else None
+
+    def summarize_branch(self, messages: list[ModelMessage]) -> str | None:
+        """Summarize an abandoned conversation branch for injection into
+        the branch being switched to. Returns the prefixed summary, or
+        ``None`` if the LLM call failed."""
+        prompt = (
+            "The user rewound a conversation and abandoned the branch below. "
+            "Summarize it as a handoff note for the assistant continuing on "
+            "another branch. Preserve concrete details: file paths, tool calls "
+            "and their results, decisions, error messages, what was completed. "
+            "Be specific, no fluff.\n\n"
+            f"Abandoned branch:\n{_serialize_for_summary(messages)}\n\n"
+            "Write only the summary."
+        )
+        summary = self._chat(prompt, max_tokens=_SUMMARY_MAX_TOKENS)
+        return f"{BRANCH_SUMMARY_PREFIX}\n{summary}" if summary else None
 
     def _prune_old_tool_results(self, messages: list[ModelMessage]) -> tuple[list[ModelMessage], int]:
         """Strip base64 / large HTML everywhere; replace old tool results with placeholder.
