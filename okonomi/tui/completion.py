@@ -5,7 +5,7 @@ from __future__ import annotations
 from prompt_toolkit.completion import Completer, Completion
 
 from ..utils import fuzzy_match
-from .commands import SLASH_COMMANDS
+from .commands import SLASH_COMMANDS, discover_skill_commands
 
 
 class SlashCompleter(Completer):
@@ -21,6 +21,6 @@ class SlashCompleter(Completer):
         if not text.startswith("/") or " " in text:
             return
         query = text[1:].lower()
-        for cmd, desc in SLASH_COMMANDS:
+        for cmd, desc in [*SLASH_COMMANDS, *discover_skill_commands()]:
             if not query or fuzzy_match(query, cmd[1:].lower()):
                 yield Completion(cmd, start_position=-len(text), display=cmd, display_meta=desc)

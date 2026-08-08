@@ -127,6 +127,51 @@ def test_tree_rows_forked_session():
     assert not by_id[5]["active"] and by_id[6]["active"]
 
 
+# ── pickers._abandoned_count + history search filter ─────────────────────
+
+
+def _forked_events():
+    u, a = EventType.USER_MESSAGE, EventType.ASSISTANT_MESSAGE
+    return [
+        _ev(0, None, u, "first ask", 1, _user_payload("first ask")),
+        _ev(1, 0, a, "answer 1", 1),
+        _ev(2, 1, u, "try redis", 1, _user_payload("try redis")),
+        _ev(3, 2, a, "redis done", 1),
+        _ev(4, 1, u, "try sqlite", 0, _user_payload("try sqlite")),
+        _ev(5, 4, a, "sqlite done", 0),
+    ]
+
+
+def test_abandoned_count_shared_helper():
+    from okonomi.tui.pickers import _abandoned_count
+
+    events = _forked_events()
+    parents = {e["event_id"]: e["parent_id"] for e in events}
+    conv_types = {t.value for t in CONVERSATION_TYPES}
+
+    # Checking out the active leaf (3) abandons nothing on the active path.
+    assert _abandoned_count(events, parents, conv_types, 3) == 0
+    # Checking out to node 1 drops active turns 2 and 3 off the path.
+    assert _abandoned_count(events, parents, conv_types, 1) == 2
+    # Checking out to empty path (None) abandons every active conversation turn.
+    assert _abandoned_count(events, parents, conv_types, None) == 4
+
+
+def test_history_preview_filter_matches_tree_rows():
+    """The Ctrl-R picker filters _tree_rows previews with fuzzy_match; a
+    query should surface the matching message and carry its checkout_target."""
+    from okonomi.utils import fuzzy_match
+    from okonomi.tui.pickers import _tree_rows
+
+    rows = _tree_rows(_forked_events())
+    hits = [r for r in rows if fuzzy_match("redis", r["preview"].lower())]
+    assert [r["event_id"] for r in hits] == [2, 3], f"redis hits: {[r['event_id'] for r in hits]}"
+    # user row → edit&resubmit its parent; assistant row → continue from itself
+    by_id = {r["event_id"]: r for r in hits}
+    assert by_id[2]["checkout_target"] == 1 and by_id[2]["prefill"] == "try redis"
+    assert by_id[3]["checkout_target"] == 3 and by_id[3]["prefill"] == ""
+
+
 # ── ContextManager.summarize_branch ──────────────────────────────────────
 
 

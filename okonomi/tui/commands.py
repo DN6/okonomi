@@ -18,6 +18,7 @@ from .. import session as session_store
 from ..constants import OKONOMI_LOVED_DIR
 from ..events import AssistantStream, EventEmitter, SystemNote
 from ..utils import copy_to_clipboard
+from ..tools.skills import BUNDLED_SKILLS_DIR, USER_SKILLS_DIR, _discover_skills, _slugify_heading
 from . import assets
 
 
@@ -74,16 +75,59 @@ def is_slash_command(text: str) -> bool:
     return text.startswith("/") and len(text) > 1
 
 
+def _discovered_skills() -> dict[str, dict]:
+    """All discoverable skills (user + bundled), name → metadata. Empty on
+    any discovery error so slash dispatch/completion degrade gracefully."""
+    try:
+        return _discover_skills([USER_SKILLS_DIR, BUNDLED_SKILLS_DIR])
+    except Exception:
+        return {}
+
+
+def _skill_commands() -> list[tuple[str, str, str]]:
+    """``(slug, real_name, description)`` per skill. The slug is the token
+    typed after ``/`` (skill names may contain spaces, so they're slugged);
+    ``real_name`` is what ``load_skill`` expects. Built-in commands win on a
+    slug clash, and the first skill wins on slug collisions between skills."""
+    out: list[tuple[str, str, str]] = []
+    seen: set[str] = set()
+    for name, info in _discovered_skills().items():
+        slug = _slugify_heading(name)
+        if f"/{slug}" in COMMANDS or slug in seen:
+            continue
+        seen.add(slug)
+        out.append((slug, name, info.get("description", "")))
+    return out
+
+
+def discover_skill_commands() -> list[tuple[str, str]]:
+    """``(/slug, description)`` for each skill, for the slash completer."""
+    return [(f"/{slug}", desc) for slug, _name, desc in _skill_commands()]
+
+
 def handle(command: str, agent: "OkonomiAgent", emitter: EventEmitter) -> "CommandResult | None":
     """Dispatch a slash command to its registered handler.
 
     Returns a ``CommandResult`` when TuiSession must act (exit, picker, forward
     to the agent, …), or None when the command was fully handled in place.
+    A ``/<skill-name>`` that matches no built-in forwards a directive to the
+    agent to load and follow that skill.
     """
     cmd = command.strip()
     name, _, arg = cmd.partition(" ")
     entry = COMMANDS.get(name.lower())
     if entry is None:
+        slug = name[1:]  # strip leading '/'
+        real = next((n for s, n, _ in _skill_commands() if s == slug), None)
+        if real is not None:
+            # Sugar for `/skill <name>`: reach it by slug and inject the full
+            # body the same way, with any trailing text as extra instruction.
+            result = agent.skills._load_full(real)
+            if "content" not in result:
+                emitter.emit(SystemNote(result.get("error", "Skill not found"), level="error"))
+                return None
+            body = f"Follow this skill:\n\n{result['content']}"
+            return CommandResult(Action.FORWARD, f"{body}\n\n{arg.strip()}" if arg.strip() else body)
         emitter.emit(SystemNote(f"Unknown command: {cmd}. Type /help for a list.", level="warn"))
         return None
     return entry.handler(arg.strip(), agent, emitter)
@@ -101,9 +145,22 @@ def _help(arg: str, agent: "OkonomiAgent", emitter: EventEmitter) -> None:
         "",
         "Keys:",
         "  ↑ / ↓        Input history",
+        "  Ctrl+R       Search conversation history / branch from a match",
         "  Ctrl+C       Interrupt running turn / clear draft",
         "  Ctrl+D       Exit",
     ]
+    emitter.emit(SystemNote("\n".join(lines)))
+
+
+@_command("/skills", "List available skills (run one with /<skill-name>)")
+def _skills(arg: str, agent: "OkonomiAgent", emitter: EventEmitter) -> None:
+    cmds = _skill_commands()
+    if not cmds:
+        emitter.emit(SystemNote("No skills found."))
+        return None
+    lines = ["Skills — run with /<name>:"]
+    for slug, _real, desc in sorted(cmds):
+        lines.append(f"  /{slug:<22} {desc}")
     emitter.emit(SystemNote("\n".join(lines)))
 
 

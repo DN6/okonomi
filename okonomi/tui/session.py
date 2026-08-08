@@ -80,6 +80,7 @@ class TuiSession:
             usage_fn=self._usage_label,
             bg_tasks_fn=self._bg_tasks_list,
             on_double_escape=self._open_tree,
+            on_history_search=self._open_history,
         )
 
     # --- Agent worker ---
@@ -328,6 +329,13 @@ class TuiSession:
             self.emitter.emit(SystemNote("Finish or interrupt the current turn before browsing the tree.", level="warn"))
             return
         self._app.show_tree_picker(self.agent.session.session_id, self._checkout_branch)
+
+    def _open_history(self) -> None:
+        """Open the Ctrl-R conversation search (branch by content)."""
+        if self._agent_running:
+            self.emitter.emit(SystemNote("Finish or interrupt the current turn before searching history.", level="warn"))
+            return
+        self._app.show_history_picker(self.agent.session.session_id, self._checkout_branch)
 
     def _checkout_branch(self, target_event_id: int | None, prefill: str, summarize: bool) -> None:
         """Callback from the tree picker: optionally summarize the branch

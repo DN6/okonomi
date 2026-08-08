@@ -294,6 +294,17 @@ def _tree_rows(events: list[dict]) -> list[dict]:
     return rows
 
 
+def _abandoned_count(events: list[dict], parents: dict, conv_types: set, target: int | None) -> int:
+    """Active conversation turns that a checkout to ``target`` would leave
+    off the active path. Shared by the tree navigator and history search."""
+    path: set[int] = set()
+    node = target
+    while node is not None:
+        path.add(node)
+        node = parents.get(node)
+    return sum(1 for e in events if e["active"] and e["type"] in conv_types and e["event_id"] not in path)
+
+
 async def pick_tree(session_id: str) -> tuple[int | None, str, bool] | None:
     """Full-screen session-tree navigator → (checkout_target_event_id,
     prefill_text, summarize_abandoned_branch) or None on cancel.
@@ -310,14 +321,6 @@ async def pick_tree(session_id: str) -> tuple[int | None, str, bool] | None:
 
     parents = {e["event_id"]: e["parent_id"] for e in events}
     conv_types = {t.value for t in CONVERSATION_TYPES}
-
-    def _abandoned_count(target: int | None) -> int:
-        path: set[int] = set()
-        node = target
-        while node is not None:
-            path.add(node)
-            node = parents.get(node)
-        return sum(1 for e in events if e["active"] and e["type"] in conv_types and e["event_id"] not in path)
 
     def _render():
         if not rows:
@@ -360,7 +363,7 @@ async def pick_tree(session_id: str) -> tuple[int | None, str, bool] | None:
             e.app.exit(result=None)
             return
         r = rows[state["idx"]]
-        if _abandoned_count(r["checkout_target"]):
+        if _abandoned_count(events, parents, conv_types, r["checkout_target"]):
             state["confirm"] = True
         else:
             e.app.exit(result=(r["checkout_target"], r["prefill"], False))
@@ -393,6 +396,119 @@ async def pick_tree(session_id: str) -> tuple[int | None, str, bool] | None:
     )
     app: Application = Application(
         layout=Layout(body, focused_element=list_win),
+        key_bindings=kb,
+        full_screen=True,
+        mouse_support=False,
+        style=REPL_STYLE,
+        output=create_output(stdout=sys.__stdout__),  # real terminal, bypass patch_stdout
+    )
+    return await app.run_async()
+
+
+async def pick_history(session_id: str) -> tuple[int | None, str, bool] | None:
+    """Full-screen fuzzy conversation search → same checkout result as
+    ``pick_tree`` (checkout_target_event_id, prefill_text,
+    summarize_abandoned_branch) or None on cancel.
+
+    The search-first counterpart to ``pick_tree``: a live fuzzy buffer
+    filters the current session's message previews into a flat ranked
+    list, and Enter checks out the chosen message with the identical
+    branch semantics (user row → edit & resubmit its parent, assistant
+    row → continue from it), including the summarize-abandoned-branch
+    confirm. Scope is the current session — branching only has meaning
+    within its event graph.
+    """
+    events = db.fetch_events(db.connection(), session_id, active_only=False)
+    all_rows = _tree_rows(events)
+    parents = {e["event_id"]: e["parent_id"] for e in events}
+    conv_types = {t.value for t in CONVERSATION_TYPES}
+    state = {"idx": 0, "confirm": False, "rows": all_rows}
+    search = Buffer()
+
+    def _refilter(_=None) -> None:
+        q = search.text.strip().lower()
+        state["rows"] = all_rows if not q else [r for r in all_rows if fuzzy_match(q, r["preview"].lower())]
+        state["idx"] = 0
+
+    search.on_text_changed += _refilter
+
+    def _render():
+        rows = state["rows"]
+        if not rows:
+            return [("class:dim", "  (no matches)")]
+        try:
+            height = max(get_app().output.get_size().rows - 4, 5)
+        except Exception:
+            height = 30
+        start = max(0, min(state["idx"] - height // 2, len(rows) - height))
+        out = []
+        for n, r in enumerate(rows[start : start + height], start=start):
+            glyph = "●" if r["type"] == EventType.USER_MESSAGE.value else "○"
+            marker = "  ◀" if r["is_current"] else ""
+            cur = n == state["idx"]
+            style = "class:picker-highlight" if cur else ("" if r["active"] else "class:dim")
+            out.append((style, f"{'›' if cur else ' '} {glyph} {r['preview'][:100]}{marker}\n"))
+        return out
+
+    def _footer():
+        if state["confirm"]:
+            return [("class:prompt", " Summarize the branch you're leaving?  y yes · n no · Esc back")]
+        return [("class:dim", "  type to search · ↑↓ move · Enter checkout (user msg → edit & resubmit) · Esc")]
+
+    in_confirm = Condition(lambda: state["confirm"])
+    kb = KeyBindings()
+
+    @kb.add("up", eager=True, filter=~in_confirm)
+    def _(e):
+        if state["rows"]:
+            state["idx"] = (state["idx"] - 1) % len(state["rows"])
+
+    @kb.add("down", eager=True, filter=~in_confirm)
+    def _(e):
+        if state["rows"]:
+            state["idx"] = (state["idx"] + 1) % len(state["rows"])
+
+    @kb.add("enter", eager=True, filter=~in_confirm)
+    def _(e):
+        rows = state["rows"]
+        if not rows:
+            e.app.exit(result=None)
+            return
+        r = rows[state["idx"]]
+        if _abandoned_count(events, parents, conv_types, r["checkout_target"]):
+            state["confirm"] = True
+        else:
+            e.app.exit(result=(r["checkout_target"], r["prefill"], False))
+
+    @kb.add("y", filter=in_confirm)
+    def _(e):
+        r = state["rows"][state["idx"]]
+        e.app.exit(result=(r["checkout_target"], r["prefill"], True))
+
+    @kb.add("n", filter=in_confirm)
+    def _(e):
+        r = state["rows"][state["idx"]]
+        e.app.exit(result=(r["checkout_target"], r["prefill"], False))
+
+    @kb.add("escape")
+    @kb.add("c-c")
+    def _(e):
+        if state["confirm"]:
+            state["confirm"] = False
+        else:
+            e.app.exit(result=None)
+
+    search_win = Window(BufferControl(buffer=search), height=1)
+    body = HSplit(
+        [
+            Window(FormattedTextControl(lambda: [("class:prompt", "Search conversation — type to filter, ↑↓ Enter, Esc")]), height=1),
+            search_win,
+            Window(FormattedTextControl(_render)),
+            Window(FormattedTextControl(_footer), height=1),
+        ]
+    )
+    app: Application = Application(
+        layout=Layout(body, focused_element=search_win),
         key_bindings=kb,
         full_screen=True,
         mouse_support=False,
