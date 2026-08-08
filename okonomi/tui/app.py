@@ -68,6 +68,7 @@ class ReplApp:
         usage_fn: Callable[[], str] | None = None,
         bg_tasks_fn: Callable[[], list] | None = None,
         on_double_escape: Callable[[], None] | None = None,
+        on_history_search: Callable[[], None] | None = None,
     ) -> None:
         self.emitter = emitter
         self.on_submit_cb = on_submit
@@ -75,6 +76,7 @@ class ReplApp:
         # there was nothing to interrupt (so the app clears the draft instead).
         self.on_interrupt_cb = on_interrupt
         self.on_double_escape = on_double_escape
+        self.on_history_search = on_history_search
         self.spinner_label_fn = spinner_label_fn
         self.usage_fn = usage_fn
         self.bg_tasks_fn = bg_tasks_fn
@@ -244,6 +246,11 @@ class ReplApp:
             if not self.input.text:
                 self.exit()
 
+        @kb.add("c-r", eager=True)
+        def _(event):
+            if self._approval_resolve is None and self.on_history_search is not None:
+                self.on_history_search()
+
         @kb.add(
             "escape",
             "escape",
@@ -379,6 +386,10 @@ class ReplApp:
         self._pending_modal = ("tree", on_select, session_id)
         self._stop_app()
 
+    def show_history_picker(self, session_id: str, on_select) -> None:
+        self._pending_modal = ("history", on_select, session_id)
+        self._stop_app()
+
     def prefill_input(self, text: str) -> None:
         """Put text in the input box, cursor at the end — the buffer
         survives the modal round-trip, so this lands after re-entry."""
@@ -407,6 +418,12 @@ class ReplApp:
                 from .pickers import pick_tree
 
                 result = await pick_tree(modal[2])
+                if result is not None:
+                    modal[1](*result)  # on_select(target_event_id, prefill, summarize)
+            elif modal[0] == "history":
+                from .pickers import pick_history
+
+                result = await pick_history(modal[2])
                 if result is not None:
                     modal[1](*result)  # on_select(target_event_id, prefill, summarize)
         except Exception as e:  # noqa: BLE001
