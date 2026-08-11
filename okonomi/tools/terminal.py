@@ -85,8 +85,6 @@ class TerminalTools(ToolMetadataMixin):
             "OPENROUTER_API_KEY",
             "ANTHROPIC_API_KEY",
             "OPENAI_API_KEY",
-            "HF_TOKEN",
-            "FAL_KEY",
             "TAVILY_API_KEY",
         }
 

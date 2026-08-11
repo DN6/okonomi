@@ -12,7 +12,7 @@ import os
 from dotenv import load_dotenv
 
 
-REQUIRED_ENV_VARS = ("OPENROUTER_API_KEY", "HF_TOKEN", "FAL_KEY")
+REQUIRED_ENV_VARS = ("OPENROUTER_API_KEY",)
 
 
 def load_env_or_raise() -> None:
