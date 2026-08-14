@@ -18,8 +18,8 @@ REQUIRED_ENV_VARS = ("OPENROUTER_API_KEY",)
 def load_env_or_raise() -> None:
     """Load ``.env`` and assert required keys are present.
 
-    Call once at app startup (CLI, Discord bot, tests that need real
-    APIs). Raises ``EnvironmentError`` if anything's missing so the
+    Call once at app startup (CLI, tests that need real APIs).
+    Raises ``EnvironmentError`` if anything's missing so the
     failure happens before agent construction, not on the first call.
     """
     load_dotenv()

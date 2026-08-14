@@ -1,23 +1,10 @@
 # Okonomi
 
-Okonomi is an Agent meant for experimenting with creative image creation.
-
-## Features
-
-- **Code Execution**: A persistent Python REPL whose variables survive across turns and sessions
-- **Session Memory**: Sessions are indexed and searchable — recall past conversations, prompts and outputs
-- **Skills**: Progressively-disclosed instruction sets (`ffmpeg`, `p5js`, `research`, `yt-dlp`) loaded on demand
-- **Background Jobs**: Long-running code, shell commands and sub-agents dispatch to the background
-- **Tools**: Shell, file editing, web search and fetch
+A terminal agent that works through a persistent Python REPL, with session memory across runs.
 
 ## Installation
 
-### Prerequisites
-
-- Python 3.11 or higher
-- uv package manager (recommended) or pip
-
-### Clone the repository
+Requires Python 3.11+ and [uv](https://docs.astral.sh/uv/) (or pip).
 
 ```shell
 git clone https://github.com/dn6/okonomi.git
@@ -25,54 +12,42 @@ cd okonomi
 uv pip install -e .
 ```
 
-## Configuration
+## Setup
 
-### Required Environment Variables
-
-Create a `.env` file in your project root with the following variables or set them manually in your environment.
+Okonomi routes all model calls through [OpenRouter](https://openrouter.ai). Create a `.env`
+file in the project root, or export the variables in your shell.
 
 ```bash
-# OpenRouter API Key (Required — all model calls route through OpenRouter)
-# Get from: https://openrouter.ai/keys
+# Required — get a key from https://openrouter.ai/keys
 OPENROUTER_API_KEY=your_openrouter_api_key
 ```
 
-### Optional Environment Variables
+Everything else is optional:
 
 ```bash
-# Tavily API Key — required for web_search / web_fetch
-# Get from: https://app.tavily.com
+# Enables the web_search / web_fetch tools — https://app.tavily.com
 TAVILY_API_KEY=your_tavily_api_key
 
-# Storage root for sessions, research, skills and favourites
-# Default: ~/.okonomi
+# Storage root for sessions, research, skills and favourites (default: ~/.okonomi)
 OKONOMI_HOME=/path/to/okonomi/home
 
 # Skip the shell-command safety checks in the `bash` tool
 OKONOMI_YOLO=false
 ```
 
-## Usage
+Sessions, generated files, saved research and skills all live under `$OKONOMI_HOME`
+(`~/.okonomi` by default). Nothing is written outside it unless you ask for it.
 
-### Interactive Mode
+## Running
 
-```bash
-# Start interactive session
+```shell
+# Interactive session
 okonomi
 
-# You'll be prompted to enter your image generation request
-```
-
-### One-off Task
-
-```bash
+# One-off task
 okonomi --task "Design a futuristic logo"
-```
 
-### Command-Line Options
-
-```bash
-# Resume from the latest session
+# Resume the most recent session
 okonomi --resume
 
 # Load a specific session by ID
@@ -80,15 +55,4 @@ okonomi --session <id>
 
 # Show executed code and full tool output
 okonomi --verbose
-
-# Run as a Discord bot (requires DISCORD_BOT_TOKEN)
-okonomi --discord
 ```
-
-## Contributing
-
-Contributions are welcome! Please feel free to submit a Pull Request.
-
-## Support
-
-For issues, questions, or suggestions, please open an issue on GitHub.
