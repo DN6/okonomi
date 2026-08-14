@@ -72,7 +72,6 @@ Examples:
     parser.add_argument("--task", "-t", help="Task description for the agent (one-off task)")
     parser.add_argument("--resume", "-r", action="store_true", help="Resume from latest session")
     parser.add_argument("--session", "-s", type=str, help="Load specific session by ID")
-    parser.add_argument("--discord", action="store_true", help="Run as a Discord bot")
     parser.add_argument("--verbose", "-V", action="store_true", help="Show executed code and output")
     parser.add_argument("--version", "-v", action="version", version="okonomi 0.1.0")
 
@@ -152,15 +151,6 @@ async def run_agent_async(args: argparse.Namespace, user_request: str) -> None:
 def main() -> None:
     load_env_or_raise()
     args = parse_arguments()
-
-    if args.discord:
-        try:
-            from .integrations.discord_bot import run_discord_bot
-        except ImportError:
-            print(f"{RED}discord.py not installed. Run: pip install okonomi[discord]{RST}")
-            return
-        run_discord_bot()
-        return
 
     is_interactive = not args.task
     if is_interactive:

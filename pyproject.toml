@@ -33,9 +33,6 @@ dependencies = [
 [project.scripts]
 okonomi = "okonomi.cli:main"
 
-[project.optional-dependencies]
-discord = ["discord.py>=2.3.0"]
-
 [dependency-groups]
 debug = [
     "ipdb>=0.13.13",
