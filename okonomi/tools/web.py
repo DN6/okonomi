@@ -1,18 +1,27 @@
-"""Web tools — search and page fetching backed by Tavily."""
+"""Web tools — search via DuckDuckGo and page fetching via httpx."""
 
-import os
-from typing import TypedDict
+import re
+from typing_extensions import TypedDict
 
-from tavily import TavilyClient
+import httpx
+import lxml.html
+from ddgs import DDGS
 
 from okonomi.tools._metadata import ToolMetadataMixin
+
+_FETCH_HEADERS = {
+    "User-Agent": (
+        "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 "
+        "(KHTML, like Gecko) Chrome/122.0 Safari/537.36"
+    )
+}
+_STRIP_TAGS = ("script", "style", "noscript", "nav", "header", "footer", "aside", "form")
 
 
 class WebResultItem(TypedDict, total=False):
     title: str
     url: str
     content: str
-    score: float
 
 
 class WebSearchResult(TypedDict, total=False):
@@ -37,98 +46,58 @@ class WebFetchResult(TypedDict, total=False):
 
 class WebTools(ToolMetadataMixin):
     __namespace__ = "web"
-    __description__ = "Web search and page fetching via Tavily."
+    __description__ = "Web search via DuckDuckGo and page fetching."
 
-    def __init__(self):
-        api_key = os.getenv("TAVILY_API_KEY")
-        self.tavily_client = TavilyClient(api_key=api_key) if api_key else None
-
-    def web_search(
-        self,
-        query: str,
-        max_results: int = 5,
-        search_depth: str = "ultra-fast",
-        include_images: bool = True,
-        include_domains: list[str] | None = None,
-        exclude_domains: list[str] | None = None,
-    ) -> WebSearchResult:
-        """Search the web for a query.
+    def web_search(self, query: str, max_results: int = 5) -> WebSearchResult:
+        """Search the web for a query via DuckDuckGo.
 
         Args:
             query: Search query string.
             max_results: Maximum number of results to return (default: 5).
-            search_depth: ``'ultra-fast'`` for quick scans or ``'advanced'``
-                for deeper, scored results.
-            include_images: Include image results when available.
-            include_domains: Restrict results to these domains.
-            exclude_domains: Exclude results from these domains.
 
         Returns:
-            ``{"query": str, "results": [{"title", "url", "content", "score"}, ...]}``
+            ``{"query": str, "results": [{"title", "url", "content"}, ...]}``
             on success, ``{"error": str, "query": str}`` on failure.
         """
-        if not self.tavily_client:
-            return {"error": "TAVILY_API_KEY not configured", "query": query}
-
         try:
-            response = self.tavily_client.search(
-                query=query,
-                max_results=max_results,
-                search_depth=search_depth,
-                include_images=include_images,
-                include_image_descriptions=True,
-                include_domains=include_domains or [],
-                exclude_domains=exclude_domains or [],
-            )
-
+            hits = DDGS().text(query, max_results=max_results)
             results = [
                 {
-                    "title": r.get("title", ""),
-                    "url": r.get("url", ""),
-                    "content": r.get("content", ""),
-                    "score": r.get("score", 0.0),
+                    "title": h.get("title", ""),
+                    "url": h.get("href", ""),
+                    "content": h.get("body", ""),
                 }
-                for r in response.get("results", [])
+                for h in hits
             ]
             return {"query": query, "results": results}
         except Exception as e:
             return {"error": str(e), "query": query}
 
-    def web_fetch(
-        self,
-        url: str,
-        extract_depth: str = "basic",
-    ) -> WebFetchResult:
-        """Fetch a URL and return its main content as clean text.
+    def web_fetch(self, url: str) -> WebFetchResult:
+        """Fetch a URL and return its main text content.
 
-        Uses Tavily's extract endpoint, which strips boilerplate (nav,
-        ads, footers) and returns the article body in markdown-ish form.
-        Use this when you have a specific page to read — pair with
-        ``web_search`` for discovery.
+        Downloads the page and strips boilerplate (scripts, styles, nav,
+        header/footer) to return the readable body text. Use this when you
+        have a specific page to read — pair with ``web_search`` for discovery.
 
         Args:
             url: The page URL to fetch.
-            extract_depth: ``'basic'`` (faster) or ``'advanced'`` (deeper
-                extraction for content-heavy pages).
 
         Returns:
             ``{"url": str, "content": str}`` on success,
             ``{"error": str, "url": str}`` on failure.
         """
-        if not self.tavily_client:
-            return {"error": "TAVILY_API_KEY not configured", "url": url}
+        try:
+            response = httpx.get(url, headers=_FETCH_HEADERS, follow_redirects=True, timeout=30.0)
+            response.raise_for_status()
+        except Exception as e:
+            return {"error": str(e), "url": url}
 
         try:
-            response = self.tavily_client.extract(urls=[url], extract_depth=extract_depth)
-            results = response.get("results", [])
-            if not results:
-                failed = response.get("failed_results", [])
-                err = failed[0].get("error", "no content extracted") if failed else "no content extracted"
-                return {"error": err, "url": url}
-            first = results[0]
-            return {
-                "url": first.get("url", url),
-                "content": first.get("raw_content", ""),
-            }
+            tree = lxml.html.fromstring(response.text)
+            for element in tree.iter(*_STRIP_TAGS):
+                element.drop_tree()
+            text = re.sub(r"\n\s*\n\s*\n+", "\n\n", tree.text_content()).strip()
+            return {"url": str(response.url), "content": text}
         except Exception as e:
             return {"error": str(e), "url": url}

@@ -15,7 +15,7 @@ from typing import TYPE_CHECKING, Callable
 
 from .. import db
 from .. import session as session_store
-from ..constants import OKONOMI_LOVED_DIR
+from ..config import OKONOMI_LOVED_DIR
 from ..events import AssistantStream, EventEmitter, SystemNote
 from ..utils import copy_to_clipboard
 from ..tools.skills import BUNDLED_SKILLS_DIR, USER_SKILLS_DIR, _discover_skills, _slugify_heading

@@ -7,9 +7,23 @@ logger = logging.getLogger(__name__)
 
 
 def create_chat_client():
+    """OpenAI-compatible client for the sidecar calls (title, compression).
+
+    Returns ``None`` for providers without an OpenAI-compatible endpoint
+    (anthropic) — callers treat that as "sidecar unavailable" and no-op.
+    """
     from openai import OpenAI
 
-    return OpenAI(base_url="https://openrouter.ai/api/v1", api_key=os.environ.get("OPENROUTER_API_KEY"))
+    from .config import select_provider
+
+    provider = select_provider()
+    if provider == "openrouter":
+        return OpenAI(base_url="https://openrouter.ai/api/v1", api_key=os.environ.get("OPENROUTER_API_KEY"))
+    if provider == "openai":
+        return OpenAI(api_key=os.environ.get("OPENAI_API_KEY"))
+    if provider == "huggingface":
+        return OpenAI(base_url="https://router.huggingface.co/v1", api_key=os.environ.get("HF_TOKEN"))
+    return None
 
 
 _SYNTHETIC_PROMPT_PREFIXES = ("[Resumed", "[system]", "[The user interrupted", "[Branch summary")
@@ -18,7 +32,19 @@ _SYNTHETIC_PROMPT_PREFIXES = ("[Resumed", "[system]", "[The user interrupted", "
 # Title generation — kept out of the agent loop. A title is a one-sentence
 # summary of the conversation so far, produced by a small/cheap model in a
 # fire-and-forget background thread (or in batch via scripts/backfill_titles.py).
-TITLE_MODEL = "anthropic/claude-haiku-4-5"
+# Cheap per-provider title model; falls back to the provider's main model
+# where no cheap option is known, so the id is always valid for the endpoint.
+TITLE_MODELS = {
+    "openrouter": "anthropic/claude-haiku-4-5",
+    "anthropic": "claude-haiku-4-5",
+}
+
+
+def _title_model() -> str:
+    from .config import resolve_model_id, select_provider
+
+    provider = select_provider()
+    return TITLE_MODELS.get(provider) or resolve_model_id(provider)
 
 _TITLE_PROMPT = (
     "You write a one-line label for a coding/creative-assistant session. "
@@ -65,7 +91,7 @@ def _compact_messages(messages: list, max_chars: int = 4000) -> str:
     return "\n".join(lines)[:max_chars]
 
 
-def generate_session_title(messages: list, model: str = TITLE_MODEL) -> str:
+def generate_session_title(messages: list, model: str | None = None) -> str:
     """One-sentence title summarizing the conversation so far. ``""`` on failure.
 
     The transcript is passed as delimited material to summarize, NOT as a live
@@ -74,8 +100,13 @@ def generate_session_title(messages: list, model: str = TITLE_MODEL) -> str:
     body = _compact_messages(messages)
     if not body:
         return ""
+    client = create_chat_client()
+    if client is None:
+        return ""
+    if model is None:
+        model = _title_model()
     try:
-        resp = create_chat_client().chat.completions.create(
+        resp = client.chat.completions.create(
             model=model,
             messages=[{"role": "user", "content": _TITLE_PROMPT.format(body=body)}],
             temperature=0.3,

@@ -22,7 +22,7 @@ from pathlib import Path
 
 import yaml
 
-from okonomi.constants import OKONOMI_SKILLS_DIR
+from okonomi.config import OKONOMI_SKILLS_DIR
 from okonomi.tools._metadata import ToolMetadataMixin
 
 
@@ -33,6 +33,7 @@ USER_SKILLS_DIR = OKONOMI_SKILLS_DIR
 
 MAX_NAME_LENGTH = 64
 MAX_DESCRIPTION_LENGTH = 1024
+MAX_INTRO_CHARS = 2000
 VALID_NAME_RE = re.compile(r"^[a-z0-9][a-z0-9._-]*$")
 ALLOWED_SUBDIRS = {"references", "templates", "scripts", "assets"}
 
@@ -270,6 +271,47 @@ def _validate_frontmatter_content(content: str) -> str | None:
     return None
 
 
+def _check_skill_structure(content: str) -> tuple[str | None, list[str]]:
+    """Validate that a SKILL.md discloses section by section.
+
+    Returns ``(hard_error, warnings)``. ``hard_error`` is set only for
+    problems that break ``load_skill_section`` — duplicate heading slugs,
+    which make every colliding section past the first unreachable.
+    ``warnings`` flag structure that still loads but not lazily: an intro
+    (text before the first ``## H2``) large enough that ``load_skill``
+    returns a heavy payload inline on every load.
+    """
+    _, body = _parse_frontmatter(content)
+    intro, sections = _parse_skill_sections(body)
+
+    slugs = [s["slug"] for s in sections]
+    dupes = sorted({s for s in slugs if slugs.count(s) > 1})
+    if dupes:
+        joined = ", ".join(f"'{d}'" for d in dupes)
+        return (
+            f"Duplicate section slug(s) {joined}: multiple headings reduce to the "
+            f"same slug, so load_skill_section can only reach the first and the rest "
+            f"are unreachable. Rename the headings so each is distinct.",
+            [],
+        )
+
+    warnings: list[str] = []
+    if len(intro) > MAX_INTRO_CHARS:
+        if not sections:
+            warnings.append(
+                f"Body has no '## ' (H2) sections and is {len(intro)} chars, so "
+                f"load_skill returns the whole skill inline instead of disclosing it "
+                f"section by section. Break the body into '## ' sections."
+            )
+        else:
+            warnings.append(
+                f"The text before the first '## ' heading is {len(intro)} chars; "
+                f"load_skill returns it inline on every load. Keep it a short preamble "
+                f"(under {MAX_INTRO_CHARS}) and move the bulk under H2 sections."
+            )
+    return None, warnings
+
+
 def _atomic_write(file_path: Path, content: str) -> None:
     file_path.parent.mkdir(parents=True, exist_ok=True)
     fd, temp_path = tempfile.mkstemp(
@@ -500,6 +542,9 @@ class SkillTools(ToolMetadataMixin):
 
         The content must be a complete SKILL.md with YAML frontmatter containing
         at minimum 'name' and 'description' fields, followed by markdown instructions.
+        Structure the body as ``## H2`` sections (the unit of progressive
+        disclosure — load_skill lists them, load_skill_section fetches one) with
+        distinct headings, and keep the preamble before the first H2 short.
 
         Args:
             name: Skill name (lowercase, hyphens/underscores allowed).
@@ -517,6 +562,10 @@ class SkillTools(ToolMetadataMixin):
         if err:
             return {"success": False, "error": err}
 
+        struct_err, warnings = _check_skill_structure(content)
+        if struct_err:
+            return {"success": False, "error": struct_err}
+
         existing = self._get_skills()
         if name in existing:
             return {
@@ -529,11 +578,14 @@ class SkillTools(ToolMetadataMixin):
         _atomic_write(skill_dir / "SKILL.md", content)
 
         self._invalidate_cache()
-        return {
+        result = {
             "success": True,
             "message": f"Skill '{name}' created.",
             "path": str(skill_dir),
         }
+        if warnings:
+            result["warnings"] = warnings
+        return result
 
     def write_skill_file(self, name: str, file_path: str, content: str) -> dict:
         """Add or overwrite a file in a user skill — including SKILL.md.
@@ -561,10 +613,14 @@ class SkillTools(ToolMetadataMixin):
         if skills[name].get("source") == "bundled":
             return {"success": False, "error": f"Cannot modify bundled skill '{name}'. Create a user copy first."}
 
+        warnings: list[str] = []
         if file_path == "SKILL.md":
             err = _validate_frontmatter_content(content)
             if err:
                 return {"success": False, "error": err}
+            struct_err, warnings = _check_skill_structure(content)
+            if struct_err:
+                return {"success": False, "error": struct_err}
             target = skills[name]["path"]
         else:
             err = _validate_file_path(file_path)
@@ -574,7 +630,10 @@ class SkillTools(ToolMetadataMixin):
 
         _atomic_write(target, content)
         self._invalidate_cache()
-        return {"success": True, "message": f"Wrote '{file_path}' in skill '{name}'."}
+        result = {"success": True, "message": f"Wrote '{file_path}' in skill '{name}'."}
+        if warnings:
+            result["warnings"] = warnings
+        return result
 
     def patch_skill_file(self, name: str, old_text: str, new_text: str, file_path: str = "SKILL.md") -> dict:
         """Surgical find-and-replace within a single file in a user
@@ -613,14 +672,21 @@ class SkillTools(ToolMetadataMixin):
             }
 
         new_content = content.replace(old_text, new_text, 1)
+        warnings: list[str] = []
         if file_path == "SKILL.md":
             err = _validate_frontmatter_content(new_content)
             if err:
                 return {"success": False, "error": err}
+            struct_err, warnings = _check_skill_structure(new_content)
+            if struct_err:
+                return {"success": False, "error": struct_err}
 
         _atomic_write(target, new_content)
         self._invalidate_cache()
-        return {"success": True, "message": f"Patched '{file_path}' in skill '{name}'."}
+        result = {"success": True, "message": f"Patched '{file_path}' in skill '{name}'."}
+        if warnings:
+            result["warnings"] = warnings
+        return result
 
     def delete_skill(self, name: str) -> dict:
         """Delete a user skill entirely (SKILL.md + every file under it).

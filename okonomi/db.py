@@ -28,7 +28,7 @@ from enum import Enum
 from pathlib import Path
 from typing import Any, Iterable
 
-from .constants import OKONOMI_SESSIONS_DIR
+from .config import OKONOMI_SESSIONS_DIR
 
 
 DB_FILENAME = "okonomi.db"

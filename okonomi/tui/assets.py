@@ -14,7 +14,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING
 
 from .. import session as _session
-from ..constants import OKONOMI_LOVED_DIR
+from ..config import OKONOMI_LOVED_DIR
 from ..events import EventEmitter, SystemNote
 from ..utils import copy_to_clipboard
 

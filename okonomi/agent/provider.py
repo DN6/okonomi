@@ -1,10 +1,15 @@
-"""Provider-layer glue for OpenRouter — the only module that should know
-about provider-specific quirks (caching, response-schema patches)."""
+"""Provider glue — builds the pydantic-ai model for the active provider.
+
+Each provider uses its stock pydantic-ai model class. Provider-specific
+SDKs (anthropic, huggingface_hub, openai) are imported lazily inside the
+matching branch so a user only needs the SDK for the provider they use.
+"""
 
 import logging
-from typing import Any
+import os
 
-from pydantic_ai.models.openrouter import OpenRouterModel
+from pydantic_ai.models import Model
+from pydantic_ai.models.openrouter import OpenRouterModel, OpenRouterModelSettings
 
 
 # Patch: OpenRouter returns service_tier="standard" which pydantic-ai doesn't accept.
@@ -21,33 +26,58 @@ except Exception:
 logger = logging.getLogger(__name__)
 
 
-class CachedOpenRouterModel(OpenRouterModel):
-    """OpenRouterModel with Anthropic prompt caching.
+def build_model(provider: str, model_id: str, timeout: float) -> Model:
+    """Construct the pydantic-ai model for ``provider``.
 
-    Uses OpenRouter's top-level cache_control to automatically cache
-    the conversation prefix for Claude models, reducing input token
-    costs by ~75% on multi-turn conversations.
+    ``openrouter`` keeps ``openrouter_usage`` so per-request USD cost is
+    returned in each response; the other providers use stock settings.
     """
+    if provider == "openrouter":
+        # openrouter_usage={"include": True} makes OpenRouter return
+        # usage.cost (actual USD spent) per response — pulled out in
+        # _accumulate_usage and persisted as actual_cost_usd.
+        return OpenRouterModel(
+            model_id,
+            settings=OpenRouterModelSettings(
+                timeout=timeout,
+                openrouter_usage={"include": True},
+            ),
+        )
 
-    def __init__(self, model_name: str, enable_caching: bool = True, **kwargs: Any):
-        super().__init__(model_name, **kwargs)
-        self._enable_caching = enable_caching and "claude" in model_name.lower()
-        if self._enable_caching:
-            logger.info("Prompt caching enabled for %s", model_name)
+    from pydantic_ai.settings import ModelSettings
 
-    async def _completions_create(self, *args: Any, **kwargs: Any) -> Any:
-        if self._enable_caching:
-            model_settings = args[2] if len(args) > 2 else kwargs.get("model_settings", {})
+    settings = ModelSettings(timeout=timeout)
 
-            extra_body = dict(model_settings.get("extra_body", {}) or {})
-            extra_body["cache_control"] = {"type": "ephemeral"}
-            if isinstance(model_settings, dict):
-                model_settings = {**model_settings, "extra_body": extra_body}
-            else:
-                model_settings["extra_body"] = extra_body
-            if len(args) > 2:
-                args = (*args[:2], model_settings, *args[3:])
-            else:
-                kwargs["model_settings"] = model_settings
+    if provider == "anthropic":
+        from pydantic_ai.models.anthropic import AnthropicModel
+        from pydantic_ai.providers.anthropic import AnthropicProvider
 
-        return await super()._completions_create(*args, **kwargs)
+        return AnthropicModel(
+            model_id,
+            provider=AnthropicProvider(api_key=os.environ["ANTHROPIC_API_KEY"]),
+            settings=settings,
+        )
+
+    if provider == "openai":
+        from pydantic_ai.models.openai import OpenAIChatModel
+        from pydantic_ai.providers.openai import OpenAIProvider
+
+        return OpenAIChatModel(
+            model_id,
+            provider=OpenAIProvider(api_key=os.environ["OPENAI_API_KEY"]),
+            settings=settings,
+        )
+
+    if provider == "huggingface":
+        from pydantic_ai.models.huggingface import HuggingFaceModel
+        from pydantic_ai.providers.huggingface import HuggingFaceProvider
+
+        return HuggingFaceModel(
+            model_id,
+            # provider_name="auto" routes to whichever inference provider
+            # serves the model (HF needs base_url/provider_name/hf_client).
+            provider=HuggingFaceProvider(api_key=os.environ["HF_TOKEN"], provider_name="auto"),
+            settings=settings,
+        )
+
+    raise ValueError(f"Unknown provider '{provider}'")
