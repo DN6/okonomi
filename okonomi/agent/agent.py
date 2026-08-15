@@ -28,7 +28,7 @@ from urllib.parse import urlparse
 import httpx
 from pydantic_ai import Agent
 from pydantic_ai.messages import ModelResponse, ToolCallPart
-from pydantic_ai.models.openrouter import OpenRouterModelSettings
+from pydantic_ai.models import Model
 
 from ..context import _CHARS_PER_TOKEN, ContextManager, count_tokens, strip_unanswered_tool_calls
 from ..events import (
@@ -57,7 +57,8 @@ from ..tools import (
 from .execute_code import CodeExecutor
 from .multimodal import _parse_user_message
 from .prompt import build_system_prompt
-from .provider import CachedOpenRouterModel
+from .provider import build_model
+from ..config import resolve_model_id, select_provider
 
 
 def _short_repr(obj: Any, limit: int = 2000) -> str:
@@ -226,13 +227,14 @@ class OkonomiAgent:
     def __init__(
         self,
         *,
-        model_id: str = "anthropic/claude-sonnet-4-5",
+        model_id: str | None = None,
         timeout: float = 600.0,
         compress_at_tokens: int = 170_000,
         session_id: str | None = None,
         verbose: bool = False,
     ):
-        self.model_id = model_id
+        self.provider = select_provider()
+        self.model_id = model_id or resolve_model_id(self.provider)
         self.timeout = timeout
         self.compress_at_tokens = compress_at_tokens
         self.session = Session(session_id or "", model=model_id, state=OkonomiState())
@@ -429,19 +431,8 @@ class OkonomiAgent:
     # genuinely long work.
     _REQUEST_TIMEOUT_S = 60.0
 
-    def _create_model(self) -> CachedOpenRouterModel:
-        # `openrouter_usage={"include": True}` makes OpenRouter return
-        # `usage.cost` (actual USD spent on the call) in each response.
-        # We pull that out per-turn in `_accumulate_usage` and persist
-        # it as `actual_cost_usd` — authoritative billing without
-        # maintaining a local pricing table.
-        return CachedOpenRouterModel(
-            self.model_id,
-            settings=OpenRouterModelSettings(
-                timeout=self._REQUEST_TIMEOUT_S,
-                openrouter_usage={"include": True},
-            ),
-        )
+    def _create_model(self) -> Model:
+        return build_model(self.provider, self.model_id, self._REQUEST_TIMEOUT_S)
 
     def _register_tool(
         self,
@@ -654,7 +645,7 @@ class OkonomiAgent:
         multi-round tool-calling turns where the model is invoked many
         times per user message.
         """
-        usage = agent_run.usage()
+        usage = agent_run.usage
         details = getattr(usage, "details", {}) or {}
         reasoning = int(details.get("reasoning_tokens") or details.get("output_reasoning_tokens") or 0)
         in_toks = usage.input_tokens or 0

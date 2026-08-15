@@ -1,7 +1,7 @@
 [project]
 name = "okonomi"
 version = "0.1.0"
-description = "AI-powered image generation agent with creative strategies"
+description = "A terminal agent for creative tasks; a learning project on harness design"
 readme = "README.md"
 requires-python = ">=3.10"
 license = { text = "MIT" }
@@ -23,11 +23,14 @@ dependencies = [
   "httpx>=0.28.1",
   "mcp[cli]>=1.12.2",
   "prompt-toolkit>=3.0.43",
-  "pydantic-ai>=1.25.0",
+  "pydantic-ai>=2.27.0",
+  "anthropic>=0.121.0",
+  "huggingface-hub>=0.34.0",
   "python-dotenv>=1.0.0",
   "pyyaml>=6.0",
   "rich>=14.0.0",
-  "tavily-python>=0.5.0",
+  "ddgs>=9.0.0",
+  "lxml>=5.0.0",
 ]
 
 [project.scripts]

@@ -5,7 +5,7 @@ here rather than in the core loop. Pure functions — everything they need
 is passed in, nothing is read off the agent.
 """
 
-from ..constants import (
+from ..config import (
     OKONOMI_FAVOURITES_DIR,
     OKONOMI_RESEARCH_DIR,
     OKONOMI_SESSIONS_DIR,
@@ -41,7 +41,7 @@ def _build_skills_index(skills) -> str:
 def _build_storage_paths() -> dict[str, str]:
     """Resolve the storage directories the agent should know about.
 
-    Honors $OKONOMI_HOME (via ``okonomi.constants``). The model reads
+    Honors $OKONOMI_HOME (via ``okonomi.config``). The model reads
     these paths, so they must reflect the user's actual filesystem
     layout — not the documented defaults.
     """

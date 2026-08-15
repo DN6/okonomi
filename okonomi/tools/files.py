@@ -9,7 +9,7 @@ surface.
 """
 
 from pathlib import Path
-from typing import TypedDict
+from typing_extensions import TypedDict
 
 from okonomi.tools._metadata import ToolMetadataMixin
 

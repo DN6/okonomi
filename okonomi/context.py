@@ -176,8 +176,10 @@ class ContextManager:
 
         Returns the compressed message list on success, or ``None`` if
         no compression happened (under threshold, too few messages,
-        empty middle, or LLM call failed).
+        empty middle, no sidecar client, or LLM call failed).
         """
+        if self._client is None:
+            return None
         before = count_tokens(messages)
         if before < self.compress_at_tokens:
             return None

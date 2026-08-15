@@ -8,7 +8,7 @@ with ``scripts/export_session.py``.
 metadata + accounting (an embedded ``TokenTracker``) plus the attached
 conversation body (``state``). ``save`` appends new events; resume reads
 the active conversation rows back. ``session_dir`` (assets + globals.pkl)
-is ``constants.OKONOMI_SESSIONS_DIR/<session_id>``, a pure function of
+is ``config.OKONOMI_SESSIONS_DIR/<session_id>``, a pure function of
 the id, never renamed.
 
 Cross-session reads span all sessions, so they live as module-level
@@ -35,7 +35,7 @@ if TYPE_CHECKING:
 SessionStatus = Literal["in_progress", "completed", "interrupted", "error", "abandoned"]
 
 from . import db
-from .constants import OKONOMI_SESSIONS_DIR
+from .config import OKONOMI_SESSIONS_DIR
 from .events import (
     CONVERSATION_TYPES,
     Event,
