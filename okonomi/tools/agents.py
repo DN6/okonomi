@@ -11,6 +11,7 @@ from dataclasses import dataclass
 from datetime import datetime
 
 from ..events import SystemNote
+from ..utils import shutdown_loop
 
 
 @dataclass
@@ -67,10 +68,8 @@ class AgentTools:
 
         parent = self._parent_agent
 
-        approvals_enabled = parent.approvals_enabled
-
         # Register in the parent agent's shared bg-log registry so /jobs
-        # and /logs see launched agents alongside bg-exec-N and term-N.
+        # and /logs see launched agents alongside term-N shell jobs.
         # The reader snapshots the BackgroundTask record (status, error,
         # artifact count) — full transcript capture would require routing
         # the bg agent's emitter through here, which the launch site
@@ -106,16 +105,6 @@ class AgentTools:
                     compress_at_tokens=parent.compress_at_tokens,
                     session_id=parent.session.session_id,
                 )
-                # Sub-agent approval requests forward to the parent's
-                # emitter — the event carries its own resolve handle, so
-                # whoever answers there resolves the sub-agent's wait.
-                if approvals_enabled:
-                    agent.approvals_enabled = True
-                    from okonomi.events import ApprovalRequest
-
-                    agent.emitter.subscribe(
-                        lambda ev: parent.emitter.emit(ev) if isinstance(ev, ApprovalRequest) else None
-                    )
 
                 loop = asyncio.new_event_loop()
                 asyncio.set_event_loop(loop)
@@ -133,9 +122,7 @@ class AgentTools:
                     final_status = "error"
                     parent.emitter.emit(SystemNote(f"✗ Agent failed: {label} — {e}", level="error"))
                 finally:
-                    from okonomi.cli import _shutdown_loop
-
-                    _shutdown_loop(loop)
+                    shutdown_loop(loop)
             except Exception as e:
                 bg_task.status = "failed"
                 bg_task.error = str(e)

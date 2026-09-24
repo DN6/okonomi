@@ -3,7 +3,6 @@ name: research
 description: "Deep creative research and conceptual exploration upstream of media creation. Develops rich, well-researched visual concepts before any pixels are made — for AI image gen, photography, illustration, concept art, or video. Covers: brainstorming visual ideas, mood boards, style/movement exploration, reference mapping, concept briefs, prompt packages, palette/composition analysis, and art history deep dives. Trigger when users want to: brainstorm visuals, explore a style, build a mood board, develop a concept brief, craft image prompts, plan a photoshoot, flesh out a vague idea, or when they say 'I want something that looks like X.'"
 metadata:
   tags: [concept, research, ideation, visual-language, prompt-crafting, mood-board, art-direction]
-  related_skills: [genmedia]
 ---
 
 # Research
@@ -21,18 +20,18 @@ The six-step process and the pitfalls below are each their own ``## H2``. Pull t
 - Art history or cross-cultural deep dives feeding into a project.
 - Whenever the user names a style they want but you can't articulate what makes it work.
 
-**Not for**: actual generation (do this *first*, then hand the brief to `genmedia`), pure technical questions (look up the relevant skill directly), one-shot prompt requests where the user is already specific.
+**Not for**: actual generation (do this *first*, then hand the brief off for generation), pure technical questions (look up the relevant skill directly), one-shot prompt requests where the user is already specific.
 
 ## How to use
 
 Six-step process; each is a drillable section:
 
 1. **Listen and clarify** — surface intent, destination, emotional target, references, constraints. See `listen-and-clarify`.
-2. **Check prior research** — `recall(query=...)` (one call covers conversation content, session titles, and media prompts) first; then `bash` over `$OKONOMI_HOME/research/`. See `check-prior-research`.
+2. **Check prior research** — `recall(query=...)` (one call covers conversation content, session titles, and media prompts) first; then the mind wiki at `$OKONOMI_HOME/mind/`. See `check-prior-research`.
 3. **Apply creative strategies** — push beyond the obvious (conceptual blending, forced connections, assumption reversal). See `apply-creative-strategies`.
 4. **Research and explore** — `web_search` / `web_fetch` for artists, movements, references. Pursue visual language, reference mapping, cross-pollination. **For 2-4 genuinely independent strands (e.g. "films + comics + photography" for a noir brief), fan out via `launch_agent` instead of serial tool calls** — cuts a 5-min serial session to ~2 min of parallel work. See `research-and-explore` for the pattern.
 5. **Synthesize and structure** — pick a format (concept brief, prompt package, exploration document, photography direction). See `synthesize-and-structure`.
-6. **Save the research** — write self-contained markdown to `$OKONOMI_HOME/research/<slug>-concept-brief.md`. See `save-the-research`.
+6. **Save the research** — file findings into the mind wiki at `$OKONOMI_HOME/mind/` as interlinked pages. See `save-the-research`.
 
 Vocabulary lookups (composition, color, lighting, art movements, creative-strategy techniques, output templates) live in `references/` — load on demand via `load_skill_reference("research", "<name>")`.
 
@@ -55,12 +54,12 @@ Infer what you can; ask about the rest. Bias toward asking rather than assuming.
 Before starting fresh, search for existing work. Use the cross-session memory ladder (cheap → fall-back):
 
 1. `recall(query=...)` — BM25-ranked FTS5 over every saved conversation, session title, and artifact. Hits carry snippets and goal/resolution bookends. The right starting point for "have we explored X before?".
-2. Saved research files on disk:
+2. The mind wiki — interlinked pages of prior distilled research:
    ```python
-   bash(command='ls $OKONOMI_HOME/research/')
-   search(pattern='<keyword>', path='$OKONOMI_HOME/research/', file_glob='*.md')
+   bash(command='ls $OKONOMI_HOME/mind/')
+   search(pattern='<keyword>', path='$OKONOMI_HOME/mind/', file_glob='*.md')
    ```
-   Read promising files to assess relevance.
+   Read a matching page, then **walk its `[[wikilinks]]`** — neighboring pages hold related concepts that share no keywords with your query. Backlinks work too: `search(pattern='\[\[<slug>\]\]', path='$OKONOMI_HOME/mind/')` finds every page that references a concept.
 3. `recall(session_id=...)` — drill into one promising hit for full metadata + artifacts + the conversation head/tail.
 
 Try synonyms, related styles, artist names. If relevant prior work exists, surface it: *"You explored something similar when you worked on X — want to build from that?"*
@@ -104,25 +103,37 @@ serially. Cuts a 5-minute serial session to ~2 minutes of parallel
 work, and each strand gets full attention from its own agent context
 rather than the parent juggling angles.
 
-Pattern — sub-agents write briefs to disk, parent reads + synthesizes:
+Pattern — sub-agents write briefs to disk, parent reads + synthesizes.
+Build the strand list conceptually — for a "noir" brief: `films` (1940s
+film noir cinematography), `comics` (noir illustration / comic art
+lineage), `photo` (contemporary noir photographers) — then make one
+direct `launch_agent` tool call per strand:
 
-```python
-import os
-session_dir = get_session_dir()
-strands = [
-    ("films", "Research 1940s film noir cinematography — lighting, framing, B&W tonality. Cite 3-5 specific films with shot examples."),
-    ("comics", "Research noir illustration / comic art lineage (Sin City, Eisner, etc.). Line-work conventions, panel composition."),
-    ("photo", "Research contemporary noir photographers. Modern reinterpretations of the noir aesthetic."),
-]
-for slug, prompt in strands:
-    out_path = f"{session_dir}/research_strand_{slug}.md"
-    full_prompt = (
-        f"{prompt}\n\n"
-        f"Use web_search / web_fetch. Produce a tight 200-word brief. "
-        f"Save it as markdown to: {out_path}\n"
-        f"End by printing the file path so the parent knows where to find it."
-    )
-    launch_agent(task=full_prompt, description=f"noir/{slug}")
+```
+launch_agent(
+    task="Research 1940s film noir cinematography — lighting, framing, "
+         "B&W tonality. Cite 3-5 specific films with shot examples.\n\n"
+         "Use web_search / web_fetch. Produce a tight 200-word brief. "
+         "Save it as markdown to: $OKONOMI_SESSION_DIR/research_strand_films.md\n"
+         "End by printing the file path so the parent knows where to find it.",
+    description="noir/films",
+)
+launch_agent(
+    task="Research noir illustration / comic art lineage (Sin City, Eisner, "
+         "etc.). Line-work conventions, panel composition.\n\n"
+         "Use web_search / web_fetch. Produce a tight 200-word brief. "
+         "Save it as markdown to: $OKONOMI_SESSION_DIR/research_strand_comics.md\n"
+         "End by printing the file path so the parent knows where to find it.",
+    description="noir/comics",
+)
+launch_agent(
+    task="Research contemporary noir photographers. Modern reinterpretations "
+         "of the noir aesthetic.\n\n"
+         "Use web_search / web_fetch. Produce a tight 200-word brief. "
+         "Save it as markdown to: $OKONOMI_SESSION_DIR/research_strand_photo.md\n"
+         "End by printing the file path so the parent knows where to find it.",
+    description="noir/photo",
+)
 ```
 
 After launching, poll `list_agents()` until all show `done`. Then read
@@ -149,16 +160,36 @@ Pick the output format that fits. Full templates in `output-formats` reference:
 
 ### Save the research
 
-Always save output as markdown to `$OKONOMI_HOME/research/` with a descriptive filename (e.g., `solarpunk-cityscape-concept-brief.md`). The file must be **self-contained** — someone reading it cold should understand the concept, references, and direction without needing the conversation.
+File results into the mind wiki at `$OKONOMI_HOME/mind/` — a flat directory of interlinked markdown pages, not monolithic reports. Two kinds of page come out of a research run:
+
+1. **Concept pages** — one per distinct concept the research surfaced: an aesthetic, an artist/film/work reference, a recurring motif, a technique. Filename is the kebab-case slug of the concept name (`sodium-vapour-night.md`).
+2. **The synthesis page** — the concept brief / prompt package itself, as its own page that links out to the concept pages it draws on. It stays **self-contained** (someone reading it cold should understand the concept, references, and direction) while its `[[links]]` connect it into the wiki.
+
+**Update before create.** Search for an existing page on each concept first (`search(pattern='<concept>', path='$OKONOMI_HOME/mind/')`). If one exists, revise/extend it and bump `updated:` — never write a duplicate page for the same concept.
+
+Page format:
+
+```markdown
+---
+name: sodium-vapour-night
+description: one-line summary shown when the wiki is listed
+tags: [aesthetic, night, colour]
+created: 2026-09-07
+updated: 2026-09-07
+---
+
+Prose: what this is, what makes it work, where it came from. Reference
+related concepts inline as [[grain]] or [[theyyam-portraits]] — the links
+are the graph; link generously to pages that exist or should exist.
+```
 
 ```python
-session_dir = get_session_dir()  # not used here, but available
 import os
-research_dir = os.path.expandvars("$OKONOMI_HOME/research")
-os.makedirs(research_dir, exist_ok=True)
-path = f"{research_dir}/<slug>-concept-brief.md"
+mind_dir = os.path.expandvars("$OKONOMI_HOME/mind")
+os.makedirs(mind_dir, exist_ok=True)
+path = f"{mind_dir}/<slug>.md"
 with open(path, "w") as f:
-    f.write(brief_markdown)
+    f.write(page_markdown)
 print(path)
 ```
 

@@ -1,7 +1,6 @@
 """Startup configuration — filesystem layout, environment variables, and
 model-provider resolution, resolved once at import.
 
-Every ``OKONOMI_*`` environment variable is declared in one place here.
 The model provider is auto-detected from which API key is set: exactly
 one key → that provider; none → error; more than one → error asking the
 user to disambiguate via ``OKONOMI_PROVIDER``.
@@ -13,16 +12,10 @@ from pathlib import Path
 from dotenv import load_dotenv
 
 
-# --- Environment variables (single registry of every OKONOMI_* var) ---
-ENV_HOME = "OKONOMI_HOME"          # storage root (default ~/.okonomi)
-ENV_PROVIDER = "OKONOMI_PROVIDER"  # force a provider when several keys are set
-ENV_MODEL = "OKONOMI_MODEL"        # override the provider's default model id
-ENV_YOLO = "OKONOMI_YOLO"          # bypass the bash safety checks
-
-# --- Filesystem layout, rooted at $OKONOMI_HOME ---
-OKONOMI_HOME = Path(os.getenv(ENV_HOME, str(Path.home() / ".okonomi")))
+# --- Filesystem layout, rooted at $OKONOMI_HOME (default ~/.okonomi) ---
+OKONOMI_HOME = Path(os.getenv("OKONOMI_HOME", str(Path.home() / ".okonomi")))
 OKONOMI_SESSIONS_DIR = OKONOMI_HOME / "sessions"
-OKONOMI_RESEARCH_DIR = OKONOMI_HOME / "research"
+OKONOMI_MIND_DIR = OKONOMI_HOME / "mind"
 OKONOMI_SKILLS_DIR = OKONOMI_HOME / "skills"
 OKONOMI_FAVOURITES_DIR = OKONOMI_HOME / "favourites"
 OKONOMI_LOVED_DIR = OKONOMI_HOME / "loved"
@@ -58,16 +51,15 @@ def select_provider() -> str:
     auto-detected: exactly one key present → that provider; none →
     error; more than one → error listing the valid provider strings.
     """
-    forced = (os.getenv(ENV_PROVIDER) or "").strip().lower()
+    forced = (os.getenv("OKONOMI_PROVIDER") or "").strip().lower()
     if forced:
         if forced not in PROVIDER_ENV_KEYS:
             raise EnvironmentError(
-                f"{ENV_PROVIDER}='{forced}' is not a known provider. "
-                f"Set it to one of: {', '.join(PROVIDERS)}."
+                f"OKONOMI_PROVIDER='{forced}' is not a known provider. " f"Set it to one of: {', '.join(PROVIDERS)}."
             )
         key = PROVIDER_ENV_KEYS[forced]
         if not os.getenv(key):
-            raise EnvironmentError(f"{ENV_PROVIDER}='{forced}' but {key} is not set.")
+            raise EnvironmentError(f"OKONOMI_PROVIDER='{forced}' but {key} is not set.")
         return forced
 
     available = _providers_with_keys()
@@ -77,7 +69,7 @@ def select_provider() -> str:
     if len(available) > 1:
         raise EnvironmentError(
             f"Multiple provider keys set ({', '.join(available)}). "
-            f"Set {ENV_PROVIDER} to pick one of: {', '.join(PROVIDERS)}."
+            f"Set OKONOMI_PROVIDER to pick one of: {', '.join(PROVIDERS)}."
         )
     return available[0]
 
@@ -85,14 +77,12 @@ def select_provider() -> str:
 def resolve_model_id(provider: str) -> str:
     """Model id for ``provider``: ``OKONOMI_MODEL`` overrides everything;
     otherwise the provider's default from ``PROVIDER_DEFAULT_MODELS``."""
-    override = (os.getenv(ENV_MODEL) or "").strip()
+    override = (os.getenv("OKONOMI_MODEL") or "").strip()
     if override:
         return override
     default = PROVIDER_DEFAULT_MODELS.get(provider)
     if not default:
-        raise EnvironmentError(
-            f"No default model for provider '{provider}'. Set {ENV_MODEL} to a model id."
-        )
+        raise EnvironmentError(f"No default model for provider '{provider}'. Set OKONOMI_MODEL to a model id.")
     return default
 
 

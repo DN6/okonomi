@@ -49,6 +49,10 @@ REPL_STYLE = Style.from_dict(
         # Picker rows (session / asset modals) — these were referenced but
         # never defined, so the selected row had no highlight.
         "picker-highlight": f"bg:{_SURFACE_HI} {_ACCENT} bold",
+        # Session-tree role tags: who wrote the row.
+        "tree.user": f"{_ACCENT} bold",
+        "tree.agent": f"{_AMBER} bold",
+        "tree.guide": _MUTED,
         "dim": _MUTED,
     }
 )

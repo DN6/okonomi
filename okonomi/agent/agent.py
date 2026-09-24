@@ -1,44 +1,39 @@
-"""Pydantic AI-based agent for Okonomi with code execution.
+"""Pydantic AI-based agent for Okonomi.
 
 This module provides the OkonomiAgent class that uses Pydantic AI for LLM
 interactions, along with its runtime state (``OkonomiState``), dependency
-container (``AgentDependencies``) and asset-download helpers. The class
-is assembled from focused modules: the turn loop, event wiring, and
-session save/load live here; code execution is a composed
-``CodeExecutor`` (``execute_code``); system-prompt construction
-(``prompt``), provider glue (``provider``), tool wrappers
-(``wrappers``), and image-reference parsing (``multimodal``) are plain
-modules.
+container (``AgentDependencies``), asset-download helpers and
+image-reference parsing. The class is assembled from focused modules:
+the turn loop, event wiring, and session save/load live here; code runs
+through the sandboxed ``bash`` tool (``tools.terminal``); system-prompt
+construction (``prompt``), provider glue (``provider``), and tool
+wrappers (``wrappers``) are plain modules.
 """
 
 import asyncio
 import contextlib
 import inspect
 import json
-import pickle
-import time
-import types
+import mimetypes
+import re
 from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
 from typing import Any
-from urllib.parse import urlparse
+from urllib.parse import unquote, urlparse
 
 import httpx
 from pydantic_ai import Agent
-from pydantic_ai.messages import ModelResponse, ToolCallPart
+from pydantic_ai.messages import BinaryContent, ImageUrl, ModelResponse, ToolCallPart
 from pydantic_ai.models import Model
 
 from ..context import _CHARS_PER_TOKEN, ContextManager, count_tokens, strip_unanswered_tool_calls
 from ..events import (
-    ApprovalRequest,
     AssistantStream,
     Event,
     EventEmitter,
     Interrupt,
-    JobFinished,
-    JobStarted,
     StatusChanged,
     SystemNote,
     ToolCallDisplay,
@@ -54,8 +49,7 @@ from ..tools import (
     TerminalTools,
     WebTools,
 )
-from .execute_code import CodeExecutor
-from .multimodal import _parse_user_message
+from .jobs import JobRegistry
 from .prompt import build_system_prompt
 from .provider import build_model
 from ..config import resolve_model_id, select_provider
@@ -97,9 +91,6 @@ class OkonomiState:
     # Compression never touches it.
     message_history: list[Any] = field(default_factory=list)
     artifacts: list[Artifact] = field(default_factory=list)
-    # REPL state across execute_code turns (model-bound locals).
-    # Persisted best-effort to globals.pkl (picklable values only).
-    execution_globals: dict[str, Any] = field(default_factory=dict)
 
     # ── non-persistent — recomputed on resume ────────────────────────────
     # Working set sent to the LLM each turn. Sanitized and compressed
@@ -109,7 +100,7 @@ class OkonomiState:
 
 @dataclass
 class AgentDependencies:
-    """Dependencies injected into pydantic-ai tool calls and execute_code.
+    """Dependencies injected into pydantic-ai tool calls.
 
     Holds a reference to the live ``Session`` — its attached state is
     where tool wrappers record artifacts, and ``session.session_dir``
@@ -117,7 +108,6 @@ class AgentDependencies:
     """
 
     session: Session
-    verbose: bool = False
     # Fired from add_artifact so the agent can kick off an eager
     # background download for artifacts with a remote ``url``.
     # Signature: (artifact: Artifact) -> None, must not raise.
@@ -145,7 +135,7 @@ class AgentDependencies:
 
 
 # Maps a file extension to the artifact_type used by /assets and search_artifacts.
-# execute_code writes media straight to the session dir (PIL/matplotlib/ffmpeg)
+# bash commands write media straight to the session dir (PIL/matplotlib/ffmpeg)
 # without going through add_artifact; a post-run sweep keyed on this table is what
 # turns those files into tracked assets.
 _MEDIA_EXT_TO_TYPE = {
@@ -215,11 +205,102 @@ def download_session_assets(artifacts: list[Artifact], session_dir: Path) -> Non
             artifact.path = local_path
 
 
+# The user can mention image URLs, data: URIs, or local paths in plain text;
+# the helpers below resolve them into pydantic-ai multimodal content parts.
+_IMAGE_EXTS = (".png", ".jpg", ".jpeg", ".webp", ".gif", ".bmp", ".tiff")
+_IMAGE_REF_RE = re.compile(
+    r"""(?:https?://|file://|data:image/[a-zA-Z]+;base64,)[^\s<>"'`]+""",
+    re.IGNORECASE,
+)
+_IMAGE_EXT_RE = re.compile(r"\.(?:png|jpg|jpeg|webp|gif|bmp|tiff)\b", re.IGNORECASE)
+_PATH_ANCHOR_RE = re.compile(r"(?:[/~]|\./)")
+_SUPPORTED_IMAGE_MIME = {"image/png", "image/jpeg", "image/gif", "image/webp"}
+
+
+def _resolve_image(ref: str):
+    """Return a pydantic-ai content part for ``ref``, or None for dead
+    paths / unsupported formats."""
+    if ref.startswith(("http://", "https://", "data:")):
+        return ImageUrl(url=ref)
+    # Finder drag-and-drop yields file:///foo/bar%20baz.png — decode it.
+    path_str = unquote(ref[7:]) if ref.startswith("file://") else ref
+    media_type, _ = mimetypes.guess_type(path_str)
+    if media_type not in _SUPPORTED_IMAGE_MIME:
+        return None
+    try:
+        data = Path(path_str).expanduser().read_bytes()
+    except (OSError, ValueError):
+        return None
+    return BinaryContent(data=data, media_type=media_type)
+
+
+def _iter_image_refs(text: str):
+    """Yield image refs (URLs, data: URIs, validated local paths) found
+    in ``text``, deduplicated. Local paths are robust to spaces,
+    backslash-escapes, and surrounding quotes — we walk back from each
+    image-extension occurrence to a path-start anchor and validate
+    against the filesystem before yielding."""
+    seen: set[str] = set()
+
+    for m in _IMAGE_REF_RE.finditer(text):
+        ref = m.group(0).rstrip(".,;:)\"'")
+        is_image = ref.startswith("data:image/") or ref.split("?", 1)[0].lower().endswith(_IMAGE_EXTS)
+        if is_image and ref not in seen:
+            seen.add(ref)
+            yield ref
+
+    for ext_m in _IMAGE_EXT_RE.finditer(text):
+        ext_end = ext_m.end()
+        line_start = text.rfind("\n", 0, ext_end) + 1
+        for anchor in _PATH_ANCHOR_RE.finditer(text, line_start, ext_end):
+            raw = text[anchor.start() : ext_end].strip("\"'").replace("\\ ", " ")
+            try:
+                p = Path(raw).expanduser()
+            except (OSError, ValueError):
+                continue
+            if p.is_file():
+                key = str(p)
+                if key not in seen:
+                    seen.add(key)
+                    yield key
+                break
+
+
+def _parse_user_message(text: str, emitter=None):
+    """If ``text`` mentions images, return ``[text, *image_parts]`` so the
+    model sees both the pixels and the string references it can pass
+    downstream. Returns ``text`` unchanged when no images resolve.
+
+    Dead refs (path missing, unsupported format) surface as SystemNote
+    events so the user sees *why* their image wasn't attached.
+    """
+    parts: list = []
+    dead: list[str] = []
+    for ref in _iter_image_refs(text):
+        part = _resolve_image(ref)
+        if part is None:
+            dead.append(ref)
+        else:
+            parts.append(part)
+
+    if emitter is not None:
+        for ref in dead:
+            emitter.emit(
+                SystemNote(
+                    f"Couldn't attach image {ref!r} — file missing, unreadable, "
+                    "or unsupported format (need png/jpg/gif/webp).",
+                    level="warn",
+                )
+            )
+
+    return [text, *parts] if parts else text
+
+
 class OkonomiAgent:
-    """Pydantic AI-based agent with local code execution.
+    """Pydantic AI-based agent.
 
     This agent provides:
-    - Code execution with tool instances injected into the environment
+    - Sandboxed shell execution via the bash tool
     - Session management for continuity
     - Message history for multi-turn conversations
     """
@@ -231,14 +312,12 @@ class OkonomiAgent:
         timeout: float = 600.0,
         compress_at_tokens: int = 170_000,
         session_id: str | None = None,
-        verbose: bool = False,
     ):
         self.provider = select_provider()
         self.model_id = model_id or resolve_model_id(self.provider)
         self.timeout = timeout
         self.compress_at_tokens = compress_at_tokens
         self.session = Session(session_id or "", model=model_id, state=OkonomiState())
-        self.verbose = verbose
         self._setup_tools()
 
         # Background pool for eager asset downloads. Daemon threads —
@@ -258,30 +337,14 @@ class OkonomiAgent:
         )
         self._status: str = ""
 
-        # Approval gating flags + ApprovalRequest flow. Currently unused:
-        # execute_code no longer gates (the expensive-tool path it guarded
-        # was removed). The flow is still wired to the TUI; kept pending a
-        # decision to remove the approval system entirely.
-        self.approvals_enabled: bool = False
-        self.auto_approve: bool = False
-
-        # Owns execute_code: in-process exec, approval gating, bg-exec-N
-        # threads. Composed rather than inherited so its state (live
-        # threads, dispatch counter) has a single owner.
-        self.executor = CodeExecutor(self)
-
-        # Per-job log registry covering bg-exec-N (Python execute_code jobs)
-        # and term-N (terminal.bash background jobs). Survives completion so
-        # /logs <id> can read after a job finishes. Each entry:
-        #   {"kind", "label", "started_at", "ended_at", "status", "_reader"}
-        # `_reader` is a zero-arg callable returning the current snapshot.
-        self._bg_logs: dict[str, dict[str, Any]] = {}
-
         # Event bus the agent pushes typed UI events onto. Always present;
         # callers subscribe what they want (the REPL transcript, or
         # nothing). Default has zero subscribers — events accumulate in
         # ``emitter.history()`` and nothing is rendered.
         self.emitter = EventEmitter()
+        # Shared background-job registry (term-N, launched
+        # agents, /bg tasks). /jobs, /logs, and the status bar read it.
+        self.jobs = JobRegistry(self.emitter)
         self._turn_count = 0
         # Stream-event persistence cursors: system notes are flushed from
         # the emitter's history at save (everything past this index);
@@ -292,7 +355,7 @@ class OkonomiAgent:
         # same event pipe instead of a raw print (built before the emitter).
         self.context_manager.emitter = self.emitter
         self._current_stream: Any = None
-        # Tracks the ToolCall event for the in-flight execute_code so we can
+        # Tracks the ToolCall event for the in-flight tool call so we can
         # attach its output/error back to the UI when the tool returns.
         self._pending_tool_calls: list[Any] = []
         # Background-job completions surface as JobFinished events on the
@@ -323,22 +386,6 @@ class OkonomiAgent:
         if emitter is not None:
             emitter.emit(StatusChanged(value))
 
-    async def _request_approval(self, code: str) -> bool | str:
-        """Emit an ``ApprovalRequest`` and suspend until a subscriber
-        answers via its ``respond`` handle (thread-safe, one-shot)."""
-        loop = asyncio.get_running_loop()
-        fut: asyncio.Future[bool | str] = loop.create_future()
-
-        def respond(decision: bool | str) -> None:
-            def _resolve() -> None:
-                if not fut.done():
-                    fut.set_result(decision)
-
-            loop.call_soon_threadsafe(_resolve)
-
-        self.emitter.emit(ApprovalRequest(code=code, respond=respond))
-        return await fut
-
     def _job_finished(
         self,
         *,
@@ -348,18 +395,19 @@ class OkonomiAgent:
         new_artifacts: int = 0,
         produced_artifacts: list | None = None,
     ) -> None:
-        """Emit ``JobFinished`` for a completed background job (bg-exec
-        blocks and term commands both route here)."""
-        refs = [{"artifact_type": a.artifact_type, "path": a.path, "url": a.url} for a in produced_artifacts or []]
-        self.emitter.emit(
-            JobFinished(
-                job_id=bg_id,
-                status="error" if error else "ok",
-                error=error,
-                output=output,
-                new_artifacts=new_artifacts,
-                artifact_refs=refs,
-            )
+        """Delegate to the shared JobRegistry (see ``okonomi.agent.jobs``),
+        sweeping the session dir first so the finished job's outputs are
+        registered as artifacts before the completion event fires."""
+        try:
+            self._sync_session_assets(self._get_dependencies())
+        except Exception:  # noqa: BLE001
+            pass
+        self.jobs.finished(
+            bg_id=bg_id,
+            error=error,
+            output=output,
+            new_artifacts=new_artifacts,
+            produced_artifacts=produced_artifacts,
         )
 
     def reload(self) -> dict[str, int]:
@@ -381,15 +429,21 @@ class OkonomiAgent:
     def _setup_tools(self) -> None:
         """Create all tool instances.
 
-        Tools are split into two categories:
-        Standalone tools are registered directly on the agent (one call per
-        model round-trip). ``execute_code`` is a plain Python REPL — the
-        model imports libraries directly; no tool objects are injected.
+        All tools are standalone: registered directly on the agent, one
+        call per model round-trip. ``bash`` is the execution surface —
+        subprocesses get a scrubbed env and $OKONOMI_SESSION_DIR.
         """
+
+        def _session_dir() -> str:
+            d = self.session.session_dir
+            d.mkdir(parents=True, exist_ok=True)
+            return str(d)
+
         # Standalone tools — direct agent tools (one call per round-trip)
         self.terminal = TerminalTools()
         self.terminal._on_bg_register = self._register_bg_log
         self.terminal._on_bg_finish = self._mark_bg_log_done
+        self.terminal._session_dir_fn = _session_dir
         self.web = WebTools()
         self.sessions = SessionsTools()
         self.agents = AgentTools()
@@ -415,9 +469,6 @@ class OkonomiAgent:
         self._register_tool(agent, self.files)
         self.agents._bind(self)
         self._register_tool(agent, self.agents, rename={"launch": "launch_agent", "list_agents": "list_agents"})
-
-        # The execute_code REPL tool
-        self.executor.register_tool(agent)
 
         return agent
 
@@ -481,6 +532,13 @@ class OkonomiAgent:
                                 agent_self.emitter.emit(pending.finish(output=output, error=error_msg))
                             except Exception:  # noqa: BLE001
                                 pass
+                        if tn == "bash":
+                            # bash writes media straight into the session
+                            # dir; sweep so outputs register as artifacts.
+                            try:
+                                agent_self._sync_session_assets(agent_self._get_dependencies())
+                            except Exception:  # noqa: BLE001
+                                pass
                         return result
                     except Exception as exc:
                         # Tool raised — surface traceback to the UI so the
@@ -511,39 +569,21 @@ class OkonomiAgent:
     def _get_dependencies(self) -> AgentDependencies:
         return AgentDependencies(
             session=self.session,
-            verbose=self.verbose,
             on_artifact_added=self._eager_download_artifact,
         )
 
     def _register_bg_log(self, *, task_id: str, label: str, reader, kind: str | None = None) -> None:
-        """Called when any bg job starts (bg-exec blocks, term commands,
-        launched agents, /bg tasks). Records the job in the shared log
-        registry so /jobs and /logs <id> see it.
-
-        Kind defaults to the task_id prefix so /jobs renders the right
-        column without each call site threading it through."""
-        prefix = kind or (task_id.split("-", 1)[0] if "-" in task_id else "task")
-        self._bg_logs[task_id] = {
-            "kind": prefix,
-            "label": label,
-            "started_at": time.time(),
-            "ended_at": None,
-            "status": "running",
-            "_reader": reader,
-        }
-        self.emitter.emit(JobStarted(job_id=task_id, kind=prefix, label=label))
+        """Delegate to the shared JobRegistry (see ``okonomi.agent.jobs``)."""
+        self.jobs.register(task_id=task_id, label=label, reader=reader, kind=kind)
 
     def _mark_bg_log_done(self, *, task_id: str, status: str) -> None:
-        """Called when a registered bg job (term-N) finishes."""
-        entry = self._bg_logs.get(task_id)
-        if entry is not None:
-            entry["status"] = status
-            entry["ended_at"] = time.time()
+        """Delegate to the shared JobRegistry (see ``okonomi.agent.jobs``)."""
+        self.jobs.mark_done(task_id=task_id, status=status)
 
-    def _sync_session_assets(self, deps: "AgentDependencies", *, tool_name: str = "execute_code") -> int:
+    def _sync_session_assets(self, deps: "AgentDependencies", *, tool_name: str = "bash") -> int:
         """Register media files in the session dir that aren't tracked yet.
 
-        execute_code writes images/video/audio/etc. straight to the session
+        bash commands write images/video/audio/etc. straight to the session
         directory (PIL.save, matplotlib.savefig, ffmpeg, imageio) without ever
         calling add_artifact, so those outputs never reach /assets, the SQLite
         index, or search_artifacts. This sweep walks the session dir and adds an
@@ -671,21 +711,6 @@ class OkonomiAgent:
             cost_usd=cost,
         )
 
-    def _extract_code(self, part: ToolCallPart) -> str:
-        """Extract code string from an execute_code tool call."""
-        args = part.args
-        if isinstance(args, dict):
-            return args.get("code", "")
-        if isinstance(args, str):
-            try:
-                parsed = json.loads(args)
-                return parsed.get("code", "") if isinstance(parsed, dict) else ""
-            except json.JSONDecodeError:
-                return args
-        if hasattr(args, "code"):
-            return args.code
-        return str(args)
-
     def _finish_pending_tool_call(self, *, output: str = "", error: str | None = None) -> None:
         """Mark the next pending tool-call widget as complete. Used by paths
         that resolve a tool call without invoking it (approval skip /
@@ -702,20 +727,7 @@ class OkonomiAgent:
         """Emit a ToolCall event for ``part``. The subscriber (TUI widget
         or stdout printer) handles rendering."""
         call_id = getattr(part, "tool_call_id", "") or ""
-        if part.tool_name == "execute_code":
-            code = self._extract_code(part)
-            if not code:
-                return
-            line_count = code.count("\n") + 1
-            ev = self.emitter.emit(
-                ToolCallDisplay(
-                    "execute_code",
-                    args=f"{line_count} lines",
-                    details=code,
-                    tool_call_id=call_id,
-                )
-            )
-        elif part.tool_name == "load_skill":
+        if part.tool_name == "load_skill":
             args = part.args
             if isinstance(args, str):
                 try:
@@ -751,9 +763,6 @@ class OkonomiAgent:
         # need the prior turn's value.
         prior_interrupted = self._was_interrupted
         self._was_interrupted = False
-        # "Approve all" applies to this turn only — a new user message
-        # implicitly resets it.
-        self.auto_approve = False
         self.session.task_input = user_message
         deps = self._get_dependencies()
 
@@ -913,7 +922,6 @@ class OkonomiAgent:
 
         session.save()
         self._flush_stream_events()
-        self._serialize_user_globals()
 
         # Titles are generated out-of-band by a small model, fire-and-forget,
         # so the agent never blocks on (or owns) titling. Refresh on every
@@ -952,11 +960,6 @@ class OkonomiAgent:
         # Notes emitted before the switch belong to the previous session.
         self._persisted_note_count = len(self.emitter.history())
         self._pending_stream_events = []
-
-        # Restore Python locals the model bound during the prior session.
-        # Tool wrappers / helpers are re-injected on the next execute_code
-        # call, so we only need user-bound vars here.
-        self._restore_user_globals()
         return True
 
     def _flush_stream_events(self) -> None:
@@ -968,70 +971,3 @@ class OkonomiAgent:
         pending, self._pending_stream_events = self._pending_stream_events, []
         if notes or pending:
             self.session.append_stream_events([*notes, *pending])
-
-    def _serialize_user_globals(self) -> None:
-        """Save picklable user-bound variables from ``execution_globals`` to
-        ``<session_dir>/globals.pkl``. Tool wrappers, modules, functions,
-        and anything that fails to pickle are silently skipped — the goal
-        is to recover the most-used patterns (URLs, paths, lists of
-        descriptions, intermediate dicts), not arbitrary live objects.
-        """
-        state = self.state
-        if not state.execution_globals:
-            return
-
-        SKIP_KEYS = {"__builtins__", "asyncio", "get_session_dir"}
-
-        candidates: dict[str, Any] = {}
-        for key, value in state.execution_globals.items():
-            if key in SKIP_KEYS or key.startswith("__"):
-                continue
-            if isinstance(value, (types.ModuleType, types.FunctionType, types.BuiltinFunctionType)):
-                continue
-            # Tool instances expose __get_metadata__ (ToolMetadataMixin) —
-            # never pickle them; they're re-bound fresh each execute_code call.
-            if hasattr(value, "__get_metadata__"):
-                continue
-            candidates[key] = value
-
-        if not candidates:
-            return
-
-        try:
-            session_dir = self.session.session_dir
-            session_dir.mkdir(parents=True, exist_ok=True)
-            path = session_dir / "globals.pkl"
-            try:
-                with open(path, "wb") as f:
-                    pickle.dump(candidates, f, protocol=pickle.HIGHEST_PROTOCOL)
-                return
-            except Exception:
-                pass
-            # One of the values is unpicklable — fall back to per-key.
-            clean: dict[str, Any] = {}
-            for key, value in candidates.items():
-                try:
-                    pickle.dumps(value)
-                except Exception:
-                    continue
-                clean[key] = value
-            with open(path, "wb") as f:
-                pickle.dump(clean, f, protocol=pickle.HIGHEST_PROTOCOL)
-        except Exception:
-            pass
-
-    def _restore_user_globals(self) -> None:
-        """Counterpart to ``_serialize_user_globals``. Reads
-        ``<session_dir>/globals.pkl`` if present and merges into
-        ``state.execution_globals``. Tool wrappers + helpers will be
-        reinstalled on the next ``execute_code`` call."""
-        try:
-            globals_path = self.session.session_dir / "globals.pkl"
-            if not globals_path.exists():
-                return
-            with open(globals_path, "rb") as f:
-                snapshot = pickle.load(f)
-            if isinstance(snapshot, dict):
-                self.state.execution_globals.update(snapshot)
-        except Exception:
-            pass

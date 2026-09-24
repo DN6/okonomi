@@ -1,14 +1,14 @@
 """Session storage. SQLite is the single source of truth for everything:
 metadata, the event stream (conversation messages + system events), and
-artifacts. ``globals.pkl`` (binary, non-searchable) is the only remaining
-per-session file besides ``assets/``; a session can be dumped to JSONL
-with ``scripts/export_session.py``.
+artifacts. ``assets/`` (generated media) is the only per-session file
+tree on disk; a session can be dumped to JSONL with
+``scripts/export_session.py``.
 
 ``Session`` is one sessions-table row that knows how to persist itself:
 metadata + accounting (an embedded ``TokenTracker``) plus the attached
 conversation body (``state``). ``save`` appends new events; resume reads
-the active conversation rows back. ``session_dir`` (assets + globals.pkl)
-is ``config.OKONOMI_SESSIONS_DIR/<session_id>``, a pure function of
+the active conversation rows back. ``session_dir`` (``assets/``) is
+``config.OKONOMI_SESSIONS_DIR/<session_id>``, a pure function of
 the id, never renamed.
 
 Cross-session reads span all sessions, so they live as module-level
@@ -173,8 +173,7 @@ class Session:
     model: str = ""  # primary LLM model id (the agent's brain)
     # Accounting — token counts + actual USD cost, summed across the run
     tokens: TokenTracker = field(default_factory=TokenTracker)
-    # The conversation body (messages, artifacts, execution globals,
-    # working set). Forward-referenced so this module never imports the
+    # The conversation body (messages, artifacts, working set). Forward-referenced so this module never imports the
     # agent package at runtime; the agent attaches it, and metadata-only
     # reads (``load`` / ``_from_row``) leave it None.
     state: "OkonomiState" = None
@@ -185,7 +184,7 @@ class Session:
 
     @property
     def session_dir(self) -> Path:
-        """This session's folder (globals.pkl, assets/) —
+        """This session's folder (``assets/``) —
         a pure function of the id, never renamed."""
         return OKONOMI_SESSIONS_DIR / self.session_id
 
@@ -321,9 +320,7 @@ class Session:
 
         conn = db.connection()
         if around_event_id is not None:
-            rows = db.fetch_events_window(
-                conn, self.session_id, around_event_id, window, types=CONVERSATION_TYPES
-            )
+            rows = db.fetch_events_window(conn, self.session_id, around_event_id, window, types=CONVERSATION_TYPES)
         else:
             rows = db.fetch_events(conn, self.session_id, types=CONVERSATION_TYPES)
         try:
@@ -446,38 +443,44 @@ def search(query: str, *, limit: int = 20) -> list[dict[str, Any]]:
     snippet that pins the thing itself."""
     hits: list[dict[str, Any]] = []
     for h in search_events(query, limit=limit):
-        hits.append({
-            "source": "event",
-            "session_id": h["session_id"],
-            "session_title": h.get("session_title") or "",
-            "event_id": h["event_id"],
-            "snippet": h.get("snippet") or "",
-            "timestamp": h.get("timestamp") or "",
-            "score": h.get("score") or 0.0,
-        })
+        hits.append(
+            {
+                "source": "event",
+                "session_id": h["session_id"],
+                "session_title": h.get("session_title") or "",
+                "event_id": h["event_id"],
+                "snippet": h.get("snippet") or "",
+                "timestamp": h.get("timestamp") or "",
+                "score": h.get("score") or 0.0,
+            }
+        )
     for h in search_sessions(query, limit=limit):
-        hits.append({
-            "source": "session",
-            "session_id": h["session_id"],
-            "session_title": h.get("title") or "",
-            "snippet": h.get("task_input") or "",
-            "num_artifacts": h.get("num_artifacts") or 0,
-            "timestamp": h.get("created_at") or "",
-            "score": h.get("score") or 0.0,
-        })
+        hits.append(
+            {
+                "source": "session",
+                "session_id": h["session_id"],
+                "session_title": h.get("title") or "",
+                "snippet": h.get("task_input") or "",
+                "num_artifacts": h.get("num_artifacts") or 0,
+                "timestamp": h.get("created_at") or "",
+                "score": h.get("score") or 0.0,
+            }
+        )
     for h in search_artifacts(query, limit=limit):
-        hits.append({
-            "source": "artifact",
-            "session_id": h["session_id"],
-            "session_title": h.get("title") or "",
-            "artifact_id": h.get("artifact_id"),
-            "artifact_type": h.get("artifact_type") or "",
-            "path": h.get("path") or "",
-            "url": h.get("url") or "",
-            "snippet": h.get("prompt") or h.get("description") or "",
-            "timestamp": h.get("created_at") or "",
-            "score": h.get("score") or 0.0,
-        })
+        hits.append(
+            {
+                "source": "artifact",
+                "session_id": h["session_id"],
+                "session_title": h.get("title") or "",
+                "artifact_id": h.get("artifact_id"),
+                "artifact_type": h.get("artifact_type") or "",
+                "path": h.get("path") or "",
+                "url": h.get("url") or "",
+                "snippet": h.get("prompt") or h.get("description") or "",
+                "timestamp": h.get("created_at") or "",
+                "score": h.get("score") or 0.0,
+            }
+        )
     hits.sort(key=lambda h: h["score"])
     return hits[:limit]
 
@@ -485,9 +488,7 @@ def search(query: str, *, limit: int = 20) -> list[dict[str, Any]]:
 def read_window(session_id: str, around_event_id: int, *, window: int = 5) -> list[dict[str, Any]]:
     """Lean conversation rows around one event — for scrolling from a
     search hit without loading payloads."""
-    rows = db.fetch_events_window(
-        db.connection(), session_id, around_event_id, window, types=CONVERSATION_TYPES
-    )
+    rows = db.fetch_events_window(db.connection(), session_id, around_event_id, window, types=CONVERSATION_TYPES)
     return [_lean_event(r) for r in rows]
 
 
@@ -495,7 +496,9 @@ def _lean_event(r: dict[str, Any]) -> dict[str, Any]:
     return {"event_id": r["event_id"], "type": r["type"], "content": r["content"], "timestamp": r["timestamp"]}
 
 
-def session_bookends(session_id: str, *, first_n: int = 3, last_n: int = 3) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+def session_bookends(
+    session_id: str, *, first_n: int = 3, last_n: int = 3
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
     """First/last user+assistant exchanges of a session — the goal and
     the resolution, as lean dicts with ``content`` text."""
     first, last = db.fetch_bookends(

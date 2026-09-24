@@ -45,13 +45,15 @@ from .palette import ACCENT as _ACCENT, AMBER as _WARN, ERROR as _ERROR, MUTED a
 _ASSISTANT_STYLE = "color(110)"  # LLM gray
 _DIM = "dim"  # rich style keyword
 
-# Lines of tool output shown inline in compact mode before clamping.
-_OUTPUT_CLAMP = 10
+# Lines of tool output shown inline in compact mode before clamping,
+# and the per-line char cap (a single long line would otherwise wrap
+# into many terminal rows and defeat the clamp).
+_OUTPUT_CLAMP = 4
+_OUTPUT_LINE_CAP = 160
 
 # Tool name → (gerund while running, past tense when done) for the action
 # header. Unmapped tools fall back to the raw name. Extend as needed.
 _TOOL_VERBS = {
-    "execute_code": ("Running code", "Ran code"),
     "load_skill": ("Loading skill", "Loaded skill"),
 }
 
@@ -60,16 +62,15 @@ def _verb(tool_name: str, *, running: bool) -> str:
     if tool_name in _TOOL_VERBS:
         gerund, past = _TOOL_VERBS[tool_name]
         return gerund if running else past
-    # Fallback: a capitalized tool name (bash → Bash), Claude-Code style.
-    return tool_name[:1].upper() + tool_name[1:] if tool_name else tool_name
+    # Fallback: the raw tool name, lowercase (bash, launch_agent).
+    return tool_name.lower()
 
 
 def _head_detail(ev) -> str:
     """A short one-line header descriptor — never the full args/code body
-    (that lives in the ⎿ output / verbose view). For execute_code the args are
-    the whole code blob, so we show nothing; other tools get a bounded snippet.
+    (that lives in the ⎿ output / verbose view). Tools get a bounded snippet.
     """
-    if ev.tool_name == "execute_code" or not ev.args:
+    if not ev.args:
         return ""
     val = ev.args.strip()
     if val[:1] in "{[":  # dict/JSON blob → show the value(s), not the wrapper
@@ -93,8 +94,8 @@ class ReplTranscript:
 
     ``tool_detail`` controls tool-call verbosity (toggled at runtime via
     ``/verbose``): ``"compact"`` prints a summary line + output clamped to
-    ``_OUTPUT_CLAMP`` lines; ``"full"`` prints the code body (syntax-highlighted
-    for ``execute_code``) and the complete output.
+    ``_OUTPUT_CLAMP`` lines; ``"full"`` prints full details and the
+    complete output.
     """
 
     def __init__(self, *, tool_detail: str = "compact") -> None:
@@ -203,20 +204,17 @@ class ReplTranscript:
             self._print_output(ev.output)
 
     def _print_details(self, ev: ToolCallDisplay) -> None:
-        if ev.tool_name == "execute_code":
-            self.console.print(
-                Syntax(ev.details, "python", theme="monokai", background_color="default", word_wrap=True)
-            )
-        else:
-            self.console.print(text_with_path_links(ev.details), style=_DIM)
+        self.console.print(text_with_path_links(ev.details), style=_DIM)
 
     def _print_output(self, output: str, style: str = _DIM) -> None:
         # Tree-branch render: first line under a ⎿, the rest aligned beneath.
         lines = output.split("\n")
         clamp = 0
-        if self.tool_detail != "full" and len(lines) > _OUTPUT_CLAMP:
-            clamp = len(lines) - _OUTPUT_CLAMP
-            lines = lines[:_OUTPUT_CLAMP]
+        if self.tool_detail != "full":
+            if len(lines) > _OUTPUT_CLAMP:
+                clamp = len(lines) - _OUTPUT_CLAMP
+                lines = lines[:_OUTPUT_CLAMP]
+            lines = [ln if len(ln) <= _OUTPUT_LINE_CAP else ln[: _OUTPUT_LINE_CAP - 1] + "…" for ln in lines]
         for i, line in enumerate(lines):
             prefix = "  ⎿ " if i == 0 else "    "
             self.console.print(text_with_path_links(prefix + line), style=style)

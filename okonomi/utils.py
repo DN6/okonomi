@@ -1,9 +1,45 @@
 import logging
 import os
+import re
 import threading
 
 
 logger = logging.getLogger(__name__)
+
+_SECRET_ENV_NAME_RE = re.compile(r"(KEY|TOKEN|SECRET|PASSWORD|PASSWD|CREDENTIALS?)$", re.IGNORECASE)
+
+
+def scrub_env(environ) -> dict:
+    """A copy of ``environ`` without secret-looking variables.
+
+    Drops every var whose name matches ``_SECRET_ENV_NAME_RE`` unless it
+    is named in ``OKONOMI_ENV_ALLOW`` (comma-separated) — the escape
+    hatch for keys that model-run code legitimately needs (e.g.
+    ``OKONOMI_ENV_ALLOW=FAL_KEY``). Same regex as ``redact_secrets``,
+    so what the scrub misses the redaction still catches.
+    """
+    allow = {n.strip() for n in (environ.get("OKONOMI_ENV_ALLOW") or "").split(",") if n.strip()}
+    return {
+        name: value
+        for name, value in environ.items()
+        if name in allow or not _SECRET_ENV_NAME_RE.search(name)
+    }
+
+
+def redact_secrets(text: str) -> str:
+    """Replace occurrences of secret-looking env-var values (``*_KEY``,
+    ``*_TOKEN``, ``*_SECRET``, …) with a ``[NAME redacted]`` marker.
+
+    Applied to tool output at the capture boundary so leaked credentials
+    never reach the transcript, the persisted session log, or the FTS
+    index. Values shorter than 8 chars are skipped (too collision-prone).
+    """
+    if not text:
+        return text
+    for name, value in os.environ.items():
+        if len(value) >= 8 and _SECRET_ENV_NAME_RE.search(name) and value in text:
+            text = text.replace(value, f"[{name} redacted]")
+    return text
 
 
 def create_chat_client():
@@ -60,7 +96,7 @@ _TITLE_PROMPT = (
 
 def _compact_messages(messages: list, max_chars: int = 4000) -> str:
     """Compact transcript for titling: user prompts + assistant text + tool-call
-    args (where genmedia/image prompts — i.e. the actual subject — live)."""
+    args (where image prompts — i.e. the actual subject — live)."""
     try:
         from pydantic_ai.messages import (
             ModelRequest,
