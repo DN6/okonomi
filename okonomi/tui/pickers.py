@@ -120,10 +120,12 @@ async def pick_session() -> str | None:
     return await app.run_async()
 
 
-async def pick_assets(artifacts) -> tuple[str, list[str]] | None:
+async def pick_assets(artifacts, on_open) -> tuple[str, list[str]] | None:
     """Full-screen multi-select asset picker → (action, paths) or None.
 
     Space toggles, a=all, x=clear, o=open, c=copy, h=heart, Esc=cancel.
+    ``o`` calls ``on_open(paths)`` and keeps the picker up, so assets can be
+    viewed and then copied or hearted without reopening it.
     """
     items = [a for a in artifacts if _ref(a)]
     selected: set[str] = set()
@@ -183,7 +185,7 @@ async def pick_assets(artifacts) -> tuple[str, list[str]] | None:
 
     @kb.add("o")
     def _(e):
-        e.app.exit(result=_dispatch("open"))
+        on_open(_dispatch("open")[1])
 
     @kb.add("c")
     def _(e):
@@ -243,8 +245,11 @@ def _tree_rows(events: list[dict]) -> list[dict]:
     Only user/assistant messages become rows — tool calls, tool results,
     and stream events stay hidden, which collapses long tool runs with no
     folding logic while keeping every fork point visible (branches start
-    at resubmitted user messages). Depth grows below any node with more
-    than one child. ``checkout_target`` bakes in the selection semantics:
+    at resubmitted user messages). ``guide`` is the ``tree(1)``-style
+    box-drawing prefix: linear runs share their parent's column, and each
+    child of a fork opens with ``├──``/``└──`` and indents its descendants
+    under ``│``. ``branch`` marks those fork heads for ←/→ hopping.
+    ``checkout_target`` bakes in the selection semantics:
     a user row checks out to its *parent* (edit and resubmit the prefilled
     text), an assistant row checks out to itself (continue from there).
     """
@@ -261,15 +266,16 @@ def _tree_rows(events: list[dict]) -> list[dict]:
     )
 
     rows: list[dict] = []
-    stack = [(eid, 0) for eid in reversed(children.get(None, []))]
+    stack = [(eid, "", "") for eid in reversed(children.get(None, []))]
     while stack:
-        eid, depth = stack.pop()
+        eid, guide, cont = stack.pop()
         e = by_id[eid]
         if e["type"] == EventType.USER_MESSAGE.value:
             rows.append({
                 "event_id": eid,
                 "type": e["type"],
-                "depth": depth,
+                "guide": guide,
+                "branch": guide != cont,
                 "preview": (e["content"] or "").splitlines()[0] if e["content"] else "(empty)",
                 "active": bool(e["active"]),
                 "is_current": eid == current_id,
@@ -280,7 +286,8 @@ def _tree_rows(events: list[dict]) -> list[dict]:
             rows.append({
                 "event_id": eid,
                 "type": e["type"],
-                "depth": depth,
+                "guide": guide,
+                "branch": guide != cont,
                 "preview": (e["content"] or "").splitlines()[0] if e["content"] else "(empty)",
                 "active": bool(e["active"]),
                 "is_current": eid == current_id,
@@ -288,9 +295,12 @@ def _tree_rows(events: list[dict]) -> list[dict]:
                 "prefill": "",
             })
         kids = children.get(eid, [])
-        child_depth = depth + 1 if len(kids) > 1 else depth
-        for k in reversed(kids):
-            stack.append((k, child_depth))
+        if len(kids) == 1:
+            stack.append((kids[0], cont, cont))
+            continue
+        for n, k in reversed(list(enumerate(kids))):
+            last = n == len(kids) - 1
+            stack.append((k, cont + ("└── " if last else "├── "), cont + ("    " if last else "│   ")))
     return rows
 
 
@@ -311,54 +321,87 @@ async def pick_tree(session_id: str) -> tuple[int | None, str, bool] | None:
 
     Selecting a target that abandons active turns first asks whether to
     LLM-summarize them into the new branch's context (y/n, Esc backs out).
+    Typing fuzzy-filters the rows by preview; matches keep their tree indent.
     """
     events = db.fetch_events(db.connection(), session_id, active_only=False)
-    rows = _tree_rows(events)
-    state = {"idx": 0, "confirm": False}
-    for n, r in enumerate(rows):
-        if r["is_current"]:
-            state["idx"] = n
+    all_rows = _tree_rows(events)
+    state = {"idx": 0, "confirm": False, "rows": all_rows}
+    search = Buffer()
+
+    def _refilter(_=None) -> None:
+        q = search.text.strip().lower()
+        state["rows"] = all_rows if not q else [r for r in all_rows if fuzzy_match(q, r["preview"].lower())]
+        state["idx"] = next((n for n, r in enumerate(state["rows"]) if r["is_current"]), 0)
+
+    _refilter()
+    search.on_text_changed += _refilter
 
     parents = {e["event_id"]: e["parent_id"] for e in events}
     conv_types = {t.value for t in CONVERSATION_TYPES}
 
     def _render():
-        if not rows:
+        rows = state["rows"]
+        if not all_rows:
             return [("class:dim", "  (no messages yet)")]
+        if not rows:
+            return [("class:dim", "  (no matches)")]
         try:
-            height = max(get_app().output.get_size().rows - 3, 5)
+            height = max(get_app().output.get_size().rows - 4, 5)
         except Exception:
             height = 30
         start = max(0, min(state["idx"] - height // 2, len(rows) - height))
         out = []
         for n, r in enumerate(rows[start : start + height], start=start):
-            glyph = "●" if r["type"] == EventType.USER_MESSAGE.value else "○"
+            if r["type"] == EventType.USER_MESSAGE.value:
+                role, role_style = "● you  ", "class:tree.user"
+            else:
+                role, role_style = "○ agent", "class:tree.agent"
             marker = "  ◀" if r["is_current"] else ""
             cur = n == state["idx"]
             style = "class:picker-highlight" if cur else ("" if r["active"] else "class:dim")
-            out.append((style, f"{'›' if cur else ' '} {'  ' * r['depth']}{glyph} {r['preview'][:100]}{marker}\n"))
+            out.append((style, f"{'›' if cur else ' '} "))
+            out.append((style if cur else "class:tree.guide", r["guide"]))
+            out.append((style if cur or not r["active"] else role_style, role))
+            out.append((style, f" {r['preview'][:100]}{marker}\n"))
         return out
 
     def _footer():
         if state["confirm"]:
             return [("class:prompt", " Summarize the branch you're leaving?  y yes · n no · Esc back")]
-        return [("class:dim", "  ↑↓ move · Enter checkout (user msg → edit & resubmit) · Esc")]
+        return [("class:dim", "  type to filter · ↑↓ move · ←→ hop branches · Enter checkout (user msg → edit & resubmit) · Esc")]
 
     in_confirm = Condition(lambda: state["confirm"])
     kb = KeyBindings()
 
+    def _hop(step: int) -> None:
+        rows = state["rows"]
+        for i in range(1, len(rows)):
+            n = (state["idx"] + step * i) % len(rows)
+            if rows[n]["branch"]:
+                state["idx"] = n
+                return
+
+    @kb.add("left", eager=True, filter=~in_confirm)
+    def _(e):
+        _hop(-1)
+
+    @kb.add("right", eager=True, filter=~in_confirm)
+    def _(e):
+        _hop(1)
+
     @kb.add("up", eager=True, filter=~in_confirm)
     def _(e):
-        if rows:
-            state["idx"] = (state["idx"] - 1) % len(rows)
+        if state["rows"]:
+            state["idx"] = (state["idx"] - 1) % len(state["rows"])
 
     @kb.add("down", eager=True, filter=~in_confirm)
     def _(e):
-        if rows:
-            state["idx"] = (state["idx"] + 1) % len(rows)
+        if state["rows"]:
+            state["idx"] = (state["idx"] + 1) % len(state["rows"])
 
     @kb.add("enter", eager=True, filter=~in_confirm)
     def _(e):
+        rows = state["rows"]
         if not rows:
             e.app.exit(result=None)
             return
@@ -370,12 +413,12 @@ async def pick_tree(session_id: str) -> tuple[int | None, str, bool] | None:
 
     @kb.add("y", filter=in_confirm)
     def _(e):
-        r = rows[state["idx"]]
+        r = state["rows"][state["idx"]]
         e.app.exit(result=(r["checkout_target"], r["prefill"], True))
 
     @kb.add("n", filter=in_confirm)
     def _(e):
-        r = rows[state["idx"]]
+        r = state["rows"][state["idx"]]
         e.app.exit(result=(r["checkout_target"], r["prefill"], False))
 
     @kb.add("escape")
@@ -386,16 +429,17 @@ async def pick_tree(session_id: str) -> tuple[int | None, str, bool] | None:
         else:
             e.app.exit(result=None)
 
-    list_win = Window(FormattedTextControl(_render, focusable=True))
+    search_win = Window(BufferControl(buffer=search), height=1)
     body = HSplit(
         [
-            Window(FormattedTextControl(lambda: [("class:prompt", "Session tree — dim rows are inactive branches, ◀ is the current leaf")]), height=1),
-            list_win,
+            Window(FormattedTextControl(lambda: [("class:prompt", "Session tree — ├─ └─ open branches, dim rows are inactive, ◀ is the current leaf")]), height=1),
+            search_win,
+            Window(FormattedTextControl(_render)),
             Window(FormattedTextControl(_footer), height=1),
         ]
     )
     app: Application = Application(
-        layout=Layout(body, focused_element=list_win),
+        layout=Layout(body, focused_element=search_win),
         key_bindings=kb,
         full_screen=True,
         mouse_support=False,

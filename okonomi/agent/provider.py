@@ -69,15 +69,19 @@ def build_model(provider: str, model_id: str, timeout: float) -> Model:
         )
 
     if provider == "huggingface":
-        from pydantic_ai.models.huggingface import HuggingFaceModel
-        from pydantic_ai.providers.huggingface import HuggingFaceProvider
+        from pydantic_ai.models.openai import OpenAIChatModel, OpenAIChatModelSettings
+        from pydantic_ai.providers.openai import OpenAIProvider
 
-        return HuggingFaceModel(
+        return OpenAIChatModel(
             model_id,
-            # provider_name="auto" routes to whichever inference provider
-            # serves the model (HF needs base_url/provider_name/hf_client).
-            provider=HuggingFaceProvider(api_key=os.environ["HF_TOKEN"], provider_name="auto"),
-            settings=settings,
+            # Not HuggingFaceModel: huggingface_hub types a replayed tool call's
+            # `function` as a function *definition*, so `arguments` is dropped on
+            # serialization and strict providers 400. The router's OpenAI-compatible
+            # endpoint auto-selects the inference provider, same as provider_name="auto".
+            provider=OpenAIProvider(base_url="https://router.huggingface.co/v1", api_key=os.environ["HF_TOKEN"]),
+            # The router streams cumulative usage on every chunk; without this
+            # pydantic-ai sums the chunks and token counts inflate ~50-100x.
+            settings=OpenAIChatModelSettings(timeout=timeout, openai_continuous_usage_stats=True),
         )
 
     raise ValueError(f"Unknown provider '{provider}'")

@@ -3,7 +3,6 @@ name: ffmpeg
 description: "Recipe collection for ffmpeg post-production: mux audio, concatenate clips, crossfade transitions, trim, loop, speed change, format conversion (mp4 ↔ webm ↔ gif), scale/pad/crop, extract frames, overlay images, render still-to-video, and encoding presets. ffmpeg is already installed; invoke via the standalone `bash` tool. Trigger when users ask to combine/stitch clips, replace an audio track, fade between scenes, convert formats, trim, slow down or speed up, change aspect ratio, extract audio or frames, or add a watermark."
 metadata:
   tags: [ffmpeg, video, audio, post-production, mux, concat, transitions]
-  related_skills: [p5js, genmedia]
 ---
 
 # ffmpeg
@@ -21,20 +20,20 @@ Recipes live as ``### H3`` subsections under ``## How to use``. Pull just the re
 - Adding watermarks / overlays.
 - Rendering a still image into a video clip.
 
-**Not for**: downloading from a URL (use `yt-dlp`), HTTP-seek frame extraction without downloading (use `video-analysis`), generating new media (use `genmedia`).
+**Not for**: downloading from a URL (use `yt-dlp`), HTTP-seek frame extraction without downloading (use `video-analysis`).
 
 ## How to use
 
-Invoke through the standalone `bash` tool, NOT inside `execute_code`:
+Invoke through the `bash` tool:
 
-```python
-result = bash(command='ffmpeg -y -loglevel error -i "{input}" -i "{audio}" -c:v copy -c:a aac -shortest "{output}"')
+```
+bash(command='ffmpeg -y -loglevel error -i "{input}" -i "{audio}" -c:v copy -c:a aac -shortest "{output}"')
 ```
 
 Universal flags worth standardizing on:
 - `-y` — overwrite output without prompting (always include).
 - `-loglevel error` — suppress info chatter; only real errors come through.
-- Save outputs into `get_session_dir()` so they're tracked in the session.
+- Save outputs into `$OKONOMI_SESSION_DIR` so they're tracked in the session.
 - Quote filenames — paths can contain spaces, parentheses, etc.
 
 `bash` returns `{"stdout", "stderr", "exit_code"}`. Check `exit_code` — ffmpeg writes progress to stderr even on success, so non-empty stderr alone does not indicate failure.

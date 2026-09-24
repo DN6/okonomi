@@ -287,7 +287,7 @@ class ApprovalRequest(Event):
 @dataclass
 class StatusChanged(Event):
     """The agent's working-state label changed ("Thinking...",
-    "Running genmedia.run...", "" when idle). Replaces polling
+    "Running bash...", "" when idle). Replaces polling
     ``agent.status`` — subscribers render the latest label."""
 
     type: ClassVar[str] = "status_changed"
@@ -297,7 +297,7 @@ class StatusChanged(Event):
 
 @dataclass
 class JobStarted(Event):
-    """A background job began (bg-exec-N execute_code block, term-N shell
+    """A background job began (term-N shell
     command, task-N sub-agent)."""
 
     type: ClassVar[str] = "job_started"

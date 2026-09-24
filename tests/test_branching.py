@@ -114,7 +114,9 @@ def test_tree_rows_forked_session():
     rows = _tree_rows(events)
 
     assert [r["event_id"] for r in rows] == [0, 1, 2, 3, 4, 5, 6, 8], f"row order: {[r['event_id'] for r in rows]}"
-    assert [r["depth"] for r in rows] == [0, 0, 1, 1, 1, 1, 0, 0], f"depths: {[r['depth'] for r in rows]}"
+    guides = [r["guide"] for r in rows]
+    assert guides == ["", "", "├── ", "│   ", "└── ", "    ", "", ""], f"guides: {guides}"
+    assert [r["event_id"] for r in rows if r["branch"]] == [2, 4], "fork heads are the two resubmitted user messages"
 
     by_id = {r["event_id"]: r for r in rows}
     assert by_id[0]["checkout_target"] is None, "root user row must check out to empty path"

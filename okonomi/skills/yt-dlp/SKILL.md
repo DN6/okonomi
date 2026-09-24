@@ -3,7 +3,7 @@ name: yt-dlp
 description: "Download videos, audio, time-slices, and metadata from YouTube and 1000+ other sites via the `yt-dlp` CLI. Trigger when the user asks to: download / save / rip / fetch a video or audio from a URL (YouTube, Vimeo, TikTok, Twitter/X, Instagram, SoundCloud, Twitch, Bilibili, etc.), extract audio (m4a/mp3) from a video URL, grab a clipped section, or pull metadata. Triggers even if the user doesn't say 'yt-dlp' — any 'download this video' request with a URL applies. Source: https://github.com/yt-dlp/yt-dlp"
 metadata:
   tags: [yt-dlp, download, video, audio, youtube]
-  related_skills: [ffmpeg, genmedia]
+  related_skills: [ffmpeg]
 ---
 
 # yt-dlp
@@ -19,17 +19,17 @@ Recipes live as `### H3` subsections under `## How to use`. Pull just the recipe
 - Time-slicing a section of audio or video without grabbing the whole file.
 - Pulling metadata (title, duration, available formats) from a URL.
 
-**Not for**: editing once downloaded (use `ffmpeg`), HTTP-seek frame extraction for analysis (use `video-analysis`), generating new media (use `genmedia`).
+**Not for**: editing once downloaded (use `ffmpeg`), HTTP-seek frame extraction for analysis (use `video-analysis`).
 
 ## How to use
 
-Invoke through the standalone `bash` tool, NOT inside `execute_code`:
+Invoke through the `bash` tool:
 
-```python
-result = bash(command='yt-dlp -o "{out_dir}/%(title)s.%(ext)s" "{url}"')
+```
+bash(command='yt-dlp -o "{out_dir}/%(title)s.%(ext)s" "{url}"')
 ```
 
-- Save outputs into `get_session_dir()` so they're tracked in the session.
+- Save outputs into `$OKONOMI_SESSION_DIR` so they're tracked in the session.
 - Always quote URLs — they often contain `&`, `?`, `=`.
 - Add `--no-playlist` when given a video URL inside a playlist context, so you don't accidentally pull the whole channel.
 - Default to 480p mp4 (see `download-a-video-480p-mp4`) unless the user explicitly asks for higher quality.

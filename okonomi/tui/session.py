@@ -51,7 +51,6 @@ class TuiSession:
         self._approval_queue: deque[ApprovalRequest] = deque()
         self._approval_active = False
         self._approval_lock = threading.Lock()
-        self.agent.approvals_enabled = True
         self.emitter.subscribe(self._on_agent_event)
 
         # First-turn reset wipes message_history/artifacts/etc. for a
@@ -64,8 +63,13 @@ class TuiSession:
         # to render an elapsed timer ("Thinking… 1m 23s"). None when idle.
         self._turn_started_at: float | None = None
 
-        # Background full-agent tasks (not the agent's per-execute_code
-        # bg-exec threads). Keyed by bg-N id.
+        # Set by cancel_current_turn (Ctrl+C) so the CancelledError handler
+        # can tell a user interrupt from a library-leaked cancellation
+        # (aiohttp timeouts cancel the calling task; a missed conversion
+        # escapes as bare CancelledError and is NOT a user interrupt).
+        self._user_cancel: bool = False
+
+        # Background full-agent tasks (/bg). Keyed by bg-N id.
         self._bg_tasks: dict[str, threading.Thread] = {}
         self._bg_counter = 0
 
@@ -108,7 +112,24 @@ class TuiSession:
             await self.agent.run_async(user_message, reset=reset)
         except asyncio.CancelledError:
             status = "interrupted"
-            self.emitter.emit(SystemNote("Interrupted. History preserved.", level="warn"))
+            # This task is the worker loop itself — reset its cancellation
+            # bookkeeping so the caught cancel can't poison later turns
+            # (structured-concurrency primitives compare cancelling() counts).
+            task = asyncio.current_task()
+            if task is not None:
+                while task.cancelling():
+                    task.uncancel()
+            if self._user_cancel:
+                self.emitter.emit(SystemNote("Interrupted. History preserved.", level="warn"))
+            else:
+                self.emitter.emit(
+                    SystemNote(
+                        "Turn cancelled from inside the provider stack (not Ctrl+C) — "
+                        "likely a connection timeout. History preserved.",
+                        level="error",
+                    )
+                )
+            self._user_cancel = False
         except Exception as e:  # noqa: BLE001
             import traceback
 
@@ -120,10 +141,9 @@ class TuiSession:
         finally:
             self._current_task = None
             self._turn_started_at = None
-            # Off-load to a thread — save does file + DB writes and a
-            # pickle dump that can take a moment. Blocking the consumer
-            # here would stall queued submits and cancellations
-            # marshalled through the same loop.
+            # Off-load to a thread — save does file + DB writes that can
+            # take a moment. Blocking the consumer here would stall queued
+            # submits and cancellations marshalled through the same loop.
             await asyncio.to_thread(self._safe_save_session, status=status)
 
     def _safe_save_session(
@@ -157,6 +177,7 @@ class TuiSession:
         def _do_cancel() -> None:
             task = self._current_task
             if task is not None and not task.done():
+                self._user_cancel = True
                 task.cancel()
 
         self._loop.call_soon_threadsafe(_do_cancel)
@@ -170,7 +191,7 @@ class TuiSession:
             return True
         return False
 
-    # --- Submit / approval / bg-exec hooks ---
+    # --- Submit / approval / bg hooks ---
 
     def _on_submit(self, text: str) -> None:
         """Handle user text from the REPL.
@@ -261,7 +282,7 @@ class TuiSession:
                 self.emitter.emit(ev)
 
         # Register in the shared job registry so /jobs and /logs see /bg
-        # tasks alongside bg-exec-N and term-N.
+        # tasks alongside term-N.
         progress = {"status": "running", "detail": ""}
 
         def _reader() -> str:
@@ -283,7 +304,6 @@ class TuiSession:
             # text don't show up in the foreground history; only approvals,
             # job completions, and the note below surface to the user.
             bg_agent.emitter = EventEmitter()
-            bg_agent.approvals_enabled = True
             bg_agent.emitter.subscribe(_forward)
             try:
                 asyncio.run(bg_agent.run_async(task_input, reset=True))
@@ -446,15 +466,13 @@ class TuiSession:
         if error:
             msg = (
                 f"[system] Background task {bg_id} failed:\n{error}\n\n"
-                "DO NOT re-run genmedia.run, browser.render, or any "
-                "other expensive generation call to recover. If this "
-                "is a parsing error (KeyError / AttributeError / TypeError "
-                "after the generation line), the generation already "
-                "succeeded — the `result` variable is still in globals from "
-                "the bg run. Write a new execute_code block with "
-                "`print(result)` to inspect its shape and fix the access. "
-                "If the generation call itself raised (network/500/timeout), "
-                "surface the error to the user and ask before retrying."
+                "DO NOT re-run an expensive generation call to recover. "
+                "If this is a parsing error after the generation line, the "
+                "generation likely succeeded — check $OKONOMI_SESSION_DIR "
+                "for its output files and `/logs` for the run's stdout "
+                "before re-running anything. If the generation call itself "
+                "raised (network/500/timeout), surface the error to the "
+                "user and ask before retrying."
             )
             self._submit(msg)
             return
@@ -498,25 +516,22 @@ class TuiSession:
             return ""
         return str(usage)
 
-    def _bg_tasks_list(self) -> list[tuple[str, str]]:
-        """(id, label) pairs for in-flight bg-exec + /bg tasks. Threads
-        that have finished but not yet been popped from their dicts are
-        filtered (race around thread.is_alive during shutdown)."""
-        out: list[tuple[str, str]] = []
-        for bg_id, thread in list(self.agent.executor.threads.items()):
-            if thread and thread.is_alive():
-                label = (self.agent._bg_logs.get(bg_id) or {}).get("label", "")
-                out.append((bg_id, label))
-        for task_id, thread in list(self._bg_tasks.items()):
-            if thread and thread.is_alive():
-                out.append((task_id, thread.name))
+    def _bg_tasks_list(self) -> list[tuple[str, str, str, str]]:
+        """(id, label, kind, elapsed) for running background jobs, read
+        from the shared JobRegistry — covers term-N, launched
+        agents, and /bg tasks in one place."""
+        now = time.time()
+        out: list[tuple[str, str, str, str]] = []
+        for job_id, job in list(self.agent.jobs.entries.items()):
+            if job.get("status") != "running":
+                continue
+            out.append((job_id, job.get("label", ""), job.get("kind", ""), f"{now - job['started_at']:.0f}s"))
         return out
 
     # --- Entry points ---
 
     async def run(self, initial_message: str = "") -> None:
         import atexit
-        import shutil
 
         # Last-ditch save: atexit fires before interpreter exit even on
         # SIGTERM, an uncaught exception, or a hung front-end.
@@ -542,16 +557,6 @@ class TuiSession:
             sid = self.agent.session.session_id
             label = f"{sid[:10]} · {title}" if title else sid
             self.emitter.emit(SystemNote(f"↑ Resumed: {label}"))
-
-        if shutil.which("genmedia") is None:
-            self.emitter.emit(SystemNote(
-                "genmedia CLI not found on $PATH. Install with:\n"
-                "  curl -fsSL https://genmedia.sh/install | sh\n"
-                "Until then, image/video generation via the genmedia "
-                "skill won't work — local tools (browser, prompt, "
-                "research) still do.",
-                level="warn",
-            ))
 
         if initial_message:
             self._on_submit(initial_message)

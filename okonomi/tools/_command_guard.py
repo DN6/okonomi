@@ -11,8 +11,6 @@ import os
 import re
 import unicodedata
 
-from ..config import ENV_YOLO
-
 
 _ANSI_RE = re.compile(r"\x1b\[[0-?]*[ -/]*[@-~]|\x1b\][^\x07]*(?:\x07|\x1b\\)")
 
@@ -165,7 +163,7 @@ _SUDO_STDIN_RE = re.compile(
 
 
 def _yolo_enabled() -> bool:
-    return os.environ.get(ENV_YOLO, "").lower() in {"1", "true", "yes", "on"}
+    return os.environ.get("OKONOMI_YOLO", "").lower() in {"1", "true", "yes", "on"}
 
 
 def check_command(command: str) -> tuple[bool, str | None]:

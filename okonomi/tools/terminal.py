@@ -18,6 +18,8 @@ from typing import Any
 
 from okonomi.tools._command_guard import check_command
 from okonomi.tools._metadata import ToolMetadataMixin
+from okonomi.tools._sandbox import wrap_command
+from okonomi.utils import redact_secrets, scrub_env
 
 
 MAX_OUTPUT_CHARS = 50_000
@@ -81,17 +83,17 @@ class TerminalTools(ToolMetadataMixin):
         # Hook called when a background job finishes. Receives
         # (task_id, status) where status is "ok" or "error".
         self._on_bg_finish: Any | None = None
-        self._env_blocklist = {
-            "OPENROUTER_API_KEY",
-            "ANTHROPIC_API_KEY",
-            "OPENAI_API_KEY",
-            "TAVILY_API_KEY",
-        }
+        # Zero-arg callable returning the current session dir (str),
+        # exported to children as $OKONOMI_SESSION_DIR. Set by the agent.
+        self._session_dir_fn: Any | None = None
 
     def _make_env(self) -> dict:
-        env = dict(os.environ)
-        for key in self._env_blocklist:
-            env.pop(key, None)
+        env = scrub_env(os.environ)
+        if self._session_dir_fn is not None:
+            try:
+                env["OKONOMI_SESSION_DIR"] = self._session_dir_fn()
+            except Exception:
+                pass
         if "/usr/local/bin" not in env.get("PATH", ""):
             env["PATH"] = f"/usr/local/bin:{env.get('PATH', '/usr/bin:/bin')}"
         return env
@@ -118,7 +120,7 @@ class TerminalTools(ToolMetadataMixin):
             background: When True, run the command in a thread and
                 return immediately with ``{"task_id": "term-N", "message":
                 ...}``. Output and exit code surface as a system note on
-                completion (same notification path as bg-exec). Use this
+                completion. Use this
                 for long downloads (yt-dlp), renders (ffmpeg), or any
                 command that would otherwise stall the agent loop.
 
@@ -155,7 +157,7 @@ class TerminalTools(ToolMetadataMixin):
 
         try:
             proc = subprocess.Popen(
-                [self._bash, "-lc", wrapped],
+                wrap_command([self._bash, "-lc", wrapped], cwd=cwd),
                 stdout=subprocess.PIPE,
                 stderr=subprocess.STDOUT,
                 stdin=subprocess.DEVNULL,
@@ -203,7 +205,7 @@ class TerminalTools(ToolMetadataMixin):
             if os.path.isdir(new_cwd):
                 self._cwd = new_cwd
 
-        output = _truncate_output(output)
+        output = _truncate_output(redact_secrets(output))
 
         if timed_out:
             output += f"\n[Timed out after {timeout}s]"
@@ -240,7 +242,7 @@ class TerminalTools(ToolMetadataMixin):
             # changes — it's not user-visible output.
             if "__CWD=" in joined:
                 joined = joined.rsplit("__CWD=", 1)[0]
-            return joined or "(no output yet)"
+            return redact_secrets(joined) or "(no output yet)"
 
         if self._on_bg_register is not None:
             try:

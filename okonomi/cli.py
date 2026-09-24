@@ -7,6 +7,7 @@ session resolution.
 
 import argparse
 import asyncio
+import sys
 
 from .agent import OkonomiAgent
 from .config import load_env_or_raise
@@ -72,7 +73,6 @@ Examples:
     parser.add_argument("--task", "-t", help="Task description for the agent (one-off task)")
     parser.add_argument("--resume", "-r", action="store_true", help="Resume from latest session")
     parser.add_argument("--session", "-s", type=str, help="Load specific session by ID")
-    parser.add_argument("--verbose", "-V", action="store_true", help="Show executed code and output")
     parser.add_argument("--version", "-v", action="version", version="okonomi 0.1.0")
 
     return parser.parse_args()
@@ -89,7 +89,7 @@ async def _run_single_task(agent: OkonomiAgent, user_message: str) -> None:
 
     from .tui.transcript import ReplTranscript
 
-    transcript = ReplTranscript(tool_detail="full" if agent.verbose else "compact")
+    transcript = ReplTranscript(tool_detail="compact")
     agent.emitter.subscribe(transcript.on_event)
     loop = asyncio.get_running_loop()
     agent_task = asyncio.create_task(agent.run_async(user_message, reset=True))
@@ -130,10 +130,7 @@ async def run_agent_async(args: argparse.Namespace, user_request: str) -> None:
     session_id = resolve_session(args)
     interactive_mode = not args.task
 
-    agent = OkonomiAgent(
-        session_id=session_id,
-        verbose=args.verbose,
-    )
+    agent = OkonomiAgent(session_id=session_id)
 
     if session_id:
         agent.load_session(session_id)
@@ -149,7 +146,11 @@ async def run_agent_async(args: argparse.Namespace, user_request: str) -> None:
 
 
 def main() -> None:
-    load_env_or_raise()
+    try:
+        load_env_or_raise()
+    except EnvironmentError as e:
+        print(f"{RED}{BOLD}Error:{RST} {e}", file=sys.stderr)
+        sys.exit(1)
     args = parse_arguments()
 
     is_interactive = not args.task

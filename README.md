@@ -1,8 +1,8 @@
 # Okonomi
 
-A terminal agent for creative tasks — it calls tools directly, keeps a persistent
-Python REPL as a workspace for generating and editing media, and carries session
-memory across runs.
+A terminal agent for creative tasks — it calls tools directly, runs code through
+a sandboxed shell with the session directory as its persistent workspace, and
+carries session memory across runs.
 
 Okonomi is a personal learning project for exploring the design choices that go
 into building an agent harness for creative media work. It is **not** stable: it
@@ -19,8 +19,9 @@ The things I mostly use it to poke at:
   titles, and media prompts) and DAG-style session branching.
 - **Creative research strategies** — structured exploration via the `research`
   skill, web search/fetch, and fanning research out across subagents.
-- **Media creation workflows** — a persistent Python REPL as the workspace for
-  generating and editing media, with outputs auto-tracked as session assets.
+- **Media creation workflows** — a sandboxed shell as the execution surface and
+  the session directory as the persistent workspace for generating and editing
+  media, with outputs auto-tracked as session assets.
 
 Expect these to be rebuilt, replaced, or removed as the experiments continue.
 
@@ -84,7 +85,4 @@ okonomi --resume
 
 # Load a specific session by ID
 okonomi --session <id>
-
-# Show executed code and full tool output
-okonomi --verbose
 ```

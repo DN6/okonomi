@@ -15,11 +15,15 @@ from typing import TYPE_CHECKING, Callable
 
 from .. import db
 from .. import session as session_store
-from ..config import OKONOMI_LOVED_DIR
-from ..events import AssistantStream, EventEmitter, SystemNote
-from ..utils import copy_to_clipboard
-from ..tools.skills import BUNDLED_SKILLS_DIR, USER_SKILLS_DIR, _discover_skills, _slugify_heading
-from . import assets
+from ..config import OKONOMI_MIND_DIR
+from ..events import EventEmitter, SystemNote
+from ..tools.skills import (
+    BUNDLED_SKILLS_DIR,
+    USER_SKILLS_DIR,
+    _discover_skills,
+    _parse_frontmatter,
+    _slugify_heading,
+)
 
 
 if TYPE_CHECKING:
@@ -86,13 +90,16 @@ def _discovered_skills() -> dict[str, dict]:
 
 def _skill_commands() -> list[tuple[str, str, str]]:
     """``(slug, real_name, description)`` per skill. The slug is the token
-    typed after ``/`` (skill names may contain spaces, so they're slugged);
+    typed after ``/``, namespaced by origin like Claude Code plugin skills:
+    ``okonomi:<name>`` for bundled skills, ``user:<name>`` for user skills
+    (skill names may contain spaces, so the name part is slugged);
     ``real_name`` is what ``load_skill`` expects. Built-in commands win on a
     slug clash, and the first skill wins on slug collisions between skills."""
     out: list[tuple[str, str, str]] = []
     seen: set[str] = set()
     for name, info in _discovered_skills().items():
-        slug = _slugify_heading(name)
+        prefix = "user" if info.get("source") == "user" else "okonomi"
+        slug = f"{prefix}:{_slugify_heading(name)}"
         if f"/{slug}" in COMMANDS or slug in seen:
             continue
         seen.add(slug)
@@ -118,7 +125,12 @@ def handle(command: str, agent: "OkonomiAgent", emitter: EventEmitter) -> "Comma
     entry = COMMANDS.get(name.lower())
     if entry is None:
         slug = name[1:]  # strip leading '/'
-        real = next((n for s, n, _ in _skill_commands() if s == slug), None)
+        # Match the namespaced slug exactly, or the bare name without its
+        # okonomi:/user: prefix so `/research` keeps working.
+        real = next(
+            (n for s, n, _ in _skill_commands() if s == slug or s.split(":", 1)[1] == slug),
+            None,
+        )
         if real is not None:
             # Sugar for `/skill <name>`: reach it by slug and inject the full
             # body the same way, with any trailing text as extra instruction.
@@ -160,7 +172,7 @@ def _skills(arg: str, agent: "OkonomiAgent", emitter: EventEmitter) -> None:
         return None
     lines = ["Skills — run with /<name>:"]
     for slug, _real, desc in sorted(cmds):
-        lines.append(f"  /{slug:<22} {desc}")
+        lines.append(f"  /{slug:<30} {desc}")
     emitter.emit(SystemNote("\n".join(lines)))
 
 
@@ -239,22 +251,6 @@ def _title(arg: str, agent: "OkonomiAgent", emitter: EventEmitter) -> None:
         emitter.emit(SystemNote(f"Title: {(meta.title if meta else '') or '(none)'}"))
 
 
-@_command("/heart", "♥ the last generated asset, or pass a URL / local path")
-def _heart(arg: str, agent: "OkonomiAgent", emitter: EventEmitter) -> None:
-    assets.heart(agent, emitter, arg)
-
-
-@_command("/loved", "List loved assets — optional filter: images / video / audio / text / 3d / internal / external")
-def _loved(arg: str, agent: "OkonomiAgent", emitter: EventEmitter) -> None:
-    assets.list_loved(agent, emitter, filter_arg=arg.lower())
-
-
-@_command("/prune", "Delete empty sessions older than 24h")
-def _prune(arg: str, agent: "OkonomiAgent", emitter: EventEmitter) -> None:
-    count = session_store.prune_empty_sessions()
-    emitter.emit(SystemNote(f"Pruned {count} empty session{'s' if count != 1 else ''}."))
-
-
 @_command("/reload", "Rebuild the agent — picks up edited skills, tool docstrings, system prompt")
 def _reload(arg: str, agent: "OkonomiAgent", emitter: EventEmitter) -> None:
     counts = agent.reload()
@@ -281,11 +277,11 @@ def _skill(arg: str, agent: "OkonomiAgent", emitter: EventEmitter) -> "CommandRe
     return None
 
 
-@_command("/jobs", "List active and recent background jobs (bg-exec-N, term-N)")
+@_command("/jobs", "List active and recent background jobs (term-N, agents)")
 def _jobs(arg: str, agent: "OkonomiAgent", emitter: EventEmitter) -> None:
     import time as _time
 
-    jobs = getattr(agent, "_bg_logs", {}) or {}
+    jobs = agent.jobs.entries
     if not jobs:
         emitter.emit(SystemNote("No background jobs."))
         return
@@ -310,7 +306,7 @@ def _jobs(arg: str, agent: "OkonomiAgent", emitter: EventEmitter) -> None:
 
 @_command("/logs", "Show captured stdout/stderr for a background job (`/logs <id>`)")
 def _logs(arg: str, agent: "OkonomiAgent", emitter: EventEmitter) -> None:
-    jobs = getattr(agent, "_bg_logs", {}) or {}
+    jobs = agent.jobs.entries
     if not arg:
         ids = ", ".join(sorted(jobs.keys())) or "(none)"
         emitter.emit(SystemNote(f"Usage: /logs <id>. Known jobs: {ids}"))
@@ -348,27 +344,41 @@ def _timeout(arg: str, agent: "OkonomiAgent", emitter: EventEmitter) -> None:
     emitter.emit(SystemNote(f"Per-turn timeout set to {label}."))
 
 
-@_command("/copy", "Copy an assistant message to the clipboard (`/copy [n]`)")
-def _copy(arg: str, agent: "OkonomiAgent", emitter: EventEmitter) -> None:
-    texts = [ev.text for ev in emitter.history() if isinstance(ev, AssistantStream) and ev.text.strip()]
-    if not texts:
-        emitter.emit(SystemNote("Nothing to copy yet.", level="warn"))
-        return
-    n = 1
+@_command("/mind", "Browse the mind wiki, or `/mind <topic>` to consult it")
+def _mind(arg: str, agent: "OkonomiAgent", emitter: EventEmitter) -> "CommandResult | None":
     if arg:
-        try:
-            n = max(1, int(arg))
-        except ValueError:
-            emitter.emit(SystemNote("Usage: /copy [n] — copies the nth-from-last assistant message.", level="warn"))
-            return
-    if n > len(texts):
-        emitter.emit(SystemNote(f"Only {len(texts)} assistant message(s) so far.", level="warn"))
-        return
-    text = texts[-n]
-    if copy_to_clipboard(text):
-        emitter.emit(SystemNote(f"Copied {len(text)} characters to clipboard."))
-    else:
-        emitter.emit(SystemNote("Clipboard copy failed (no pbcopy/xclip/xsel found).", level="warn"))
+        return CommandResult(
+            Action.FORWARD,
+            f"Consult the mind wiki (the markdown pages in {OKONOMI_MIND_DIR}) about: {arg}. "
+            "Read the relevant pages, follow their [[wikilinks]] to related concepts, and summarize what's there.",
+        )
+
+    pages = []
+    if OKONOMI_MIND_DIR.is_dir():
+        for path in OKONOMI_MIND_DIR.glob("*.md"):
+            try:
+                meta, _body = _parse_frontmatter(path.read_text(encoding="utf-8"))
+            except Exception:
+                meta = {}
+            pages.append(
+                (
+                    str(meta.get("updated", "")) or "",
+                    meta.get("name") or path.stem,
+                    meta.get("description", ""),
+                    path.stat().st_mtime,
+                )
+            )
+    if not pages:
+        emitter.emit(SystemNote("No mind pages yet — run the research skill or ask the agent to file one."))
+        return None
+
+    pages.sort(key=lambda p: (p[0], p[3]), reverse=True)
+    lines = [f"Mind wiki ({len(pages)} pages):"]
+    for updated, name, desc, _mtime in pages:
+        stamp = f"  [{updated}]" if updated else ""
+        lines.append(f"  {name:<28} {desc}{stamp}")
+    emitter.emit(SystemNote("\n".join(lines)))
+    return None
 
 
 @_command("/verbose", "Toggle full tool code/output (REPL only)")

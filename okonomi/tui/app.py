@@ -28,6 +28,7 @@ from typing import Callable
 from prompt_toolkit.application import Application
 from prompt_toolkit.buffer import Buffer
 from prompt_toolkit.completion import FuzzyCompleter
+from prompt_toolkit.data_structures import Point
 from prompt_toolkit.document import Document
 from prompt_toolkit.filters import Condition
 from prompt_toolkit.history import FileHistory
@@ -56,6 +57,41 @@ from .transcript import ReplTranscript
 
 HISTORY_FILE = Path.home() / ".okonomi" / "input_history"
 _SPIN_FRAMES = "✳✦"  # pulses each refresh so the status reads as live
+
+
+class _ReflowSafeApplication(Application):
+    """Application whose resize erase survives terminal reflow.
+
+    On SIGWINCH prompt_toolkit erases its region by moving the cursor up the
+    number of rows it *drew*, then clearing downward. But a narrower terminal
+    has already re-wrapped the full-width rows (the input Frame's borders) into
+    two rows each, so the cursor stops short and the old top border survives
+    above the redraw. Recount the rows above the cursor at the new width — rows
+    are hard-broken with CR LF, so widening never joins them and needs no fix.
+    """
+
+    def _on_resize(self) -> None:
+        renderer = self.renderer
+        screen, last_size = renderer._last_screen, renderer._last_size
+        cols = self.output.get_size().columns
+        if screen is not None and last_size is not None and cols < last_size.columns:
+            has_style = renderer._style_string_has_style
+            x, y = renderer._cursor_pos
+            rows = 0
+            for r in range(y):
+                # Same "used width" rule as the renderer's diff: unstyled
+                # trailing spaces are never written, so they don't wrap.
+                used = max(
+                    (
+                        c + (cell.width or 1)
+                        for c, cell in screen.data_buffer[r].items()
+                        if cell.char != " " or has_style[cell.style]
+                    ),
+                    default=0,
+                )
+                rows += max(1, -(-used // cols))
+            renderer._cursor_pos = Point(x=x % cols, y=rows + x // cols)
+        super()._on_resize()
 
 
 class ReplApp:
@@ -145,7 +181,7 @@ class ReplApp:
             content=body,
             floats=[Float(content=CompletionsMenu(max_height=12, scroll_offset=1), xcursor=True, ycursor=True)],
         )
-        return Application(
+        return _ReflowSafeApplication(
             layout=Layout(root, focused_element=input_window),
             key_bindings=merge_key_bindings([load_key_bindings(), self._key_bindings()]),
             style=REPL_STYLE,
@@ -202,7 +238,14 @@ class ReplApp:
         except Exception:
             bg = []
         if bg:
-            groups.append([("class:bottom-toolbar.bg", "bg: " + ", ".join(str(item[0]) for item in bg))])
+            parts = []
+            for job_id, label, _kind, elapsed in bg[:3]:
+                label = label if len(label) <= 18 else label[:17] + "…"
+                parts.append(f"{job_id} {label} {elapsed}".replace("  ", " "))
+            text = "bg: " + " · ".join(parts)
+            if len(bg) > 3:
+                text += f" +{len(bg) - 3}"
+            groups.append([("class:bottom-toolbar.bg", text)])
         if not groups:
             return []  # idle → no status bar
         out: list = []
@@ -411,7 +454,7 @@ class ReplApp:
             elif modal[0] == "asset":
                 from .pickers import pick_assets
 
-                result = await pick_assets(modal[2])
+                result = await pick_assets(modal[2], lambda paths: modal[1]("open", paths))
                 if result is not None:
                     modal[1](result[0], result[1])  # on_action(action, paths)
             elif modal[0] == "tree":
