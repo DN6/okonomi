@@ -9,20 +9,21 @@ registry is the single source for dispatch, ``/help``, and completion.
 
 from __future__ import annotations
 
+import shlex
+import threading
 from dataclasses import dataclass
 from enum import Enum
 from typing import TYPE_CHECKING, Callable
 
-from .. import db
+from .. import db, mcp
 from .. import session as session_store
-from ..config import OKONOMI_MIND_DIR
 from ..events import EventEmitter, SystemNote
 from ..tools.skills import (
     BUNDLED_SKILLS_DIR,
     USER_SKILLS_DIR,
     _discover_skills,
-    _parse_frontmatter,
     _slugify_heading,
+    install_skill_from_github,
 )
 
 
@@ -35,7 +36,7 @@ class Action(str, Enum):
 
     EXIT = "exit"
     VERBOSE = "verbose"
-    SESSION_PICKER = "session_picker"
+    FIND_PICKER = "find_picker"
     ASSET_PICKER = "asset_picker"
     TREE_PICKER = "tree_picker"
     BG = "bg"
@@ -47,6 +48,7 @@ class Action(str, Enum):
 class CommandResult:
     action: Action
     payload: str = ""
+    scope: str = ""  # FIND_PICKER only: "" (everything) | "session"
 
 
 Handler = Callable[[str, "OkonomiAgent", EventEmitter], "CommandResult | None"]
@@ -158,14 +160,42 @@ def _help(arg: str, agent: "OkonomiAgent", emitter: EventEmitter) -> None:
         "Keys:",
         "  ↑ / ↓        Input history",
         "  Ctrl+R       Search conversation history / branch from a match",
-        "  Ctrl+C       Interrupt running turn / clear draft",
+        "  Ctrl+C       Interrupt running turn / clear draft / exit when idle",
         "  Ctrl+D       Exit",
     ]
     emitter.emit(SystemNote("\n".join(lines)))
 
 
-@_command("/skills", "List available skills (run one with /<skill-name>)")
+@_command("/skills", "List skills, or install one from GitHub (`/skills install <owner/repo/path | URL>`)")
 def _skills(arg: str, agent: "OkonomiAgent", emitter: EventEmitter) -> None:
+    sub, _, spec = arg.partition(" ")
+    if sub == "install":
+        spec = spec.strip()
+        if not spec:
+            emitter.emit(
+                SystemNote("Usage: /skills install <owner/repo/path/to/skill | github.com tree URL>", level="warn")
+            )
+            return None
+        emitter.emit(SystemNote(f"Installing skill from {spec} …"))
+
+        # Network I/O off the prompt_toolkit loop; the emitter is thread-safe.
+        def _run() -> None:
+            result = install_skill_from_github(spec)
+            if not result["success"]:
+                emitter.emit(SystemNote(result["error"], level="error"))
+                return
+            counts = agent.reload()
+            emitter.emit(
+                SystemNote(
+                    f"Installed skill '{result['name']}' → {result['path']} (reloaded — {counts['skills']} skills)."
+                )
+            )
+
+        threading.Thread(target=_run, name="skill-install", daemon=True).start()
+        return None
+    if arg:
+        emitter.emit(SystemNote(f"Unknown subcommand '{sub}'. Usage: /skills [install <spec>]", level="warn"))
+        return None
     cmds = _skill_commands()
     if not cmds:
         emitter.emit(SystemNote("No skills found."))
@@ -176,8 +206,13 @@ def _skills(arg: str, agent: "OkonomiAgent", emitter: EventEmitter) -> None:
     emitter.emit(SystemNote("\n".join(lines)))
 
 
-@_command("/assets", "List generated assets in this session")
+@_command("/assets", "List this session's assets, or `/assets <query>` to search assets from every session")
 def _assets(arg: str, agent: "OkonomiAgent", emitter: EventEmitter) -> "CommandResult | None":
+    if arg:
+        if not session_store.search_artifacts(arg, limit=1):
+            emitter.emit(SystemNote(f"No assets match {arg!r}."))
+            return None
+        return CommandResult(Action.ASSET_PICKER, arg)
     try:
         agent._sync_session_assets(agent._get_dependencies())
     except Exception:
@@ -213,9 +248,14 @@ def _clear(arg: str, agent: "OkonomiAgent", emitter: EventEmitter) -> None:
     emitter.emit(SystemNote(f"Conversation cleared ({rewound} events rewound)."))
 
 
-@_command("/session", "Browse and resume a past session")
+@_command("/session", "Search and resume a past session (`/session [query]`)")
 def _session(arg: str, agent: "OkonomiAgent", emitter: EventEmitter) -> "CommandResult":
-    return CommandResult(Action.SESSION_PICKER)
+    return CommandResult(Action.FIND_PICKER, arg, scope="session")
+
+
+@_command("/find", "Search sessions, conversations, assets, and the mind wiki (`/find [query]`)")
+def _find(arg: str, agent: "OkonomiAgent", emitter: EventEmitter) -> "CommandResult":
+    return CommandResult(Action.FIND_PICKER, arg)
 
 
 @_command("/tree", "Browse the session tree — jump back, edit & resubmit to branch")
@@ -249,6 +289,66 @@ def _title(arg: str, agent: "OkonomiAgent", emitter: EventEmitter) -> None:
         # Re-fetch: the out-of-band titler writes to the DB, not the live object.
         meta = session_store.Session.load(agent.session.session_id)
         emitter.emit(SystemNote(f"Title: {(meta.title if meta else '') or '(none)'}"))
+
+
+_MCP_USAGE = "Usage: /mcp | /mcp add <name> <url | command [args...]> [-e KEY=VALUE ...] | /mcp remove <name>"
+
+
+@_command("/mcp", "List, add or remove MCP servers (`/mcp add <name> <url|command ...>`)")
+def _mcp(arg: str, agent: "OkonomiAgent", emitter: EventEmitter) -> None:
+    try:
+        words = shlex.split(arg)
+    except ValueError as e:
+        emitter.emit(SystemNote(f"Could not parse arguments: {e}", level="error"))
+        return None
+    sub = words[0] if words else ""
+
+    if sub == "add":
+        env: dict[str, str] = {}
+        rest: list[str] = []
+        it = iter(words[1:])
+        for w in it:
+            if w == "-e":
+                kv = next(it, "")
+                key, eq, value = kv.partition("=")
+                if not eq or not key:
+                    emitter.emit(SystemNote(f"-e expects KEY=VALUE, got '{kv}'", level="warn"))
+                    return None
+                env[key] = value
+            else:
+                rest.append(w)
+        if len(rest) < 2:
+            emitter.emit(SystemNote(_MCP_USAGE, level="warn"))
+            return None
+        name, target, *args = rest
+        result = mcp.add_server(name, target, args, env)
+    elif sub == "remove":
+        if len(words) != 2:
+            emitter.emit(SystemNote(_MCP_USAGE, level="warn"))
+            return None
+        name = words[1]
+        result = mcp.remove_server(name)
+    elif sub:
+        emitter.emit(SystemNote(_MCP_USAGE, level="warn"))
+        return None
+    else:
+        servers = mcp.load_servers()
+        if not servers:
+            emitter.emit(SystemNote(f"No MCP servers configured ({mcp.OKONOMI_MCP_CONFIG}).\n{_MCP_USAGE}"))
+            return None
+        lines = [f"MCP servers ({mcp.OKONOMI_MCP_CONFIG}):"]
+        for name, server in servers.items():
+            lines.append(f"  {name:<16} {mcp.describe(server)}")
+        emitter.emit(SystemNote("\n".join(lines)))
+        return None
+
+    if not result["success"]:
+        emitter.emit(SystemNote(result["error"], level="error"))
+        return None
+    counts = agent.reload()
+    verb = "Added" if sub == "add" else "Removed"
+    emitter.emit(SystemNote(f"{verb} MCP server '{name}' — {counts['mcp']} servers configured (agent reloaded)."))
+    return None
 
 
 @_command("/reload", "Rebuild the agent — picks up edited skills, tool docstrings, system prompt")
@@ -344,41 +444,18 @@ def _timeout(arg: str, agent: "OkonomiAgent", emitter: EventEmitter) -> None:
     emitter.emit(SystemNote(f"Per-turn timeout set to {label}."))
 
 
-@_command("/mind", "Browse the mind wiki, or `/mind <topic>` to consult it")
-def _mind(arg: str, agent: "OkonomiAgent", emitter: EventEmitter) -> "CommandResult | None":
-    if arg:
-        return CommandResult(
-            Action.FORWARD,
-            f"Consult the mind wiki (the markdown pages in {OKONOMI_MIND_DIR}) about: {arg}. "
-            "Read the relevant pages, follow their [[wikilinks]] to related concepts, and summarize what's there.",
-        )
-
-    pages = []
-    if OKONOMI_MIND_DIR.is_dir():
-        for path in OKONOMI_MIND_DIR.glob("*.md"):
-            try:
-                meta, _body = _parse_frontmatter(path.read_text(encoding="utf-8"))
-            except Exception:
-                meta = {}
-            pages.append(
-                (
-                    str(meta.get("updated", "")) or "",
-                    meta.get("name") or path.stem,
-                    meta.get("description", ""),
-                    path.stat().st_mtime,
-                )
-            )
-    if not pages:
-        emitter.emit(SystemNote("No mind pages yet — run the research skill or ask the agent to file one."))
-        return None
-
-    pages.sort(key=lambda p: (p[0], p[3]), reverse=True)
-    lines = [f"Mind wiki ({len(pages)} pages):"]
-    for updated, name, desc, _mtime in pages:
-        stamp = f"  [{updated}]" if updated else ""
-        lines.append(f"  {name:<28} {desc}{stamp}")
-    emitter.emit(SystemNote("\n".join(lines)))
-    return None
+@_command("/mind", "Add to the mind wiki: `/mind <note>`, or `/mind` to file what this conversation established")
+def _mind(arg: str, agent: "OkonomiAgent", emitter: EventEmitter) -> "CommandResult":
+    what = (
+        f"this note: {arg}"
+        if arg
+        else "what we've established in this conversation (decisions, preferences, findings worth keeping)"
+    )
+    return CommandResult(
+        Action.FORWARD,
+        f"Add {what} to the mind wiki. `recall` first; extend an existing page with `remember(..., update=True)` "
+        "rather than creating a duplicate, and link related pages.",
+    )
 
 
 @_command("/verbose", "Toggle full tool code/output (REPL only)")

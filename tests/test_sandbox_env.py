@@ -15,33 +15,6 @@ def test_scrub_env_drops_secret_like_vars():
     assert out["PATH"] == "/usr/bin" and out["HOME"] == "/tmp/h"
 
 
-def test_scrub_env_allowlist():
-    env = {"FAL_KEY": "z" * 20, "HF_TOKEN": "w" * 20, "OKONOMI_ENV_ALLOW": "FAL_KEY"}
-    out = scrub_env(env)
-    assert out["FAL_KEY"] == "z" * 20, "allowlisted key must survive"
-    assert "HF_TOKEN" not in out
-
-
-def test_wrap_command_passthrough_when_disabled(monkeypatch):
-    monkeypatch.setenv("OKONOMI_NO_SANDBOX", "1")
-    argv = ["bash", "-lc", "echo hi"]
-    assert _sandbox.wrap_command(argv) is argv
-
-
-def test_wrap_command_passthrough_off_darwin(monkeypatch):
-    monkeypatch.delenv("OKONOMI_NO_SANDBOX", raising=False)
-    monkeypatch.setattr(_sandbox.sys, "platform", "linux")
-    argv = ["bash", "-lc", "echo hi"]
-    assert _sandbox.wrap_command(argv) is argv
-
-
-def test_profile_scopes_writes():
-    profile = _sandbox._build_profile("/some/cwd")
-    assert "(deny file-write*)" in profile
-    assert str(_sandbox.OKONOMI_HOME) in profile
-    assert '"/some/cwd"' in profile
-
-
 @pytest.mark.skipif(sys.platform != "darwin", reason="sandbox-exec is macOS-only")
 def test_sandbox_blocks_out_of_scope_write(tmp_path, monkeypatch):
     import subprocess

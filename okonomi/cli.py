@@ -10,8 +10,9 @@ import asyncio
 import sys
 
 from .agent import OkonomiAgent
+from .agent.jobs import REPORTED_KINDS, job_notice
 from .config import load_env_or_raise
-from .events import SystemNote
+from .events import JobFinished, SystemNote
 
 
 # ANSI colors for the startup chrome (session resolution, one-shot notes) —
@@ -33,7 +34,8 @@ def resolve_session(args: argparse.Namespace) -> str | None:
     if not (args.resume or args.session):
         return None
 
-    from .session import Session, list_sessions
+    from .session import list_sessions
+    from .session import resolve_session as find_session
 
     if args.resume:
         recent = list_sessions(limit=1)
@@ -43,10 +45,10 @@ def resolve_session(args: argparse.Namespace) -> str | None:
         print(f"{YELLOW}No previous sessions found. Starting new session.{RST}\n")
         return None
 
-    session = Session.load(args.session)
+    session = find_session(args.session)
     if session:
         print(f"{BOLD}{GREEN}Loaded: {session.display_name}{RST}\n")
-        return args.session
+        return session.session_id
 
     print(f"{RED}Session {args.session} not found. Starting new session.{RST}\n")
     return None
@@ -66,13 +68,13 @@ Examples:
   okonomi                                    # Interactive mode
   okonomi --task "Design a futuristic logo"  # One-off task
   okonomi --resume                           # Resume from latest session
-  okonomi --session <id>                     # Load specific session
+  okonomi --session <id|title|words>         # Load specific session
         """,
     )
 
     parser.add_argument("--task", "-t", help="Task description for the agent (one-off task)")
     parser.add_argument("--resume", "-r", action="store_true", help="Resume from latest session")
-    parser.add_argument("--session", "-s", type=str, help="Load specific session by ID")
+    parser.add_argument("--session", "-s", type=str, help="Load a session by ID, ID prefix, title, or content words")
     parser.add_argument("--version", "-v", action="version", version="okonomi 0.1.0")
 
     return parser.parse_args()
@@ -92,7 +94,31 @@ async def _run_single_task(agent: OkonomiAgent, user_message: str) -> None:
     transcript = ReplTranscript(tool_detail="compact")
     agent.emitter.subscribe(transcript.on_event)
     loop = asyncio.get_running_loop()
-    agent_task = asyncio.create_task(agent.run_async(user_message, reset=True))
+
+    # A one-shot run has no input loop to deliver completion notices later,
+    # so it takes one more turn per launched agent; exiting after the first
+    # turn would drop their results.
+    async def _run_until_agents_report() -> None:
+        notices: asyncio.Queue[JobFinished] = asyncio.Queue()
+
+        def _collect(ev) -> None:
+            if isinstance(ev, JobFinished) and ev.kind in REPORTED_KINDS:
+                loop.call_soon_threadsafe(notices.put_nowait, ev)
+
+        agent.emitter.subscribe(_collect)
+        await agent.run_async(user_message, reset=True)
+        # Counted by job id rather than by "still running": a job is marked
+        # done just before its notice is emitted.
+        reported: set[str] = set()
+        while True:
+            launched = {job_id for job_id, entry in agent.jobs.entries.items() if entry["kind"] in REPORTED_KINDS}
+            if launched <= reported:
+                return
+            ev = await notices.get()
+            reported.add(ev.job_id)
+            await agent.run_async(job_notice(ev))
+
+    agent_task = asyncio.create_task(_run_until_agents_report())
     interrupted = False
 
     def on_sigint():

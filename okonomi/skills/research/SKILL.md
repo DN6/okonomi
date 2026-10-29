@@ -9,7 +9,7 @@ metadata:
 
 Great media start with great thinking. Move from a vague feeling to a concrete, actionable visual concept — *then* generate.
 
-The six-step process and the pitfalls below are each their own ``## H2``. Pull the section you need with `load_skill_section("research", "<slug>")` rather than the whole file. Deep lookups (composition vocabulary, color harmonies, art movements, creative-strategy techniques, output templates) live in `references/` — load on demand via `load_skill_reference("research", "<name>")`.
+The six-step process and the pitfalls below are each their own ``## H2``. Pull the section you need with `load_skill_section("research", "<slug>")` rather than the whole file. Deep lookups (composition vocabulary, color harmonies, art movements, output templates) live in `references/` — load on demand via `load_skill_reference("research", "<name>")`.
 
 ## When to use
 
@@ -27,13 +27,13 @@ The six-step process and the pitfalls below are each their own ``## H2``. Pull t
 Six-step process; each is a drillable section:
 
 1. **Listen and clarify** — surface intent, destination, emotional target, references, constraints. See `listen-and-clarify`.
-2. **Check prior research** — `recall(query=...)` (one call covers conversation content, session titles, and media prompts) first; then the mind wiki at `$OKONOMI_HOME/mind/`. See `check-prior-research`.
-3. **Apply creative strategies** — push beyond the obvious (conceptual blending, forced connections, assumption reversal). See `apply-creative-strategies`.
+2. **Check prior research** — `recall(query=...)` (one call covers conversation content, session titles, media prompts, and mind wiki pages) first; then walk the `[[wikilinks]]` of any mind page it surfaces. See `check-prior-research`.
+3. **Apply creative strategies** — only when the brief is open-ended or the first direction is obvious; skip for specific briefs. See `apply-creative-strategies`.
 4. **Research and explore** — `web_search` / `web_fetch` for artists, movements, references. Pursue visual language, reference mapping, cross-pollination. **For 2-4 genuinely independent strands (e.g. "films + comics + photography" for a noir brief), fan out via `launch_agent` instead of serial tool calls** — cuts a 5-min serial session to ~2 min of parallel work. See `research-and-explore` for the pattern.
 5. **Synthesize and structure** — pick a format (concept brief, prompt package, exploration document, photography direction). See `synthesize-and-structure`.
-6. **Save the research** — file findings into the mind wiki at `$OKONOMI_HOME/mind/` as interlinked pages. See `save-the-research`.
+6. **Save the research** — file findings into the mind wiki with `remember(...)` as interlinked pages. See `save-the-research`.
 
-Vocabulary lookups (composition, color, lighting, art movements, creative-strategy techniques, output templates) live in `references/` — load on demand via `load_skill_reference("research", "<name>")`.
+Vocabulary lookups (composition, color, lighting, art movements, output templates) live in `references/` — load on demand via `load_skill_reference("research", "<name>")`.
 
 ### Listen and clarify
 
@@ -53,31 +53,19 @@ Infer what you can; ask about the rest. Bias toward asking rather than assuming.
 
 Before starting fresh, search for existing work. Use the cross-session memory ladder (cheap → fall-back):
 
-1. `recall(query=...)` — BM25-ranked FTS5 over every saved conversation, session title, and artifact. Hits carry snippets and goal/resolution bookends. The right starting point for "have we explored X before?".
-2. The mind wiki — interlinked pages of prior distilled research:
-   ```python
-   bash(command='ls $OKONOMI_HOME/mind/')
-   search(pattern='<keyword>', path='$OKONOMI_HOME/mind/', file_glob='*.md')
-   ```
-   Read a matching page, then **walk its `[[wikilinks]]`** — neighboring pages hold related concepts that share no keywords with your query. Backlinks work too: `search(pattern='\[\[<slug>\]\]', path='$OKONOMI_HOME/mind/')` finds every page that references a concept.
+1. `recall(query=...)` — BM25-ranked FTS5 over every saved conversation, session title, artifact, and mind wiki page. Hits carry snippets; conversation hits add goal/resolution bookends, mind hits a `path`. The right starting point for "have we explored X before?".
+2. The mind wiki — for a mind hit, `read_file` its `path`, then **walk its `[[wikilinks]]`** — neighboring pages hold related concepts that share no keywords with your query. Backlinks work too: `search(pattern='\[\[<slug>\]\]', path='$OKONOMI_HOME/mind/')` finds every page that references a concept.
 3. `recall(session_id=...)` — drill into one promising hit for full metadata + artifacts + the conversation head/tail.
 
 Try synonyms, related styles, artist names. If relevant prior work exists, surface it: *"You explored something similar when you worked on X — want to build from that?"*
 
 ### Apply creative strategies
 
-Push the concept beyond the obvious before research begins. Quick reference:
+Skip this step when the brief is already specific. Otherwise push past the obvious direction before research begins, with whatever technique fits the brief — there is no fixed set.
 
-| Strategy | Use when |
-|---|---|
-| Conceptual blending | Two domains can merge (Baroque + brutalism) |
-| Replacement template | Symbolic substitution reveals hidden qualities |
-| Forced connections | Need unexpected angles from distant domains |
-| Assumption reversal | Flip fundamental premises to find new possibilities |
-| Distance associations | Walk from obvious to surprising via semantic network |
-| Perspective shifting | View through different lenses, scales, or timeframes |
+Strategies that worked for this user live in the mind wiki as pages tagged `strategy`; `recall(query="strategy")` lists them, and each page's `## Uses` section records where it was applied and whether the user kept the result. Weigh those, but don't limit yourself to them.
 
-Use one or combine several. The goal: a direction that's specific *and* surprising. Full technique writeups in `creative-strategies` reference.
+The goal: a direction that's specific *and* surprising.
 
 ### Research and explore
 
@@ -136,9 +124,11 @@ launch_agent(
 )
 ```
 
-After launching, poll `list_agents()` until all show `done`. Then read
-the strand files, synthesize them into the final concept brief, and
-proceed to generation as usual. Sub-agents share the session dir,
+After launching, end your reply. Each sub-agent's closing message
+arrives in a system note when it finishes; do not poll `list_agents()`
+for it. Once every strand has reported, read the strand files,
+synthesize them into the final concept brief, and proceed to
+generation as usual. Sub-agents share the session dir,
 share the artifact registry, and auto-merge their tracked outputs back
 when they finish.
 
@@ -160,38 +150,28 @@ Pick the output format that fits. Full templates in `output-formats` reference:
 
 ### Save the research
 
-File results into the mind wiki at `$OKONOMI_HOME/mind/` — a flat directory of interlinked markdown pages, not monolithic reports. Two kinds of page come out of a research run:
+File results into the mind wiki with the `remember` tool — the only way pages are written (file tools refuse the mind directory). The wiki is a flat set of interlinked pages, not monolithic reports. Two kinds of page come out of a research run:
 
-1. **Concept pages** — one per distinct concept the research surfaced: an aesthetic, an artist/film/work reference, a recurring motif, a technique. Filename is the kebab-case slug of the concept name (`sodium-vapour-night.md`).
+1. **Concept pages** — one per distinct concept the research surfaced: an aesthetic, an artist/film/work reference, a recurring motif, a technique. The slug is the kebab-case concept name (`sodium-vapour-night`).
 2. **The synthesis page** — the concept brief / prompt package itself, as its own page that links out to the concept pages it draws on. It stays **self-contained** (someone reading it cold should understand the concept, references, and direction) while its `[[links]]` connect it into the wiki.
 
-**Update before create.** Search for an existing page on each concept first (`search(pattern='<concept>', path='$OKONOMI_HOME/mind/')`). If one exists, revise/extend it and bump `updated:` — never write a duplicate page for the same concept.
-
-Page format:
-
-```markdown
----
-name: sodium-vapour-night
-description: one-line summary shown when the wiki is listed
-tags: [aesthetic, night, colour]
-created: 2026-09-07
-updated: 2026-09-07
----
-
-Prose: what this is, what makes it work, where it came from. Reference
-related concepts inline as [[grain]] or [[theyyam-portraits]] — the links
-are the graph; link generously to pages that exist or should exist.
-```
+**Update before create.** `recall(query='<concept>')` for each concept first. If a mind page comes back, `read_file` it, merge the new findings into its body, and write it back with its slug and `update=True` — never write a duplicate page for the same concept.
 
 ```python
-import os
-mind_dir = os.path.expandvars("$OKONOMI_HOME/mind")
-os.makedirs(mind_dir, exist_ok=True)
-path = f"{mind_dir}/<slug>.md"
-with open(path, "w") as f:
-    f.write(page_markdown)
-print(path)
+remember(
+    title="Sodium-Vapour Night",
+    slug="sodium-vapour-night",
+    tags=["aesthetic", "night", "colour"],
+    related=["grain", "theyyam-portraits"],
+    body="Prose: what this is, what makes it work, where it came from. Reference related "
+         "concepts inline as [[grain]] — the links are the graph; link generously to pages "
+         "that exist or should exist.",
+)
 ```
+
+`remember` writes the frontmatter (`title`, `tags`, `created`, `updated`, `related`) and the title heading; pass only the body.
+
+**Record the strategy.** If a creative strategy produced the direction the user chose (or rejected), add an entry to that strategy page's `## Uses` section — project, what was combined or flipped, and the outcome — via the same update-before-create path. A strategy with no page yet gets a new one tagged `strategy`. Link the synthesis page to it.
 
 ## Pitfalls
 
@@ -212,6 +192,5 @@ Topic-deep material, available via `load_skill_reference("research", "<name>")`:
 
 | Reference | Contents |
 |---|---|
-| `creative-strategies` | Conceptual blending, replacement templates, forced connections, assumption reversal, distance associations, perspective shifting — full writeups with examples. |
 | `visual-language` | Composition (rule of thirds, golden ratio, leading lines, negative space), color harmonies (mono, analogous, complementary, split-comp, triadic), lighting (hard/soft, Rembrandt, butterfly, split, rim), texture vocabulary, art-movement glossary (Impressionism → Vaporwave → Solarpunk). |
 | `output-formats` | Templates for concept brief, prompt package, exploration document, photography direction. |

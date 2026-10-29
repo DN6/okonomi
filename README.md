@@ -53,6 +53,7 @@ If more than one key is set, pick the provider explicitly (valid strings:
 ```bash
 OKONOMI_PROVIDER=openrouter   # which provider to use when several keys are present
 OKONOMI_MODEL=...             # override the default model id for the chosen provider
+OKONOMI_SUBAGENT_MODELS=a,b   # model ids the agent may pick for sub-agents (default: its own model only)
 ```
 
 > Media generation (image/video) routes through OpenRouter-specific model ids, so
@@ -61,7 +62,7 @@ OKONOMI_MODEL=...             # override the default model id for the chosen pro
 Everything else is optional:
 
 ```bash
-# Storage root for sessions, research, skills and favourites (default: ~/.okonomi)
+# Storage root for sessions, research, skills and favorites (default: ~/.okonomi)
 OKONOMI_HOME=/path/to/okonomi/home
 
 # Skip the shell-command safety checks in the `bash` tool

@@ -230,6 +230,14 @@ def fuzzy_match(query: str, haystack: str) -> bool:
     return i == len(query)
 
 
+def words_match(query: str, text: str) -> bool:
+    """In-memory twin of the live FTS query the search pickers send: every
+    query word must start some word of ``text`` (case-insensitive), so
+    filtering a list and searching the store accept the same input."""
+    words = re.findall(r"\w+", text.lower())
+    return all(any(w.startswith(q) for w in words) for q in re.findall(r"\w+", query.lower()))
+
+
 def shutdown_loop(loop) -> None:
     """Cancel pending tasks, drain async generators, then close the loop."""
     import asyncio

@@ -10,6 +10,7 @@ from .files import FileTools
 from .sessions import SessionsTools
 from .skills import SkillTools
 from .terminal import TerminalTools
+from .viewer import ViewerTools
 from .web import WebTools
 
 
@@ -19,5 +20,6 @@ __all__ = [
     "SessionsTools",
     "SkillTools",
     "TerminalTools",
+    "ViewerTools",
     "WebTools",
 ]

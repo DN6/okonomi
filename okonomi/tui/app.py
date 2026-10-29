@@ -13,7 +13,7 @@ explicit echo control: real user messages are printed to scrollback by us; the
 approval answer is not, so it leaves no residue.
 
 Exposes the same surface ``TuiSession`` calls on the app: ``run_async``,
-``exit``, ``call_from_thread``, ``show_approval``, ``show_session_picker``,
+``exit``, ``call_from_thread``, ``show_approval``, ``show_find_picker``,
 ``show_asset_picker``, ``show_tree_picker``, ``prefill_input``,
 ``toggle_verbose``.
 """
@@ -21,6 +21,7 @@ Exposes the same surface ``TuiSession`` calls on the app: ``run_async``,
 from __future__ import annotations
 
 import asyncio
+import threading
 import time
 from pathlib import Path
 from typing import Callable
@@ -34,6 +35,7 @@ from prompt_toolkit.filters import Condition
 from prompt_toolkit.history import FileHistory
 from prompt_toolkit.key_binding import KeyBindings, merge_key_bindings
 from prompt_toolkit.key_binding.defaults import load_key_bindings
+from prompt_toolkit.keys import Keys
 from prompt_toolkit.layout import Layout
 from prompt_toolkit.layout.containers import (
     ConditionalContainer,
@@ -105,6 +107,8 @@ class ReplApp:
         bg_tasks_fn: Callable[[], list] | None = None,
         on_double_escape: Callable[[], None] | None = None,
         on_history_search: Callable[[], None] | None = None,
+        on_jobs: Callable[[], None] | None = None,
+        is_busy: Callable[[], bool] | None = None,
     ) -> None:
         self.emitter = emitter
         self.on_submit_cb = on_submit
@@ -113,6 +117,8 @@ class ReplApp:
         self.on_interrupt_cb = on_interrupt
         self.on_double_escape = on_double_escape
         self.on_history_search = on_history_search
+        self.on_jobs = on_jobs
+        self.is_busy = is_busy or (lambda: False)
         self.spinner_label_fn = spinner_label_fn
         self.usage_fn = usage_fn
         self.bg_tasks_fn = bg_tasks_fn
@@ -124,6 +130,14 @@ class ReplApp:
         # A picker requested by a slash command; the app exits so the outer
         # loop can run the (full-screen) modal, then re-enters.
         self._pending_modal: tuple | None = None
+        # Idle Ctrl+C on an empty prompt arms exit; a second press within
+        # the window exits. One press can land just after a turn ends.
+        self._exit_armed_at = 0.0
+        # While a full-screen picker is up, transcript output is held and
+        # printed on close: it would otherwise land on the picker's screen.
+        self._in_modal = False
+        self._held: list[Callable[[], None]] = []
+        self._held_lock = threading.Lock()
 
         HISTORY_FILE.parent.mkdir(parents=True, exist_ok=True)
         self.input = Buffer(
@@ -131,7 +145,7 @@ class ReplApp:
             complete_while_typing=True,
             history=FileHistory(str(HISTORY_FILE)),
             accept_handler=self._on_accept,
-            multiline=False,
+            multiline=True,  # Enter still submits (binding below); Alt+Enter adds a line
         )
         self.app: Application = self._build_app()
 
@@ -181,7 +195,7 @@ class ReplApp:
             content=body,
             floats=[Float(content=CompletionsMenu(max_height=12, scroll_offset=1), xcursor=True, ycursor=True)],
         )
-        return _ReflowSafeApplication(
+        app = _ReflowSafeApplication(
             layout=Layout(root, focused_element=input_window),
             key_bindings=merge_key_bindings([load_key_bindings(), self._key_bindings()]),
             style=REPL_STYLE,
@@ -190,6 +204,10 @@ class ReplApp:
             erase_when_done=True,
             refresh_interval=0.5,
         )
+        # How long a lone Esc byte waits in case it starts an escape
+        # sequence; the 0.5s default made Esc-to-stop feel laggy.
+        app.ttimeoutlen = 0.1
+        return app
 
     def _input_prefix(self, line_number: int, wrap_count: int):
         if line_number or wrap_count:
@@ -245,6 +263,7 @@ class ReplApp:
             text = "bg: " + " · ".join(parts)
             if len(bg) > 3:
                 text += f" +{len(bg) - 3}"
+            text += " · ↓ view"
             groups.append([("class:bottom-toolbar.bg", text)])
         if not groups:
             return []  # idle → no status bar
@@ -294,6 +313,26 @@ class ReplApp:
             if self._approval_resolve is None and self.on_history_search is not None:
                 self.on_history_search()
 
+        @kb.add("escape", "enter")
+        def _(event):
+            event.current_buffer.insert_text("\n")
+
+        # While a turn runs, a single Esc cancels it; idle, Esc Esc opens the tree.
+        # Terminals send Alt+Enter as Esc then Enter in one read, so step
+        # aside when an Enter is already queued behind this Esc.
+        def _enter_queued() -> bool:
+            queue = self.app.key_processor.input_queue
+            return bool(queue) and queue[0].key == Keys.ControlM
+
+        @kb.add(
+            "escape",
+            eager=True,
+            filter=Condition(lambda: self._approval_resolve is None and self.is_busy() and not _enter_queued()),
+        )
+        def _(event):
+            if self.on_interrupt_cb is not None:
+                self.on_interrupt_cb()
+
         @kb.add(
             "escape",
             "escape",
@@ -301,11 +340,24 @@ class ReplApp:
                 lambda: not self.input.text
                 and self._approval_resolve is None
                 and self.input.complete_state is None
+                and not self.is_busy()
             ),
         )
         def _(event):
             if self.on_double_escape is not None:
                 self.on_double_escape()
+
+        @kb.add(
+            "down",
+            filter=Condition(
+                lambda: not self.input.text
+                and self._approval_resolve is None
+                and self.input.complete_state is None
+            ),
+        )
+        def _(event):
+            if self.on_jobs is not None:
+                self.on_jobs()
 
         return kb
 
@@ -314,7 +366,7 @@ class ReplApp:
     async def run_async(self) -> None:
         self._loop = asyncio.get_running_loop()
         with patch_stdout(raw=True):  # pass rich's ANSI/OSC escapes through unescaped
-            unsub = self.emitter.subscribe(self.transcript.on_event)
+            unsub = self.emitter.subscribe(self._on_event)
             self.transcript.replaying = True
             for ev in self.emitter.history():
                 self.transcript.on_event(ev)
@@ -327,12 +379,23 @@ class ReplApp:
                         break
                     if self._exit:
                         break
-                    if self._pending_modal is not None:
-                        await self._run_modal()
-                    else:
+                    if self._pending_modal is None:
                         break  # app ended with no modal pending → stop
+                    # A modal can queue the next one (jobs → tree).
+                    while self._pending_modal is not None:
+                        await self._run_modal()
             finally:
                 unsub()
+
+    def _on_event(self, ev) -> None:
+        self._unless_modal(lambda: self.transcript.on_event(ev))
+
+    def _unless_modal(self, fn: Callable[[], None]) -> None:
+        with self._held_lock:
+            if self._in_modal:
+                self._held.append(fn)
+                return
+        fn()
 
     def _on_accept(self, buf: Buffer) -> bool:
         text = buf.text
@@ -346,7 +409,8 @@ class ReplApp:
 
     def _on_interrupt(self) -> None:
         # 1. answering an approval → skip; 2. turn running → cancel it;
-        # 3. otherwise clear the current draft.
+        # 3. draft present → clear it; 4. otherwise (idle, empty) exit on
+        # a second press.
         if self._approval_resolve is not None:
             resolver = self._approval_resolve
             self._approval_resolve = None
@@ -355,11 +419,21 @@ class ReplApp:
             return
         if self.on_interrupt_cb is not None and self.on_interrupt_cb():
             return  # a running turn was cancelled
+        if not self.input.text:
+            if time.monotonic() - self._exit_armed_at < 2.0:
+                self.exit()
+                return
+            self._exit_armed_at = time.monotonic()
+            self.emitter.emit(SystemNote("Press Ctrl+C again to exit."))
+            return
         self.input.reset()
 
     # --- inline approval (runs on the main loop via call_from_thread) ---
 
     def show_approval(self, code: str, resolve: Callable[[object], None]) -> None:
+        self._unless_modal(lambda: self._show_approval(code, resolve))
+
+    def _show_approval(self, code: str, resolve: Callable[[object], None]) -> None:
         self._approval_resolve = resolve
         if code:
             self.transcript.print_code(code)  # persists in scrollback (highlighted)
@@ -417,8 +491,8 @@ class ReplApp:
         if loop is not None:
             loop.call_soon_threadsafe(lambda: fn(*args))
 
-    def show_session_picker(self, on_select) -> None:
-        self._pending_modal = ("session", on_select)
+    def show_find_picker(self, initial: str, scope: str, on_select) -> None:
+        self._pending_modal = ("find", on_select, initial, scope)
         self._stop_app()  # break out so the outer loop runs the modal
 
     def show_asset_picker(self, artifacts, on_action) -> None:
@@ -433,6 +507,10 @@ class ReplApp:
         self._pending_modal = ("history", on_select, session_id)
         self._stop_app()
 
+    def show_jobs_picker(self, title: str, jobs, on_tree) -> None:
+        self._pending_modal = ("jobs", on_tree, title, jobs)
+        self._stop_app()
+
     def prefill_input(self, text: str) -> None:
         """Put text in the input box, cursor at the end — the buffer
         survives the modal round-trip, so this lands after re-entry."""
@@ -444,13 +522,15 @@ class ReplApp:
         self._pending_modal = None
         if modal is None:
             return
+        with self._held_lock:
+            self._in_modal = True
         try:
-            if modal[0] == "session":
-                from .pickers import pick_session
+            if modal[0] == "find":
+                from .pickers import pick_find
 
-                chosen = await pick_session()
-                if chosen:
-                    modal[1](chosen)
+                result = await pick_find(modal[2], modal[3])
+                if result is not None:
+                    modal[1](*result)  # on_select(action, hit)
             elif modal[0] == "asset":
                 from .pickers import pick_assets
 
@@ -469,8 +549,22 @@ class ReplApp:
                 result = await pick_history(modal[2])
                 if result is not None:
                     modal[1](*result)  # on_select(target_event_id, prefill, summarize)
+            elif modal[0] == "jobs":
+                from .pickers import pick_jobs
+
+                if await pick_jobs(modal[2], modal[3]) == "tree":
+                    modal[1]()
         except Exception as e:  # noqa: BLE001
             self.emitter.emit(SystemNote(f"Picker error: {e}", level="warn"))
+        finally:
+            while True:
+                with self._held_lock:
+                    if not self._held:
+                        self._in_modal = False
+                        break
+                    held, self._held = self._held, []
+                for fn in held:
+                    fn()
 
     def toggle_verbose(self) -> None:
         self.transcript.tool_detail = "full" if self.transcript.tool_detail == "compact" else "compact"

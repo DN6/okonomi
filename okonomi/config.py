@@ -17,8 +17,8 @@ OKONOMI_HOME = Path(os.getenv("OKONOMI_HOME", str(Path.home() / ".okonomi")))
 OKONOMI_SESSIONS_DIR = OKONOMI_HOME / "sessions"
 OKONOMI_MIND_DIR = OKONOMI_HOME / "mind"
 OKONOMI_SKILLS_DIR = OKONOMI_HOME / "skills"
-OKONOMI_FAVOURITES_DIR = OKONOMI_HOME / "favourites"
-OKONOMI_LOVED_DIR = OKONOMI_HOME / "loved"
+OKONOMI_FAVORITES_DIR = OKONOMI_HOME / "favorites"
+OKONOMI_MCP_CONFIG = OKONOMI_HOME / "mcp.json"
 
 
 # --- Model providers ---
@@ -84,6 +84,14 @@ def resolve_model_id(provider: str) -> str:
     if not default:
         raise EnvironmentError(f"No default model for provider '{provider}'. Set OKONOMI_MODEL to a model id.")
     return default
+
+
+def subagent_models() -> list[str]:
+    """Model ids a parent agent may pick for a sub-agent, from the
+    comma-separated ``OKONOMI_SUBAGENT_MODELS``. Empty when unset:
+    sub-agents then always run on the parent's model."""
+    raw = os.getenv("OKONOMI_SUBAGENT_MODELS") or ""
+    return [model.strip() for model in raw.split(",") if model.strip()]
 
 
 def load_env_or_raise() -> None:
