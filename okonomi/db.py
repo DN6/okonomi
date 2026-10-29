@@ -125,11 +125,11 @@ CREATE INDEX IF NOT EXISTS idx_artifacts_session ON artifacts(session_id);
 CREATE INDEX IF NOT EXISTS idx_artifacts_type    ON artifacts(artifact_type);
 CREATE INDEX IF NOT EXISTS idx_artifacts_ts      ON artifacts(timestamp DESC);
 
--- User-curated favorites ("hearts"). Two flavors share one table:
+-- User-curated favorites. Two flavors share one table:
 --   internal: artifact_id set → CASCADE-deletes with the artifact
 --   external: artifact_id NULL → user bookmarked a bare URL or local path
 -- Dedup via partial unique indexes: same artifact / same URL / same path
--- can each be hearted at most once.
+-- can each be favorited at most once.
 CREATE TABLE IF NOT EXISTS favorites (
     id              INTEGER PRIMARY KEY AUTOINCREMENT,
     artifact_id     INTEGER REFERENCES artifacts(id) ON DELETE CASCADE,
@@ -157,6 +157,11 @@ CREATE VIRTUAL TABLE IF NOT EXISTS events_fts USING fts5(
     content,
     tokenize = 'porter unicode61'
 );
+
+-- Indexed terms, for expanding a typed prefix (see expand_prefixes).
+CREATE VIRTUAL TABLE IF NOT EXISTS sessions_vocab  USING fts5vocab(sessions_fts, row);
+CREATE VIRTUAL TABLE IF NOT EXISTS artifacts_vocab USING fts5vocab(artifacts_fts, row);
+CREATE VIRTUAL TABLE IF NOT EXISTS events_vocab    USING fts5vocab(events_fts, row);
 
 CREATE TRIGGER IF NOT EXISTS events_ai AFTER INSERT ON events BEGIN
     INSERT INTO events_fts(rowid, content) VALUES (new.rowid, new.content);
@@ -593,6 +598,40 @@ def sanitize_fts_query(query: str) -> str:
     return " ".join(tokens)
 
 
+_FTS_PREFIX = re.compile(r"^(\w+)\*$")
+_PREFIX_EXPANSIONS = 64
+
+
+def expand_prefixes(conn: sqlite3.Connection, vocab: str, q: str) -> str:
+    """Rewrite each ``word*`` in a sanitized query as an OR of the indexed
+    terms starting with ``word``. FTS5 runs a prefix through the porter
+    stemmer before matching it, so a half-typed word gets mangled
+    (``theyy*`` → ``theyi*``) and finds nothing; matching against the
+    stored terms directly avoids that. The raw ``word*`` stays in the
+    group: it covers every term the expansion cap leaves out whenever
+    stemming leaves the prefix alone, which it always does for the
+    one- and two-letter prefixes most likely to hit the cap. A parenthesised group can't rely on FTS5's
+    implicit AND, so adjacent operands get an explicit one."""
+    out: list[str] = []
+    for tok in re.findall(r'"[^"]*"|\S+', q):
+        m = _FTS_PREFIX.match(tok)
+        if m:
+            prefix = m.group(1).lower()
+            terms = [
+                r[0]
+                for r in conn.execute(
+                    f"SELECT term FROM {vocab} WHERE term >= ? AND term < ? ORDER BY doc DESC LIMIT ?",
+                    (prefix, prefix + "\uffff", _PREFIX_EXPANSIONS),
+                )
+            ]
+            if terms:
+                tok = f"({' OR '.join([tok, *terms])})"
+        if out and out[-1] not in _FTS_BOOLEANS and tok not in _FTS_BOOLEANS:
+            out.append("AND")
+        out.append(tok)
+    return " ".join(out)
+
+
 def _force_phrase(query: str) -> str:
     """Last-resort MATCH argument: the whole query as one quoted phrase."""
     return '"' + query.replace('"', " ").strip() + '"'
@@ -608,7 +647,7 @@ def search_events_fts(
     """BM25-ranked FTS5 search over event content, with a highlighted
     snippet per hit and the owning session's title joined in. Rewound
     (inactive) events are invisible."""
-    q = sanitize_fts_query(query)
+    q = expand_prefixes(conn, "events_vocab", sanitize_fts_query(query))
     if not q.strip():
         return []
 
@@ -622,7 +661,7 @@ def search_events_fts(
     sql = f"""
         SELECT e.session_id, e.event_id, e.type, e.timestamp,
                snippet(events_fts, 0, '>>>', '<<<', '…', 20) AS snippet,
-               s.title AS session_title, s.created_at AS session_created_at,
+               COALESCE(NULLIF(s.title, ''), substr(s.task_input, 1, 60)) AS session_title, s.created_at AS session_created_at,
                bm25(events_fts) AS score
         FROM events_fts f
         JOIN events e ON e.rowid = f.rowid
@@ -647,7 +686,7 @@ def search_sessions_fts(conn: sqlite3.Connection, query: str, limit: int = 20) -
     to ``_TASK_INPUT_PREVIEW`` chars. Drill into a hit with
     ``fetch_session`` for the full row.
     """
-    q = sanitize_fts_query(query)
+    q = expand_prefixes(conn, "sessions_vocab", sanitize_fts_query(query))
     if not q.strip():
         return []
     sql = """
@@ -677,6 +716,72 @@ def search_sessions_fts(conn: sqlite3.Connection, query: str, limit: int = 20) -
     return out
 
 
+_MIND_TITLE = re.compile(r"^title:\s*(.+)$", re.MULTILINE)
+_MIND_SUMMARY = re.compile(r"^tags:\s*(.+)$", re.MULTILINE)
+
+
+def _mind_page(path: Path, content: str, **extra: Any) -> dict[str, Any]:
+    title = _MIND_TITLE.search(content)
+    return {
+        "path": str(path),
+        "title": title.group(1).strip() if title else path.stem,
+        "timestamp": datetime.fromtimestamp(path.stat().st_mtime).isoformat(timespec="seconds"),
+        **extra,
+    }
+
+
+def list_mind_pages(mind_dir: Path) -> list[dict[str, Any]]:
+    """Every mind wiki page, most recently edited first, with its
+    frontmatter tags as the snippet."""
+    if not mind_dir.is_dir():
+        return []
+    pages = []
+    for p in mind_dir.glob("*.md"):
+        content = p.read_text(encoding="utf-8", errors="replace")
+        summary = _MIND_SUMMARY.search(content)
+        pages.append(_mind_page(p, content, snippet=summary.group(1).strip() if summary else "", score=0.0))
+    pages.sort(key=lambda h: h["timestamp"], reverse=True)
+    return pages
+
+
+def search_mind_fts(mind_dir: Path, query: str, limit: int = 20) -> list[dict[str, Any]]:
+    """BM25-ranked FTS5 search over the mind wiki's markdown pages.
+
+    The pages are plain files written by the agent through any file tool,
+    so there is no write hook to keep a persistent index in sync; the
+    wiki is small, so it is indexed into a throwaway in-memory table per
+    query instead.
+    """
+    q = sanitize_fts_query(query)
+    if not q.strip() or not mind_dir.is_dir():
+        return []
+    mem = sqlite3.connect(":memory:")
+    mem.row_factory = sqlite3.Row
+    try:
+        mem.execute("CREATE VIRTUAL TABLE mind_fts USING fts5(path UNINDEXED, content, tokenize = 'porter unicode61')")
+        mem.execute("CREATE VIRTUAL TABLE mind_vocab USING fts5vocab(mind_fts, row)")
+        mem.executemany(
+            "INSERT INTO mind_fts(path, content) VALUES (?, ?)",
+            [(str(p), p.read_text(encoding="utf-8", errors="replace")) for p in sorted(mind_dir.glob("*.md"))],
+        )
+        q = expand_prefixes(mem, "mind_vocab", q)
+        sql = """
+            SELECT path, content, snippet(mind_fts, 1, '>>>', '<<<', '…', 20) AS snippet,
+                   bm25(mind_fts) AS score
+            FROM mind_fts
+            WHERE mind_fts MATCH ?
+            ORDER BY score
+            LIMIT ?
+            """
+        try:
+            rows = mem.execute(sql, (q, limit)).fetchall()
+        except sqlite3.OperationalError:
+            rows = mem.execute(sql, (_force_phrase(query), limit)).fetchall()
+    finally:
+        mem.close()
+    return [_mind_page(Path(r["path"]), r["content"], snippet=r["snippet"], score=r["score"]) for r in rows]
+
+
 def search_artifacts_fts(
     conn: sqlite3.Connection,
     query: str,
@@ -689,8 +794,8 @@ def search_artifacts_fts(
 
     The FTS5 index doesn't tokenize URLs (random hash IDs aren't useful
     search terms), so a URL fragment like ``"gTPx9BTfmSTrVPiInkOrJ"``
-    won't FTS-match anything. We fall back to a ``LIKE %query%`` scan
-    of ``url`` and ``path`` when the FTS path returns nothing — covers
+    won't FTS-match anything. A ``LIKE %query%`` scan of ``url`` and
+    ``path`` fills in after the FTS hits — covers
     the "I have this image URL, where did it come from?" lookup that
     used to require grepping transcripts on disk.
 
@@ -717,14 +822,14 @@ def search_artifacts_fts(
         sql = """
             SELECT a.id AS artifact_id, a.session_id, a.artifact_type, a.url, a.path,
                    a.prompt, a.description,
-                   s.title, s.created_at,
+                   COALESCE(NULLIF(s.title, ''), substr(s.task_input, 1, 60)) AS title, s.created_at,
                    bm25(artifacts_fts) AS score
             FROM artifacts_fts f
             JOIN artifacts a ON a.id = f.rowid
             JOIN sessions s ON s.session_id = a.session_id
             WHERE artifacts_fts MATCH ?
         """
-        params: list[Any] = [sanitize_fts_query(query)]
+        params: list[Any] = [expand_prefixes(conn, "artifacts_vocab", sanitize_fts_query(query))]
         if artifact_type:
             sql += " AND a.artifact_type = ?"
             params.append(artifact_type)
@@ -736,15 +841,17 @@ def search_artifacts_fts(
         # Skip straight to the URL/path fallback.
         fts_rows = []
 
-    if fts_rows:
+    if len(fts_rows) >= limit:
         return _normalize(fts_rows)
 
-    # Fallback: substring match against url / path.
-    like = f"%{query}%"
+    # Then substring matches against url / path, which FTS can't see —
+    # appended rather than only-on-empty, so a path fragment that also
+    # shares a word with some prompt still finds its file.
+    like = f"%{query.rstrip('*')}%"  # live pickers send the word being typed as an FTS prefix
     sql = """
         SELECT a.id AS artifact_id, a.session_id, a.artifact_type, a.url, a.path,
                a.prompt, a.description,
-               s.title, s.created_at,
+               COALESCE(NULLIF(s.title, ''), substr(s.task_input, 1, 60)) AS title, s.created_at,
                0.0 AS score
         FROM artifacts a
         JOIN sessions s ON s.session_id = a.session_id
@@ -756,7 +863,9 @@ def search_artifacts_fts(
         params.append(artifact_type)
     sql += " ORDER BY a.timestamp DESC LIMIT ?"
     params.append(limit)
-    return _normalize(conn.execute(sql, params).fetchall())
+    seen = {r["artifact_id"] for r in fts_rows}
+    like_rows = [r for r in conn.execute(sql, params).fetchall() if r["artifact_id"] not in seen]
+    return _normalize([*fts_rows, *like_rows][:limit])
 
 
 # ── favorites ───────────────────────────────────────────────────────────
@@ -769,12 +878,12 @@ def add_favorite(
     url: str = "",
     artifact_type: str = "",
 ) -> int:
-    """Heart an asset. Idempotent — re-hearting the same target refreshes
+    """Favorite an asset. Idempotent — re-favoriting the same target refreshes
     the timestamp and returns the existing row id.
 
     Identity:
-      - ``artifact_id`` set → internal heart (de-duped per artifact)
-      - else ``url`` set    → external heart (de-duped per URL/path string)
+      - ``artifact_id`` set → internal favorite (de-duped per artifact)
+      - else ``url`` set    → external favorite (de-duped per URL/path string)
 
     The ``url`` arg accepts either a remote URL (``http``/``https``/
     ``file``/``data``) or a bare local filesystem path.
@@ -814,7 +923,7 @@ def add_favorite(
 
 
 def remove_favorite(conn: sqlite3.Connection, favorite_id: int) -> bool:
-    """Unheart by favorites.id. Returns True if a row was removed."""
+    """Remove a favorite by favorites.id. Returns True if a row was removed."""
     cur = conn.execute("DELETE FROM favorites WHERE id = ?", (favorite_id,))
     return cur.rowcount > 0
 
@@ -826,13 +935,15 @@ def list_favorites(
     artifact_source: str | None = None,
     limit: int | None = None,
 ) -> list[dict[str, Any]]:
-    """Newest-first hearts. Internal hearts get artifact + session context
-    via LEFT JOIN; external hearts return their stored url/path/type.
+    """Newest-first favorites with artifact + session context via LEFT JOIN.
+    Internal favorites join on ``artifact_id``; external favorites join on the
+    newest artifact whose path or URL equals the stored ref, so a favorite
+    from the viewer or asset picker still knows its prompt and session.
 
     Each row carries: ``id``, ``artifact_id`` (or None),
     ``artifact_source``, ``url`` (URL or local path), ``artifact_type``,
     ``favorited_at``, plus ``session_id`` / ``session_title`` / ``prompt``
-    / ``tool_name`` / ``model_id`` when the heart is internal.
+    / ``tool_name`` / ``model_id`` when the favorite is internal.
 
     ``artifact_type`` and ``artifact_source`` are optional filters. The
     type filter matches against the resolved type (favorite's own type
@@ -842,10 +953,15 @@ def list_favorites(
         SELECT f.id, f.artifact_id, f.artifact_source, f.favorited_at,
                COALESCE(NULLIF(f.url, ''), a.path, a.url) AS url,
                COALESCE(NULLIF(f.artifact_type, ''), a.artifact_type) AS artifact_type,
-               a.session_id, a.prompt, a.tool_name, a.model_id, a.timestamp,
-               s.title AS session_title
+               a.session_id, a.prompt, a.description, a.tool_name, a.model_id, a.timestamp,
+               COALESCE(NULLIF(s.title, ''), substr(s.task_input, 1, 60)) AS session_title
         FROM favorites f
-        LEFT JOIN artifacts a ON a.id = f.artifact_id
+        LEFT JOIN artifacts a ON a.id = COALESCE(
+            f.artifact_id,
+            (SELECT x.id FROM artifacts x
+             WHERE f.url != '' AND (x.path = f.url OR x.url = f.url)
+             ORDER BY x.id DESC LIMIT 1)
+        )
         LEFT JOIN sessions  s ON s.session_id = a.session_id
     """
     where: list[str] = []

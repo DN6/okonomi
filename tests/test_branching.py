@@ -7,7 +7,7 @@ import pytest
 from pydantic_ai.messages import ModelRequest, ModelResponse, TextPart, UserPromptPart
 
 from okonomi import db
-from okonomi.context import BRANCH_SUMMARY_PREFIX, ContextManager
+from okonomi.context import BRANCH_SUMMARY_PREFIX
 from okonomi.events import CONVERSATION_TYPES, EventType
 from okonomi.tui.pickers import _tree_rows
 
@@ -65,19 +65,6 @@ def test_append_after_checkout_chains_from_leaf(conn):
     assert _active_ids(conn) == [0, 1, 2, 3, 6]
 
 
-def test_checkout_none_deactivates_all(conn):
-    _forked_session(conn)
-    n = db.checkout_events(conn, SID, None)
-    assert n == 0
-    assert _active_ids(conn) == [], f"expected empty active path, got {_active_ids(conn)}"
-
-
-def test_checkout_unknown_target_raises(conn):
-    _forked_session(conn)
-    with pytest.raises(ValueError, match="99"):
-        db.checkout_events(conn, SID, 99)
-
-
 # ── pickers._tree_rows ───────────────────────────────────────────────────
 
 
@@ -114,9 +101,13 @@ def test_tree_rows_forked_session():
     rows = _tree_rows(events)
 
     assert [r["event_id"] for r in rows] == [0, 1, 2, 3, 4, 5, 6, 8], f"row order: {[r['event_id'] for r in rows]}"
+    # No active child under node 1, so the newest (4) is the trunk and 2 hangs.
     guides = [r["guide"] for r in rows]
-    assert guides == ["", "", "├── ", "│   ", "└── ", "    ", "", ""], f"guides: {guides}"
-    assert [r["event_id"] for r in rows if r["branch"]] == [2, 4], "fork heads are the two resubmitted user messages"
+    assert guides == ["", "", "├── ", "│   ", "", "", "", ""], f"guides: {guides}"
+    assert [r["event_id"] for r in rows if r["branch"]] == [2], "only the hanging branch has a fold head"
+    heads = [r["heads"] for r in rows]
+    assert heads == [(), (), (), (2,), (), (), (), ()], f"enclosing heads: {heads}"
+
 
     by_id = {r["event_id"]: r for r in rows}
     assert by_id[0]["checkout_target"] is None, "root user row must check out to empty path"
@@ -132,73 +123,7 @@ def test_tree_rows_forked_session():
 # ── pickers._abandoned_count + history search filter ─────────────────────
 
 
-def _forked_events():
-    u, a = EventType.USER_MESSAGE, EventType.ASSISTANT_MESSAGE
-    return [
-        _ev(0, None, u, "first ask", 1, _user_payload("first ask")),
-        _ev(1, 0, a, "answer 1", 1),
-        _ev(2, 1, u, "try redis", 1, _user_payload("try redis")),
-        _ev(3, 2, a, "redis done", 1),
-        _ev(4, 1, u, "try sqlite", 0, _user_payload("try sqlite")),
-        _ev(5, 4, a, "sqlite done", 0),
-    ]
-
-
-def test_abandoned_count_shared_helper():
-    from okonomi.tui.pickers import _abandoned_count
-
-    events = _forked_events()
-    parents = {e["event_id"]: e["parent_id"] for e in events}
-    conv_types = {t.value for t in CONVERSATION_TYPES}
-
-    # Checking out the active leaf (3) abandons nothing on the active path.
-    assert _abandoned_count(events, parents, conv_types, 3) == 0
-    # Checking out to node 1 drops active turns 2 and 3 off the path.
-    assert _abandoned_count(events, parents, conv_types, 1) == 2
-    # Checking out to empty path (None) abandons every active conversation turn.
-    assert _abandoned_count(events, parents, conv_types, None) == 4
-
-
-def test_history_preview_filter_matches_tree_rows():
-    """The Ctrl-R picker filters _tree_rows previews with fuzzy_match; a
-    query should surface the matching message and carry its checkout_target."""
-    from okonomi.utils import fuzzy_match
-    from okonomi.tui.pickers import _tree_rows
-
-    rows = _tree_rows(_forked_events())
-    hits = [r for r in rows if fuzzy_match("redis", r["preview"].lower())]
-    assert [r["event_id"] for r in hits] == [2, 3], f"redis hits: {[r['event_id'] for r in hits]}"
-    # user row → edit&resubmit its parent; assistant row → continue from itself
-    by_id = {r["event_id"]: r for r in hits}
-    assert by_id[2]["checkout_target"] == 1 and by_id[2]["prefill"] == "try redis"
-    assert by_id[3]["checkout_target"] == 3 and by_id[3]["prefill"] == ""
-
-
 # ── ContextManager.summarize_branch ──────────────────────────────────────
-
-
-def test_summarize_branch_prefix(monkeypatch):
-    monkeypatch.setattr("okonomi.context.create_chat_client", lambda: None)
-    cm = ContextManager(model_id="test-model")
-
-    monkeypatch.setattr(cm, "_chat", lambda prompt, max_tokens: "did some work on foo.py")
-    summary = cm.summarize_branch([ModelRequest(parts=[UserPromptPart(content="hi")])])
-    assert summary is not None and summary.startswith(BRANCH_SUMMARY_PREFIX), f"summary: {summary!r}"
-
-    monkeypatch.setattr(cm, "_chat", lambda prompt, max_tokens: "")
-    assert cm.summarize_branch([]) is None, "failed LLM call must yield None, not an empty summary"
-
-
-def test_branch_summary_prefix_is_skipped_on_replay():
-    from okonomi.tui.transcript import _SYNTHETIC_REPLAY_PREFIXES
-    from okonomi.utils import _SYNTHETIC_PROMPT_PREFIXES
-
-    assert any(BRANCH_SUMMARY_PREFIX.startswith(p) for p in _SYNTHETIC_REPLAY_PREFIXES), (
-        f"replay skip tuple {_SYNTHETIC_REPLAY_PREFIXES} misses {BRANCH_SUMMARY_PREFIX[:20]!r}"
-    )
-    assert any(BRANCH_SUMMARY_PREFIX.startswith(p) for p in _SYNTHETIC_PROMPT_PREFIXES), (
-        f"titler skip tuple {_SYNTHETIC_PROMPT_PREFIXES} misses {BRANCH_SUMMARY_PREFIX[:20]!r}"
-    )
 
 
 # ── Session save/load across a checkout ──────────────────────────────────

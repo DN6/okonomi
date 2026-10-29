@@ -13,10 +13,14 @@ wrappers (``wrappers``) are plain modules.
 import asyncio
 import contextlib
 import inspect
+import itertools
 import json
 import mimetypes
 import re
+import threading
+import time
 from concurrent.futures import Future, ThreadPoolExecutor
+from concurrent.futures import TimeoutError as FutureTimeout
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
@@ -24,10 +28,25 @@ from typing import Any
 from urllib.parse import unquote, urlparse
 
 import httpx
-from pydantic_ai import Agent
-from pydantic_ai.messages import BinaryContent, ImageUrl, ModelResponse, ToolCallPart
+from pydantic_ai import Agent, RunContext
+from pydantic_ai.messages import (
+    BinaryContent,
+    EnqueuedMessagesEvent,
+    FunctionToolCallEvent,
+    FunctionToolResultEvent,
+    ImageUrl,
+    ModelResponse,
+    PartDeltaEvent,
+    PartStartEvent,
+    RetryPromptPart,
+    TextPart,
+    TextPartDelta,
+    ToolCallPart,
+    ToolReturnPart,
+)
 from pydantic_ai.models import Model
 
+from ..config import resolve_model_id, select_provider
 from ..context import _CHARS_PER_TOKEN, ContextManager, count_tokens, strip_unanswered_tool_calls
 from ..events import (
     AssistantStream,
@@ -40,6 +59,7 @@ from ..events import (
     TurnEnd,
     TurnStart,
 )
+from ..mcp import build_toolsets as build_mcp_toolsets
 from ..session import Artifact, Session, SessionStatus, asset_subdir_for_file
 from ..tools import (
     AgentTools,
@@ -47,12 +67,41 @@ from ..tools import (
     SessionsTools,
     SkillTools,
     TerminalTools,
+    ViewerTools,
     WebTools,
 )
+from ..traces import TracingModel
+from ..utils import redact_secrets
 from .jobs import JobRegistry
 from .prompt import build_system_prompt
 from .provider import build_model
-from ..config import resolve_model_id, select_provider
+
+
+# A tool call still running after this many seconds moves to the background
+# as a ``tool-N`` job so the main thread stays free: the model gets a
+# ``{"pending": "tool-N"}`` placeholder and ends its reply, and the result
+# arrives later as a follow-up message (``JobFinished`` → ``tool_notice``),
+# the same path as every other background job. Short calls stay inline so
+# the model can chain them.
+TOOL_DETACH_AFTER = 30.0
+_detach_counter = itertools.count(1)
+
+
+def _tool_result_display(part: ToolReturnPart | RetryPromptPart) -> dict[str, str | None]:
+    """``ToolCallDisplay.finish`` kwargs for a tool result. Tools often
+    return ``{"error": ...}`` instead of raising, so that shows as an error
+    too; a detached call shows its job id instead of the placeholder dict."""
+    if isinstance(part, RetryPromptPart):
+        return {"error": part.content if isinstance(part.content, str) else str(part.content)}
+    content = part.content
+    if isinstance(content, dict) and content.get("error"):
+        return {"error": str(content["error"])}
+    if isinstance(content, dict) and content.get("pending"):
+        return {"output": f"still running — moved to background as {content['pending']}; its result arrives as a follow-up message"}
+    try:
+        return {"output": _short_repr(content)}
+    except Exception:  # noqa: BLE001
+        return {"output": repr(content)}
 
 
 def _short_repr(obj: Any, limit: int = 2000) -> str:
@@ -330,6 +379,21 @@ class OkonomiAgent:
         # Set on cancel/timeout so the NEXT turn knows to prepend a
         # "you were interrupted, focus on the new instruction" marker.
         self._was_interrupted: bool = False
+        # Set when the running turn is cancelled or times out, so tool calls
+        # still attached to it stop instead of detaching into jobs whose
+        # completion would start an unasked-for turn. Replaced every turn.
+        self._turn_cancelled = threading.Event()
+        # Set when the user sends a message mid-tool: running calls move to
+        # the background now so the model reads the message without waiting
+        # on them. Replaced every turn.
+        self._detach_now = threading.Event()
+        # Reply text the model had streamed when its turn was cut off; the
+        # next user message tells the model where it was interrupted.
+        self._interrupted_partial: str = ""
+        # Why the last turn ended without a real reply (timeout or a raised
+        # error), else None. ``run_async`` reports both as an ordinary return
+        # value, so a caller that must tell failure from success reads this.
+        self.last_turn_error: str | None = None
 
         self.context_manager = ContextManager(
             model_id=model_id,
@@ -355,9 +419,20 @@ class OkonomiAgent:
         # same event pipe instead of a raw print (built before the emitter).
         self.context_manager.emitter = self.emitter
         self._current_stream: Any = None
-        # Tracks the ToolCall event for the in-flight tool call so we can
-        # attach its output/error back to the UI when the tool returns.
-        self._pending_tool_calls: list[Any] = []
+        # Open ToolCall widgets by tool_call_id, closed when pydantic-ai
+        # reports the call's result (or the turn ends without one).
+        self._open_tool_calls: dict[str, ToolCallDisplay] = {}
+        # The turn in flight, so messages sent mid-turn can be enqueued into
+        # it; and those messages by enqueue id until the turn picks them up.
+        self._agent_run: Any = None
+        self._enqueued: dict[str, str] = {}
+        # Tools run on this pool so a call that outlives TOOL_DETACH_AFTER can
+        # keep running as a background job after the turn moves on.
+        self._tool_pool = ThreadPoolExecutor(thread_name_prefix="okonomi-tool")
+        # MCP connections held open across turns (see _ensure_mcp_connected),
+        # with the event loop and toolsets they were opened for.
+        self._mcp_stack: contextlib.AsyncExitStack | None = None
+        self._mcp_stack_key: tuple[Any, Any] | None = None
         # Background-job completions surface as JobFinished events on the
         # emitter (see _job_finished) — subscribers react (e.g. the TUI
         # injects a follow-up turn); nothing polls or registers callbacks.
@@ -418,13 +493,13 @@ class OkonomiAgent:
         docstrings, edited system-prompt rules. Does NOT hot-reload tool
         method bodies — for that, restart.
 
-        Returns a dict with counts: ``{"skills": N, "tools": M}``.
+        Returns a dict with counts: ``{"skills": N, "tools": M, "mcp": K}``.
         """
         self.skills._invalidate_cache()
         self.agent = self._create_agent()
         skill_count = len(self.skills.list_skills().get("skills", []))
         tool_count = len(self.agent._function_toolset.tools)
-        return {"skills": skill_count, "tools": tool_count}
+        return {"skills": skill_count, "tools": tool_count, "mcp": len(self._mcp_toolsets)}
 
     def _setup_tools(self) -> None:
         """Create all tool instances.
@@ -448,6 +523,7 @@ class OkonomiAgent:
         self.sessions = SessionsTools()
         self.agents = AgentTools()
         self.files = FileTools()
+        self.viewer = ViewerTools(lambda: self.session)
         self.skills = SkillTools(
             available_tools={"terminal", "web", "sessions", "skills", "files"},
         )
@@ -455,10 +531,12 @@ class OkonomiAgent:
     def _create_agent(self) -> Agent[AgentDependencies, str]:
         """Create and configure the Pydantic AI agent."""
         model = self._create_model()
+        self._mcp_toolsets = build_mcp_toolsets(process_tool_call=self._process_mcp_tool_call)
         agent = Agent(
             model,
             deps_type=AgentDependencies,
             system_prompt=self._get_system_prompt(),
+            toolsets=self._mcp_toolsets,
         )
 
         # Standalone tools
@@ -467,6 +545,7 @@ class OkonomiAgent:
         self._register_tool(agent, self.web)
         self._register_tool(agent, self.sessions)
         self._register_tool(agent, self.files)
+        self._register_tool(agent, self.viewer)
         self.agents._bind(self)
         self._register_tool(agent, self.agents, rename={"launch": "launch_agent", "list_agents": "list_agents"})
 
@@ -483,7 +562,7 @@ class OkonomiAgent:
     _REQUEST_TIMEOUT_S = 60.0
 
     def _create_model(self) -> Model:
-        return build_model(self.provider, self.model_id, self._REQUEST_TIMEOUT_S)
+        return TracingModel(build_model(self.provider, self.model_id, self._REQUEST_TIMEOUT_S), lambda: self.session)
 
     def _register_tool(
         self,
@@ -508,63 +587,140 @@ class OkonomiAgent:
 
             tool_name = rename.get(name, name)
             sig = inspect.signature(method)
+            # ``_``-prefixed params are wrapper-to-tool plumbing (bash's
+            # ``_chunks_sink`` / ``_kill``), not arguments the model may set.
+            sig = sig.replace(parameters=[p for p in sig.parameters.values() if not p.name.startswith("_")])
 
             def make_wrapper(m, s, tn, agent_self=self):
-                def wrapper(*args, **kwargs):
-                    agent_self.status = f"Running {tn}..."
-                    pending = agent_self._pending_tool_calls.pop(0) if agent_self._pending_tool_calls else None
-                    try:
-                        result = m(*args, **kwargs)
-                        # Surface the return value back onto the UI event.
-                        if pending is not None:
-                            error_msg = None
-                            output = ""
-                            if isinstance(result, dict) and result.get("error"):
-                                # Tools often return {"error": "..."} on failure
-                                # instead of raising — treat as an error visibly.
-                                error_msg = str(result["error"])
-                            else:
-                                try:
-                                    output = _short_repr(result)
-                                except Exception:  # noqa: BLE001
-                                    output = repr(result)
-                            try:
-                                agent_self.emitter.emit(pending.finish(output=output, error=error_msg))
-                            except Exception:  # noqa: BLE001
-                                pass
-                        if tn == "bash":
-                            # bash writes media straight into the session
-                            # dir; sweep so outputs register as artifacts.
-                            try:
-                                agent_self._sync_session_assets(agent_self._get_dependencies())
-                            except Exception:  # noqa: BLE001
-                                pass
-                        return result
-                    except Exception as exc:
-                        # Tool raised — surface traceback to the UI so the
-                        # user sees what went wrong before the model
-                        # confabulates a recovery.
-                        if pending is not None:
-                            try:
-                                agent_self.emitter.emit(pending.finish(error=f"{type(exc).__name__}: {exc}"))
-                            except Exception:  # noqa: BLE001
-                                pass
-                        raise
-                    finally:
-                        agent_self.status = ""
+                def wrapper(ctx: RunContext[AgentDependencies], *args, **kwargs):
+                    chunks: list[str] = []
+                    cancelled = agent_self._turn_cancelled
+                    detach_now = agent_self._detach_now
+                    kill = threading.Event()
+                    if tn == "bash":
+                        # Live output for /logs tool-N. ``kill`` replaces the
+                        # shared Ctrl+C flag: it is only set while the call is
+                        # still attached, so a detached call survives later stops.
+                        kwargs["_chunks_sink"] = chunks
+                        kwargs["_kill"] = kill
+                    fut = agent_self._tool_pool.submit(m, *args, **kwargs)
+                    deadline = time.monotonic() + TOOL_DETACH_AFTER
+                    while True:
+                        try:
+                            result = fut.result(timeout=0.1)
+                            break
+                        except FutureTimeout:
+                            if cancelled.is_set():
+                                kill.set()
+                                return {"error": "interrupted by the user"}
+                            if detach_now.is_set() or time.monotonic() > deadline:
+                                return agent_self._detach_tool_call(fut, tn, chunks)
+                    if tn == "bash":
+                        # bash writes media straight into the session
+                        # dir; sweep so outputs register as artifacts.
+                        try:
+                            agent_self._sync_session_assets(agent_self._get_dependencies())
+                        except Exception:  # noqa: BLE001
+                            pass
+                    return result
 
+                ctx_param = inspect.Parameter(
+                    "ctx", inspect.Parameter.POSITIONAL_OR_KEYWORD, annotation=RunContext[AgentDependencies]
+                )
                 wrapper.__name__ = tn
                 wrapper.__qualname__ = tn
                 wrapper.__doc__ = m.__doc__
-                wrapper.__signature__ = s
+                wrapper.__signature__ = s.replace(parameters=[ctx_param, *s.parameters.values()])
                 wrapper.__annotations__ = {
                     k: v.annotation for k, v in s.parameters.items() if v.annotation is not inspect.Parameter.empty
                 }
+                wrapper.__annotations__["ctx"] = RunContext[AgentDependencies]
                 if s.return_annotation is not inspect.Signature.empty:
                     wrapper.__annotations__["return"] = s.return_annotation
                 return wrapper
 
-            agent.tool_plain(make_wrapper(method, sig, tool_name), name=tool_name)
+            agent.tool(make_wrapper(method, sig, tool_name), name=tool_name)
+
+    async def _process_mcp_tool_call(self, ctx: RunContext[AgentDependencies], call_tool, name: str, args: dict):
+        """Apply TOOL_DETACH_AFTER to MCP calls, which bypass
+        ``_register_tool``'s wrapper. The call keeps running on this event
+        loop after the turn ends; that works because the connection is held
+        open across turns by ``_ensure_mcp_connected``."""
+        task = asyncio.ensure_future(call_tool(name, args))
+        try:
+            done, _ = await asyncio.wait({task}, timeout=TOOL_DETACH_AFTER)
+        except asyncio.CancelledError:
+            task.cancel()
+            raise
+        if done:
+            return task.result()
+        return self._detach_tool_call(task, ctx.tool_name or name, [])
+
+    async def _ensure_mcp_connected(self) -> None:
+        """Hold MCP connections open across turns, so a call moved to the
+        background outlives the turn that made it (each pydantic-ai run only
+        enters toolsets for its own duration; this extra enter keeps the
+        ref-counted connection alive). A connection belongs to the event
+        loop that opened it: a run on another loop (one-shot ``asyncio.run``,
+        a sub-agent thread) or after ``reload()`` rebuilt the toolsets opens
+        a fresh one."""
+        key = (asyncio.get_running_loop(), tuple(self._mcp_toolsets))
+        if self._mcp_stack_key == key:
+            return
+        await self.close_mcp()
+        if not self._mcp_toolsets:
+            return
+        async with contextlib.AsyncExitStack() as stack:
+            for toolset in self._mcp_toolsets:
+                await stack.enter_async_context(toolset)
+            self._mcp_stack = stack.pop_all()
+        self._mcp_stack_key = key
+
+    async def close_mcp(self) -> None:
+        """Close held MCP connections. Must run on the loop that opened
+        them; a stack from an already-closed loop is just dropped."""
+        stack, key = self._mcp_stack, self._mcp_stack_key
+        self._mcp_stack = self._mcp_stack_key = None
+        if stack is not None and key is not None and key[0] is asyncio.get_running_loop():
+            await stack.aclose()
+
+    def _detach_tool_call(self, fut: Future | asyncio.Future, tool_name: str, chunks: list[str]) -> dict:
+        """Register a slow tool call as a ``tool-N`` job and return the
+        placeholder the model sees instead of its result. The result is
+        reported through ``_job_finished`` when the call completes."""
+        job_id = f"tool-{next(_detach_counter)}"
+        box: dict[str, Any] = {}
+
+        def _reader() -> str:
+            if tool_name == "bash":
+                joined = "".join(chunks)
+                if "__CWD=" in joined:
+                    joined = joined.rsplit("__CWD=", 1)[0]
+                return redact_secrets(joined) or "(no output yet)"
+            return _short_repr(box["result"]) if "result" in box else "(running — this tool has no live output)"
+
+        self.jobs.register(task_id=job_id, label=tool_name, reader=_reader, kind="tool")
+
+        def _done(f: Future | asyncio.Future) -> None:
+            try:
+                result = f.result()
+                error = str(result["error"]) if isinstance(result, dict) and result.get("error") else None
+            except (Exception, asyncio.CancelledError) as exc:  # noqa: BLE001
+                result = None
+                error = f"{type(exc).__name__}: {exc}"
+            box["result"] = result if error is None else {"error": error}
+            self.jobs.mark_done(task_id=job_id, status="error" if error else "ok")
+            self._job_finished(bg_id=job_id, error=error, output=None if error else _short_repr(result))
+
+        fut.add_done_callback(_done)
+        return {
+            "pending": job_id,
+            "message": (
+                f"{tool_name} is still running after {TOOL_DETACH_AFTER:.0f}s and has moved to the background as "
+                f"{job_id}. Do not poll, wait, or re-run it. Tell the user it is running and end your reply; "
+                "its result arrives as a [system] message when it finishes."
+            ),
+        }
 
     def _get_dependencies(self) -> AgentDependencies:
         return AgentDependencies(
@@ -711,39 +867,95 @@ class OkonomiAgent:
             cost_usd=cost,
         )
 
-    def _finish_pending_tool_call(self, *, output: str = "", error: str | None = None) -> None:
-        """Mark the next pending tool-call widget as complete. Used by paths
-        that resolve a tool call without invoking it (approval skip /
-        feedback) or before the wrapper has a chance to."""
-        if not self._pending_tool_calls:
-            return
-        pending = self._pending_tool_calls.pop(0)
-        try:
-            self.emitter.emit(pending.finish(output=output, error=error))
-        except Exception:
-            pass
+    def _on_event(self, ev: Any) -> None:
+        """Translate one pydantic-ai stream event into UI events. Covers
+        every toolset (function tools, MCP) because pydantic-ai emits the
+        same call/result events for all of them, keyed by tool_call_id."""
+        match ev:
+            case PartStartEvent(part=TextPart(content=text)) | PartDeltaEvent(delta=TextPartDelta(content_delta=text)):
+                self._stream_text(text)
+            case FunctionToolCallEvent(part=call):
+                self._open_tool_call(call)
+            case EnqueuedMessagesEvent(enqueue_id=enqueue_id):
+                if self._enqueued.pop(enqueue_id, None) is not None:
+                    self.emitter.emit(SystemNote("↳ Message picked up by the running turn."))
+            case FunctionToolResultEvent(part=result):
+                widget = self._open_tool_calls.pop(result.tool_call_id, None)
+                if widget is not None:
+                    self.emitter.emit(widget.finish(**_tool_result_display(result)))
+                if not self._open_tool_calls:
+                    self.status = ""
 
-    def _display_tool_call(self, part: ToolCallPart) -> None:
-        """Emit a ToolCall event for ``part``. The subscriber (TUI widget
-        or stdout printer) handles rendering."""
-        call_id = getattr(part, "tool_call_id", "") or ""
+    def enqueue(self, text: str) -> bool:
+        """Deliver ``text`` into the running turn at its next model request,
+        so the user can redirect or add to a turn without cancelling it. If
+        the model was about to finish, it answers the message instead.
+        Must be called on the event loop driving ``run_async``. Returns
+        False when no turn is running."""
+        if self._agent_run is None:
+            return False
+        prompt = _parse_user_message(text, emitter=self.emitter)
+        enqueue_id = self._agent_run.enqueue(*prompt) if isinstance(prompt, list) else self._agent_run.enqueue(prompt)
+        if enqueue_id is not None:
+            self._enqueued[enqueue_id] = text
+        return True
+
+    def detach_running_tools(self) -> None:
+        """Move the running turn's in-flight tool calls to the background
+        now (as ``tool-N`` jobs), so a message just enqueued reaches the
+        model without waiting on them."""
+        self._detach_now.set()
+
+    def take_undelivered(self) -> list[str]:
+        """Messages enqueued into a turn that ended (or was cancelled)
+        before reaching its next model request; the caller resubmits them
+        as new turns."""
+        texts = list(self._enqueued.values())
+        self._enqueued.clear()
+        return texts
+
+    @property
+    def streaming_text(self) -> bool:
+        """True while the model is mid-reply with no tool running — the
+        moment a new user message should cut in rather than wait."""
+        return self._current_stream is not None and not self._open_tool_calls
+
+    def _stream_text(self, text: str) -> None:
+        if not text:
+            return
+        self.status = ""
+        if self._current_stream is None:
+            self._current_stream = AssistantStream()
+        self._current_stream.text += text
+        self.emitter.emit(self._current_stream)
+
+    def _end_text_stream(self) -> None:
+        if self._current_stream is not None:
+            self._current_stream.done = True
+            self.emitter.emit(self._current_stream)
+            self._current_stream = None
+
+    def _open_tool_call(self, part: ToolCallPart) -> None:
+        call_id = part.tool_call_id
         if part.tool_name == "load_skill":
-            args = part.args
-            if isinstance(args, str):
-                try:
-                    args = json.loads(args)
-                except json.JSONDecodeError:
-                    pass
+            try:
+                args: Any = part.args_as_dict()
+            except ValueError:
+                args = part.args
             name = args.get("name", args) if isinstance(args, dict) else args
-            ev = self.emitter.emit(
-                ToolCallDisplay("load_skill", args=str(name), details=str(args), tool_call_id=call_id)
-            )
+            ev = ToolCallDisplay("load_skill", args=str(name), details=str(args), tool_call_id=call_id)
         else:
             args_str = str(part.args) if part.args else ""
-            ev = self.emitter.emit(
-                ToolCallDisplay(part.tool_name, args=args_str, details=args_str, tool_call_id=call_id)
-            )
-        self._pending_tool_calls.append(ev)
+            ev = ToolCallDisplay(part.tool_name, args=args_str, details=args_str, tool_call_id=call_id)
+        self._open_tool_calls[call_id] = self.emitter.emit(ev)
+        self.status = f"Running {part.tool_name}..."
+
+    def _close_open_tool_calls(self, error: str) -> None:
+        """A run that raises or is cancelled mid-tool produces no result
+        event; close its widgets so none are left spinning."""
+        for widget in self._open_tool_calls.values():
+            self.emitter.emit(widget.finish(error=error))
+        self._open_tool_calls.clear()
 
     async def run_async(self, user_message: str, reset: bool = False) -> str:
         """Run the agent asynchronously with a user message.
@@ -757,12 +969,15 @@ class OkonomiAgent:
 
         self._turn_count += 1
         turn = self._turn_count
+        self.last_turn_error = None
         self.emitter.emit(TurnStart(turn=turn))
 
         # Snapshot the interrupt flag before clearing it; the checks below
         # need the prior turn's value.
         prior_interrupted = self._was_interrupted
         self._was_interrupted = False
+        self._turn_cancelled = threading.Event()
+        self._detach_now = threading.Event()
         self.session.task_input = user_message
         deps = self._get_dependencies()
 
@@ -780,9 +995,12 @@ class OkonomiAgent:
                 )
                 self.state.context = compressed
 
-        if prior_interrupted and self.state.context:
+        partial, self._interrupted_partial = self._interrupted_partial, ""
+        # Job notices ("[system] ...") are not the user speaking.
+        if prior_interrupted and self.state.context and not user_message.startswith("[system]"):
+            said = f" You had started replying: \"{partial.strip()}\"" if partial.strip() else ""
             user_message = (
-                "[The user interrupted the previous response to give new instructions. "
+                f"[The user interrupted the previous response to give new instructions.{said} "
                 "Stop what you were doing and focus on this message.]\n\n" + user_message
             )
 
@@ -790,24 +1008,31 @@ class OkonomiAgent:
         timeout = asyncio.timeout(self.timeout) if self.timeout > 0 else contextlib.nullcontext()
 
         try:
+            await self._ensure_mcp_connected()
             async with self.agent.iter(
                 prompt,
                 deps=deps,
                 message_history=self.state.context or None,
             ) as agent_run:
+                self._agent_run = agent_run
                 try:
                     async with timeout:
                         async for node in agent_run:
-                            if not Agent.is_model_request_node(node):
+                            if Agent.is_model_request_node(node):
+                                self.status = "Thinking..."
+                            elif not Agent.is_call_tools_node(node):
                                 continue
-                            self.status = "Thinking..."
-                            await self._stream_model_response(node, agent_run.ctx)
+                            async with node.stream(agent_run.ctx) as events:
+                                async for ev in events:
+                                    self._on_event(ev)
+                            self._end_text_stream()
 
                 except (asyncio.CancelledError, TimeoutError) as exc:
                     self._handle_interruption(agent_run, deps, isinstance(exc, TimeoutError))
                     if isinstance(exc, asyncio.CancelledError):
                         raise
 
+                    self.last_turn_error = f"turn timed out after {self.timeout:.0f}s"
                     return ""
 
                 result = agent_run.result
@@ -817,12 +1042,17 @@ class OkonomiAgent:
             return result.output
 
         except Exception as e:
+            self._close_open_tool_calls(f"{type(e).__name__}: {e}")
             self.emitter.emit(SystemNote(f"Error: {e}", level="error"))
+            self.last_turn_error = f"{type(e).__name__}: {e}"
             return f"Error: {str(e)}"
         finally:
             # The turn is over on every exit path (normal, cancel, timeout,
             # error). Clear the spinner so the status bar can't get stuck on
             # a stale "Thinking..." while the agent is actually idle.
+            self._agent_run = None
+            self._end_text_stream()
+            self._close_open_tool_calls("interrupted")
             self.status = ""
             self.emitter.emit(TurnEnd(turn=turn))
 
@@ -830,6 +1060,8 @@ class OkonomiAgent:
         """Commit partial state and surface a timeout note. Caller decides
         whether to re-raise CancelledError or return an empty string."""
         self._was_interrupted = True
+        self._turn_cancelled.set()
+        self._interrupted_partial = self._current_stream.text if self._current_stream is not None else ""
         self._pending_stream_events.append(Interrupt("timeout" if timed_out else "cancelled"))
         self._commit_turn(agent_run, deps, strip_unanswered_tool_calls(agent_run.all_messages()))
         if timed_out:
@@ -840,37 +1072,14 @@ class OkonomiAgent:
                 )
             )
 
-    async def _stream_model_response(self, node, ctx) -> None:
-        """Stream one model-request node's text output into the emitter
-        as a single growing AssistantStream event, then display any
-        accompanying tool calls."""
-        async with node.stream(ctx) as stream:
-            async for text in stream.stream_text(delta=True, debounce_by=None):
-                if self.status:
-                    self.status = ""
-                if self._current_stream is None:
-                    self._current_stream = AssistantStream()
-                self._current_stream.text += text
-                self.emitter.emit(self._current_stream)
-
-            self.status = ""
-            if self._current_stream is not None:
-                self._current_stream.done = True
-                self.emitter.emit(self._current_stream)
-                self._current_stream = None
-
-            response = stream.response
-            if response and response.parts:
-                for part in response.parts:
-                    if isinstance(part, ToolCallPart):
-                        self._display_tool_call(part)
-
     def _commit_turn(self, agent_run, deps: AgentDependencies, post_messages: list) -> None:
         """Fold the run's results into ``self.state``. Shared by the
         normal-completion and cancellation paths."""
         self._accumulate_usage(agent_run)
         try:
-            self.state.message_history.extend(list(agent_run.new_messages()))
+            # A cancelled turn ends on a tool call with no return; persisting
+            # it would replay as a tool that never finishes.
+            self.state.message_history.extend(strip_unanswered_tool_calls(list(agent_run.new_messages())))
         except Exception:
             pass
         self.state.context = post_messages

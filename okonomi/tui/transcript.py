@@ -150,6 +150,7 @@ class ReplTranscript:
             if self.replaying:  # live turns are separated by the prompt, not a rule
                 self.console.print(Text("─" * 40, style=_DIM))
         elif isinstance(ev, Banner):
+            self.console.clear()
             self.console.print(render_welcome_banner(), justify="center")
 
     def _render_stream(self, ev: AssistantStream) -> None:
@@ -438,3 +439,10 @@ def replay_history(history: list, emitter: EventEmitter) -> None:
             if stream is not None:
                 stream.done = True
                 emitter.emit(stream)
+    # Sessions saved before cancelled turns were stripped can end on a call
+    # with no return; close it here or it shows as running forever.
+    for tc in pending_tool_calls.values():
+        try:
+            emitter.emit(tc.finish(error="interrupted — no result"))
+        except Exception:
+            pass

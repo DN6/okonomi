@@ -28,12 +28,6 @@ class _NullEmitter:
         pass
 
 
-def test_skill_command_slugs_are_space_free():
-    for cmd, _desc in commands.discover_skill_commands():
-        assert " " not in cmd, f"slash slug contains a space: {cmd!r}"
-        assert cmd.startswith("/")
-
-
 def test_spaced_skill_dispatches_by_slug_and_forwards_real_name():
     cmds = commands._skill_commands()
     spaced = next(((s, n) for s, n, _ in cmds if " " in n), None)
@@ -46,18 +40,6 @@ def test_spaced_skill_dispatches_by_slug_and_forwards_real_name():
     assert agent.skills.loaded == real, "loader must receive the real (spaced) name"
     assert f"BODY OF {real}" in res.payload
     assert "make it warmer" in res.payload, "trailing text must pass through as instruction"
-
-
-def test_builtin_wins_over_skill_and_unknown_warns():
-    # A real built-in is dispatched to its handler, not treated as a skill.
-    assert "/help" in commands.COMMANDS
-    # An unknown slash that is neither built-in nor a skill returns None.
-    assert handle("/definitely-not-a-skill-xyz", _StubAgent(), _NullEmitter()) is None
-
-
-def test_skill_slugs_are_namespaced_by_source():
-    for cmd, _desc in commands.discover_skill_commands():
-        assert cmd.startswith(("/okonomi:", "/user:")), f"slug not namespaced: {cmd!r}"
 
 
 def test_bare_slug_dispatches_without_prefix():

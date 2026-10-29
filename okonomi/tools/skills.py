@@ -20,6 +20,7 @@ import sys
 import tempfile
 from pathlib import Path
 
+import httpx
 import yaml
 
 from okonomi.config import OKONOMI_SKILLS_DIR
@@ -343,6 +344,121 @@ def _validate_file_path(file_path: str) -> str | None:
     if len(normalized.parts) < 2:
         return f"Provide a file path, not just a directory. Example: '{normalized.parts[0]}/myfile.md'"
     return None
+
+
+_GITHUB_TREE_RE = re.compile(r"^https?://github\.com/([^/]+)/([^/]+)/tree/([^/]+)/?(.*?)/?$")
+
+
+def _parse_github_spec(spec: str) -> tuple[str, str, str | None, str] | None:
+    """``(owner, repo, ref, path)`` from a github.com tree URL or the
+    ``owner/repo/path/to/skill`` shorthand (``ref=None`` → default branch)."""
+    spec = spec.strip()
+    m = _GITHUB_TREE_RE.match(spec)
+    if m:
+        return m.group(1), m.group(2), m.group(3), m.group(4)
+    if "://" in spec:
+        return None
+    parts = [p for p in spec.split("/") if p]
+    if len(parts) < 2:
+        return None
+    return parts[0], parts[1], None, "/".join(parts[2:])
+
+
+def _github_headers() -> dict[str, str]:
+    headers = {"Accept": "application/vnd.github+json", "User-Agent": "okonomi"}
+    token = os.getenv("GITHUB_TOKEN")
+    if token:
+        headers["Authorization"] = f"Bearer {token}"
+    return headers
+
+
+def _github_listing(client: httpx.Client, owner: str, repo: str, path: str, ref: str | None) -> list[dict]:
+    url = f"https://api.github.com/repos/{owner}/{repo}/contents/{path}"
+    response = client.get(url, params={"ref": ref} if ref else None)
+    if response.status_code == 404:
+        raise FileNotFoundError(f"GitHub path not found: {owner}/{repo}/{path or ''}" + (f" @ {ref}" if ref else ""))
+    response.raise_for_status()
+    data = response.json()
+    if not isinstance(data, list):
+        raise NotADirectoryError(f"'{path}' is a file, not a skill directory.")
+    return data
+
+
+def _github_skill_files(client: httpx.Client, owner: str, repo: str, path: str, ref: str | None) -> list[dict]:
+    """Listing entries for a skill directory: every top-level file plus the
+    full contents of the allowed subdirs. Other subdirs are skipped."""
+    files: list[dict] = []
+    for entry in _github_listing(client, owner, repo, path, ref):
+        if entry["type"] == "file":
+            files.append(entry)
+        elif entry["type"] == "dir" and entry["name"] in ALLOWED_SUBDIRS:
+            pending = [entry["path"]]
+            while pending:
+                for sub in _github_listing(client, owner, repo, pending.pop(), ref):
+                    if sub["type"] == "file":
+                        files.append(sub)
+                    elif sub["type"] == "dir":
+                        pending.append(sub["path"])
+    return files
+
+
+def install_skill_from_github(spec: str) -> dict:
+    """Download a skill directory from GitHub into ``USER_SKILLS_DIR``.
+
+    ``spec`` is a github.com tree URL or ``owner/repo/path/to/skill``. The
+    destination folder takes the source folder's name; an existing user skill
+    of that name is never overwritten. Returns ``{"success", "name", "path"}``
+    or ``{"success": False, "error"}``.
+    """
+    parsed = _parse_github_spec(spec)
+    if parsed is None:
+        return {
+            "success": False,
+            "error": (
+                f"Could not parse '{spec}'. Use owner/repo/path/to/skill or "
+                "https://github.com/owner/repo/tree/<ref>/path/to/skill."
+            ),
+        }
+    owner, repo, ref, path = parsed
+    folder = path.rsplit("/", 1)[-1] if path else repo
+    dest = USER_SKILLS_DIR / folder
+    if dest.exists():
+        return {"success": False, "error": f"'{dest}' already exists. Remove it first to reinstall."}
+
+    try:
+        with httpx.Client(headers=_github_headers(), follow_redirects=True, timeout=30.0) as client:
+            files = _github_skill_files(client, owner, repo, path, ref)
+            skill_md = next((f for f in files if f["name"] == "SKILL.md"), None)
+            if skill_md is None:
+                return {"success": False, "error": f"No SKILL.md at {owner}/{repo}/{path or ''}."}
+            content = client.get(skill_md["download_url"]).raise_for_status().text
+            err = _validate_frontmatter_content(content)
+            if err:
+                return {"success": False, "error": f"Invalid SKILL.md: {err}"}
+            struct_err, _ = _check_skill_structure(content)
+            if struct_err:
+                return {"success": False, "error": f"Invalid SKILL.md: {struct_err}"}
+
+            USER_SKILLS_DIR.mkdir(parents=True, exist_ok=True)
+            staging = Path(tempfile.mkdtemp(dir=str(USER_SKILLS_DIR), prefix=f".tmp.{folder}."))
+            try:
+                for entry in files:
+                    rel = entry["path"][len(path) :].lstrip("/") if path else entry["path"]
+                    target = staging / rel
+                    target.parent.mkdir(parents=True, exist_ok=True)
+                    if entry is skill_md:
+                        target.write_text(content, encoding="utf-8")
+                    else:
+                        target.write_bytes(client.get(entry["download_url"]).raise_for_status().content)
+                os.rename(staging, dest)
+            except Exception:
+                shutil.rmtree(staging, ignore_errors=True)
+                raise
+    except (httpx.HTTPError, OSError) as e:
+        return {"success": False, "error": f"Install failed: {e}"}
+
+    metadata, _ = _parse_frontmatter(content)
+    return {"success": True, "name": metadata.get("name") or folder, "path": str(dest)}
 
 
 class SkillTools(ToolMetadataMixin):

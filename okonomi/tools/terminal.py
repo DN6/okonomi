@@ -16,6 +16,7 @@ import time
 from pathlib import Path
 from typing import Any
 
+from okonomi.config import OKONOMI_HOME
 from okonomi.tools._command_guard import check_command
 from okonomi.tools._metadata import ToolMetadataMixin
 from okonomi.tools._sandbox import wrap_command
@@ -25,6 +26,23 @@ from okonomi.utils import redact_secrets, scrub_env
 MAX_OUTPUT_CHARS = 50_000
 HEAD_RATIO = 0.4
 _bg_counter = itertools.count(1)
+
+# Every bash subprocess alive in this process, across all TerminalTools
+# instances (the foreground agent, detached tool calls, term-N jobs, and
+# sub-agents' own terminals). Each runs in its own process group via setsid,
+# so without this the REPL exiting would orphan them.
+_live_procs: set[subprocess.Popen] = set()
+_live_procs_lock = threading.Lock()
+
+
+def kill_all_processes() -> int:
+    """Shutdown hook: SIGTERM (then SIGKILL) every live bash subprocess.
+    Returns how many were killed."""
+    with _live_procs_lock:
+        procs = list(_live_procs)
+    for proc in procs:
+        TerminalTools._kill_process(proc)
+    return len(procs)
 
 
 def _find_bash() -> str:
@@ -87,8 +105,13 @@ class TerminalTools(ToolMetadataMixin):
         # exported to children as $OKONOMI_SESSION_DIR. Set by the agent.
         self._session_dir_fn: Any | None = None
 
+    def interrupt(self) -> None:
+        """Kill the foreground command, if one is running (Ctrl+C)."""
+        self._interrupt.set()
+
     def _make_env(self) -> dict:
         env = scrub_env(os.environ)
+        env["OKONOMI_HOME"] = str(OKONOMI_HOME)
         if self._session_dir_fn is not None:
             try:
                 env["OKONOMI_SESSION_DIR"] = self._session_dir_fn()
@@ -105,6 +128,7 @@ class TerminalTools(ToolMetadataMixin):
         workdir: str | None = None,
         background: bool = False,
         _chunks_sink: list | None = None,
+        _kill: threading.Event | None = None,
     ) -> dict:
         """Execute a shell command and return its output.
 
@@ -151,7 +175,11 @@ class TerminalTools(ToolMetadataMixin):
                 "cwd": self._cwd,
             }
 
-        self._interrupt.clear()
+        # Only foreground calls honour Ctrl+C; background (term-N) jobs
+        # share this instance and must survive a cancelled turn.
+        foreground = _chunks_sink is None
+        if foreground:
+            self._interrupt.clear()
 
         wrapped = f'{command}\n__exit_code=$?\nprintf "\\n__CWD=%s" "$(pwd)"\nexit $__exit_code'
 
@@ -175,6 +203,8 @@ class TerminalTools(ToolMetadataMixin):
                 "cwd": self._cwd,
             }
 
+        with _live_procs_lock:
+            _live_procs.add(proc)
         chunks: list[str] = _chunks_sink if _chunks_sink is not None else []
         drain = threading.Thread(target=_drain_pipe, args=(proc.stdout, chunks), daemon=True)
         drain.start()
@@ -183,16 +213,20 @@ class TerminalTools(ToolMetadataMixin):
         timed_out = False
         interrupted = False
 
-        while proc.poll() is None:
-            if self._interrupt.is_set():
-                interrupted = True
-                self._kill_process(proc)
-                break
-            if time.monotonic() > deadline:
-                timed_out = True
-                self._kill_process(proc)
-                break
-            time.sleep(0.1)
+        try:
+            while proc.poll() is None:
+                if (foreground and self._interrupt.is_set()) or (_kill is not None and _kill.is_set()):
+                    interrupted = True
+                    self._kill_process(proc)
+                    break
+                if time.monotonic() > deadline:
+                    timed_out = True
+                    self._kill_process(proc)
+                    break
+                time.sleep(0.1)
+        finally:
+            with _live_procs_lock:
+                _live_procs.discard(proc)
 
         drain.join(timeout=2)
         output = "".join(chunks)
@@ -285,7 +319,7 @@ class TerminalTools(ToolMetadataMixin):
         return "'" + s.replace("'", "'\\''") + "'"
 
     def _resolve_path(self, path: str) -> str:
-        path = os.path.expanduser(path)
+        path = os.path.expanduser(os.path.expandvars(path))
         if not os.path.isabs(path):
             path = os.path.join(self._cwd, path)
         return path

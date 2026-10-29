@@ -11,6 +11,7 @@ surface.
 from pathlib import Path
 from typing_extensions import TypedDict
 
+from okonomi.config import OKONOMI_MIND_DIR
 from okonomi.tools._metadata import ToolMetadataMixin
 
 
@@ -38,6 +39,14 @@ class WriteResult(TypedDict, total=False):
 
 def _resolve(path: str) -> Path:
     return Path(path).expanduser().resolve()
+
+
+def _mind_write_refusal(p: Path) -> dict | None:
+    # Mind pages share one frontmatter schema that recall and /mind read;
+    # ``remember`` is the single writer that keeps it, so file tools refuse.
+    if p.is_relative_to(OKONOMI_MIND_DIR.expanduser().resolve()):
+        return {"error": f"{p} is a mind wiki page. Use remember(title, body, ..., slug=..., update=True) to write it."}
+    return None
 
 
 def _looks_binary(data: bytes) -> bool:
@@ -159,6 +168,8 @@ class FileTools(ToolMetadataMixin):
             p = _resolve(path)
         except Exception as e:
             return {"error": f"Invalid path: {e}"}
+        if refusal := _mind_write_refusal(p):
+            return refusal
 
         created = not p.exists()
         if not created:
@@ -208,6 +219,8 @@ class FileTools(ToolMetadataMixin):
             p = _resolve(path)
         except Exception as e:
             return {"error": f"Invalid path: {e}"}
+        if refusal := _mind_write_refusal(p):
+            return refusal
         if not p.exists():
             return {"error": f"No such file: {p}"}
         if not p.is_file():

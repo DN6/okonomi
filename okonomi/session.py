@@ -35,7 +35,7 @@ if TYPE_CHECKING:
 SessionStatus = Literal["in_progress", "completed", "interrupted", "error", "abandoned"]
 
 from . import db
-from .config import OKONOMI_SESSIONS_DIR
+from .config import OKONOMI_MIND_DIR, OKONOMI_SESSIONS_DIR
 from .events import (
     CONVERSATION_TYPES,
     Event,
@@ -435,12 +435,16 @@ def search_events(
 
 def search(query: str, *, limit: int = 20) -> list[dict[str, Any]]:
     """One query over everything: conversation content, session
-    titles/tasks, and artifacts, interleaved by BM25 (ascending — FTS
-    scores are negative-better; LIKE-fallback artifact hits score 0.0 and
-    sort last). Every hit carries enough to act on without a second
-    lookup: ``source`` (event | session | artifact), ``session_id``,
-    ``session_title``, and the event_id / artifact_id / path / url /
-    snippet that pins the thing itself."""
+    titles/tasks, artifacts, and mind wiki pages. Every hit carries enough
+    to act on without a second lookup: ``source`` (event | session |
+    artifact | mind), ``session_id`` (empty for mind pages),
+    ``session_title`` (the page title for mind pages), and the event_id /
+    artifact_id / path / url / snippet that pins the thing itself.
+
+    Each source is its own BM25 index, so raw scores aren't comparable
+    across them (a four-page mind wiki gives every term near-zero IDF).
+    Hits are therefore interleaved by their rank within their source,
+    with raw score only breaking ties between equal ranks."""
     hits: list[dict[str, Any]] = []
     for h in search_events(query, limit=limit):
         hits.append(
@@ -459,13 +463,14 @@ def search(query: str, *, limit: int = 20) -> list[dict[str, Any]]:
             {
                 "source": "session",
                 "session_id": h["session_id"],
-                "session_title": h.get("title") or "",
+                "session_title": h.get("title") or (h.get("task_input") or "")[:60],
                 "snippet": h.get("task_input") or "",
                 "num_artifacts": h.get("num_artifacts") or 0,
                 "timestamp": h.get("created_at") or "",
                 "score": h.get("score") or 0.0,
             }
         )
+    favorites = favorite_refs()
     for h in search_artifacts(query, limit=limit):
         hits.append(
             {
@@ -479,10 +484,50 @@ def search(query: str, *, limit: int = 20) -> list[dict[str, Any]]:
                 "snippet": h.get("prompt") or h.get("description") or "",
                 "timestamp": h.get("created_at") or "",
                 "score": h.get("score") or 0.0,
+                "favorite": norm_ref(h.get("path") or h.get("url") or "") in favorites,
             }
         )
-    hits.sort(key=lambda h: h["score"])
+    for h in db.search_mind_fts(OKONOMI_MIND_DIR, query, limit=limit):
+        hits.append(
+            {
+                "source": "mind",
+                "session_id": "",
+                "session_title": h["title"],
+                "path": h["path"],
+                "snippet": h.get("snippet") or "",
+                "timestamp": h.get("timestamp") or "",
+                "score": h.get("score") or 0.0,
+            }
+        )
+    ranks: dict[str, int] = {}
+    for h in hits:
+        h["rank"] = ranks[h["source"]] = ranks.get(h["source"], -1) + 1
+    hits.sort(key=lambda h: (h["rank"], h["score"]))
     return hits[:limit]
+
+
+def browse(*, limit: int = 20) -> list[dict[str, Any]]:
+    """What ``search`` shows before there's a query: every favorite first,
+    then recent sessions and mind wiki pages interleaved newest first —
+    all in the same hit shape."""
+    rest: list[dict[str, Any]] = []
+    for s in list_sessions(limit=limit):
+        if not (s.title or s.task_input):
+            continue
+        rest.append(
+            {
+                "source": "session",
+                "session_id": s.session_id,
+                "session_title": s.display_name,
+                "snippet": s.task_input or "",
+                "timestamp": s.updated_at or s.created_at or "",
+                "score": 0.0,
+            }
+        )
+    for h in db.list_mind_pages(OKONOMI_MIND_DIR):
+        rest.append({"source": "mind", "session_id": "", "session_title": h["title"], **h})
+    rest.sort(key=lambda h: h["timestamp"], reverse=True)
+    return [*favorite_hits(limit=limit), *rest][:limit]
 
 
 def read_window(session_id: str, around_event_id: int, *, window: int = 5) -> list[dict[str, Any]]:
@@ -555,7 +600,7 @@ def prune_empty_sessions(*, min_age_hours: int = 24) -> int:
 
 
 def favorite(*, artifact_id: int | None = None, url: str = "", artifact_type: str = "") -> int:
-    """Heart an asset — internal (``artifact_id``) or external (``url``,
+    """Favorite an asset — internal (``artifact_id``) or external (``url``,
     which accepts URLs or bare local paths). Idempotent; returns the
     favorite row id."""
     conn = db.connection()
@@ -569,6 +614,43 @@ def unfavorite(favorite_id: int) -> bool:
         return db.remove_favorite(conn, favorite_id)
 
 
+def norm_ref(ref: str) -> str:
+    """One identity for a favorite: URLs as-is, local paths resolved — so the
+    viewer, the asset picker, and search all agree on what is a favorite."""
+    if not ref or ref.startswith(("http://", "https://", "file://", "data:")):
+        return ref
+    return str(Path(ref).expanduser().resolve())
+
+
+def favorite_refs() -> set[str]:
+    return {norm_ref(f["url"]) for f in list_favorites() if f.get("url")}
+
+
+def favorite_hits(*, limit: int | None = None) -> list[dict[str, Any]]:
+    """Every favorite as a search-shaped artifact hit, newest first — the
+    browse view of favorites across all sessions."""
+    hits = []
+    for f in list_favorites(limit=limit):
+        ref = f.get("url") or ""
+        remote = ref.startswith(("http://", "https://", "data:"))
+        hits.append(
+            {
+                "source": "artifact",
+                "session_id": f.get("session_id") or "",
+                "session_title": f.get("session_title") or "",
+                "artifact_id": f.get("artifact_id"),
+                "artifact_type": f.get("artifact_type") or "",
+                "path": "" if remote else ref,
+                "url": ref if remote else "",
+                "snippet": f.get("prompt") or f.get("description") or "",
+                "timestamp": f.get("favorited_at") or "",
+                "score": 0.0,
+                "favorite": True,
+            }
+        )
+    return hits
+
+
 def list_favorites(
     *,
     artifact_type: str | None = None,
@@ -579,7 +661,7 @@ def list_favorites(
 
     Returns plain dicts (not Artifact) since each row carries
     cross-session fields (``session_id``, ``session_title``,
-    ``favorited_at``, ``note``) that don't fit the Artifact dataclass.
+    ``favorited_at``) that don't fit the Artifact dataclass.
     """
     return db.list_favorites(
         db.connection(),

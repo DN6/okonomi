@@ -316,6 +316,7 @@ class JobFinished(Event):
     type: ClassVar[str] = "job_finished"
 
     job_id: str = ""
+    kind: str = ""
     status: str = "ok"  # ok | error
     error: str | None = None
     output: str | None = None

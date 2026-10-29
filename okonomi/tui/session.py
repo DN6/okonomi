@@ -15,8 +15,9 @@ from collections import deque
 from concurrent.futures import TimeoutError as FutureTimeout
 
 from ..agent import OkonomiAgent
+from ..agent.jobs import job_notice
 from ..events import ApprovalRequest, Event, EventEmitter, JobFinished, SystemNote, ToolCallDisplay
-from ..session import SessionStatus, prune_empty_sessions
+from ..session import Artifact, SessionStatus, prune_empty_sessions, search_artifacts
 from ..utils import format_elapsed
 from .app import ReplApp
 from .assets import handle_asset_action
@@ -68,6 +69,13 @@ class TuiSession:
         # (aiohttp timeouts cancel the calling task; a missed conversion
         # escapes as bare CancelledError and is NOT a user interrupt).
         self._user_cancel: bool = False
+        # Messages that cut into a streaming reply; the turn is cancelled
+        # and they run next, together with anything it never picked up.
+        self._steer_texts: list[str] = []
+        # After a user stop the agent stays quiet until the user speaks:
+        # job results are held and ride along with their next message.
+        self._quiet = False
+        self._held_notices: list[str] = []
 
         # Background full-agent tasks (/bg). Keyed by bg-N id.
         self._bg_tasks: dict[str, threading.Thread] = {}
@@ -85,6 +93,8 @@ class TuiSession:
             bg_tasks_fn=self._bg_tasks_list,
             on_double_escape=self._open_tree,
             on_history_search=self._open_history,
+            on_jobs=self._open_jobs,
+            is_busy=lambda: self._agent_running,
         )
 
     # --- Agent worker ---
@@ -108,6 +118,7 @@ class TuiSession:
         self._turn_started_at = time.monotonic()
         self._current_task = asyncio.current_task()
         status: SessionStatus = "completed"
+        stopped = False
         try:
             await self.agent.run_async(user_message, reset=reset)
         except asyncio.CancelledError:
@@ -119,8 +130,11 @@ class TuiSession:
             if task is not None:
                 while task.cancelling():
                     task.uncancel()
-            if self._user_cancel:
+            stopped = self._user_cancel
+            if stopped:
                 self.emitter.emit(SystemNote("Interrupted. History preserved.", level="warn"))
+            elif self._steer_texts:
+                self.emitter.emit(SystemNote("↳ Redirecting."))
             else:
                 self.emitter.emit(
                     SystemNote(
@@ -141,10 +155,26 @@ class TuiSession:
         finally:
             self._current_task = None
             self._turn_started_at = None
+            # Messages sent mid-turn that the turn ended before picking up.
+            # After a user stop they go back to the input box rather than
+            # starting a turn: stop has to mean the agent goes quiet.
+            pending = [*self.agent.take_undelivered(), *self._steer_texts]
+            self._steer_texts = []
+            if stopped:
+                self._quiet = True
+                if pending:
+                    self._app.call_from_thread(self._restore_draft, pending)
+            elif pending:
+                self._input_queue.put_nowait("\n\n".join(pending))
             # Off-load to a thread — save does file + DB writes that can
             # take a moment. Blocking the consumer here would stall queued
             # submits and cancellations marshalled through the same loop.
             await asyncio.to_thread(self._safe_save_session, status=status)
+
+    def _restore_draft(self, texts: list[str]) -> None:
+        draft = " ".join([*texts, self._app.input.text]).strip()
+        self._app.prefill_input(draft)
+        self.emitter.emit(SystemNote("Your unsent message is back in the input box — Enter to send it."))
 
     def _safe_save_session(
         self,
@@ -179,6 +209,10 @@ class TuiSession:
             if task is not None and not task.done():
                 self._user_cancel = True
                 task.cancel()
+                # Cancelling the task abandons the executor thread running
+                # a sync tool; the subprocess would otherwise live on until
+                # its own timeout.
+                self.agent.terminal.interrupt()
 
         self._loop.call_soon_threadsafe(_do_cancel)
 
@@ -212,15 +246,21 @@ class TuiSession:
             if result.action is Action.EXIT:
                 self._app.exit()
                 return
-            if result.action is Action.SESSION_PICKER:
-                self._app.show_session_picker(self._resume_session)
+            if result.action is Action.FIND_PICKER:
+                self._app.show_find_picker(result.payload, result.scope, self._open_hit)
                 return
             if result.action is Action.TREE_PICKER:
                 self._open_tree()
                 return
             if result.action is Action.ASSET_PICKER:
+                artifacts = list(self.agent.state.artifacts)
+                if result.payload:
+                    artifacts = [
+                        Artifact(h["artifact_type"], path=h["path"], url=h["url"], prompt=h["prompt"])
+                        for h in search_artifacts(result.payload, limit=200)
+                    ]
                 self._app.show_asset_picker(
-                    list(self.agent.state.artifacts),
+                    artifacts,
                     lambda action, paths: handle_asset_action(action, paths, self.agent, self.emitter),
                 )
                 return
@@ -237,7 +277,46 @@ class TuiSession:
             # Action.FORWARD — send the command's payload to the agent.
             text = result.payload
 
-        self._submit(text)
+        self._loop.call_soon_threadsafe(self._deliver_on_loop, text)
+
+    def _deliver_on_loop(self, text: str) -> None:
+        """Send a user message into the running turn, where it is picked up
+        at the turn's next model request; with no turn running, queue it as
+        a new turn. Runs on the worker loop, so it can't race the turn's
+        start or end.
+
+        If the model is mid-reply (streaming text, no tool running) the
+        message cuts in: the turn is cancelled and the message runs next
+        with the partial reply as context, instead of waiting for the model
+        to finish talking."""
+        self._quiet = False
+        if self._held_notices:
+            text = "\n\n".join([text, *self._held_notices])
+            self._held_notices = []
+        if self._agent_running and (self._steer_texts or self.agent.streaming_text):
+            if not self._steer_texts:
+                self._current_task.cancel()
+            self._steer_texts.append(text)
+            return
+        if not (self._agent_running and self.agent.enqueue(text)):
+            self._input_queue.put_nowait(text)
+        elif self.agent.status.startswith("Running"):
+            # Don't make the user wait on a slow tool: it carries on as a
+            # background job and the model reads the message now.
+            self.agent.detach_running_tools()
+            self.emitter.emit(SystemNote("↳ Running tool moved to the background so the agent can read this now."))
+
+    def _deliver_notice(self, notice: str) -> None:
+        """Hand a finished job's result to the agent: into the running turn
+        if there is one, else as a new turn — unless the user stopped the
+        agent, in which case it waits for their next message. Runs on the
+        worker loop."""
+        if self._quiet:
+            self._held_notices.append(notice)
+            self.emitter.emit(SystemNote("A background job finished; the agent gets its result with your next message."))
+            return
+        if not (self._agent_running and self.agent.enqueue(notice)):
+            self._input_queue.put_nowait(notice)
 
     def _submit(self, msg: str | None) -> None:
         """Schedule a message onto the worker loop's input queue.
@@ -247,20 +326,14 @@ class TuiSession:
         self._loop.call_soon_threadsafe(self._input_queue.put_nowait, msg)
 
     def _inject_side_question(self, question: str) -> None:
-        """Cancel the in-flight turn and queue the question as a course
-        correction. The agent's run_async path already handles
-        ``_was_interrupted`` by prepending the new message with a
-        priority marker, so this works with no agent-side changes.
-        """
+        """Deliver a side question like any message typed mid-turn (cuts in
+        on a streaming reply, else joins the running turn), tagged so the
+        agent knows it is an aside rather than new instructions."""
         if self._agent_running:
-            self.cancel_current_turn()
-            # Tag the message so the agent knows this is a side question
-            # rather than a routine continuation. The "interrupted"
-            # framing in run_async will pick it up.
             tagged = f"[Side question while you were working]\n\n{question}"
         else:
             tagged = question
-        self._submit(tagged)
+        self._loop.call_soon_threadsafe(self._deliver_on_loop, tagged)
 
     def _spawn_bg_task(self, task_input: str) -> None:
         """Run a task in the background with a separate OkonomiAgent.
@@ -305,11 +378,12 @@ class TuiSession:
             # job completions, and the note below surface to the user.
             bg_agent.emitter = EventEmitter()
             bg_agent.emitter.subscribe(_forward)
+            parent.jobs.entries[task_id]["jobs"] = bg_agent.jobs
             try:
-                asyncio.run(bg_agent.run_async(task_input, reset=True))
+                reply = asyncio.run(bg_agent.run_async(task_input, reset=True))
                 parent.state.artifacts.extend(bg_agent.state.artifacts)
                 n = len(bg_agent.state.artifacts)
-                progress["detail"] = f"artifacts produced: {n}"
+                progress["detail"] = f"artifacts produced: {n}" + (f"\n\n{reply}" if reply else "")
                 self.emitter.emit(SystemNote(f"Background task {task_id} done — {n} artifact{'s' if n != 1 else ''}"))
             except Exception as e:  # noqa: BLE001
                 status = "error"
@@ -324,6 +398,21 @@ class TuiSession:
         thread = threading.Thread(target=_run, daemon=True, name=label)
         self._bg_tasks[task_id] = thread
         thread.start()
+
+    def _open_hit(self, action: str, hit: dict) -> None:
+        """Callback from the find picker. Enter keeps you in okonomi: a
+        session or conversation hit resumes that session; an asset or mind
+        page is added to the message being typed, the same as dropping the
+        file in. Ctrl-O opens an asset or page in its own app instead."""
+        ref = hit.get("path") or hit.get("url") or ""
+        if action == "open" and ref:
+            handle_asset_action("open", [ref], self.agent, self.emitter)
+            return
+        if hit["source"] in ("session", "event"):
+            self._resume_session(hit["session_id"])
+            return
+        text = self._app.input.text
+        self._app.prefill_input(f"{text} {ref} " if text and not text.endswith(" ") else f"{text}{ref} ")
 
     def _resume_session(self, session_id: str) -> None:
         """Callback from the session picker. Loads a past session and
@@ -349,6 +438,14 @@ class TuiSession:
             self.emitter.emit(SystemNote("Finish or interrupt the current turn before browsing the tree.", level="warn"))
             return
         self._app.show_tree_picker(self.agent.session.session_id, self._checkout_branch)
+
+    def _open_jobs(self) -> None:
+        """Open the conversation + background-jobs navigator (↓ on an
+        empty prompt), mid-turn included. A no-op until something has been
+        launched."""
+        if not self.agent.jobs.entries:
+            return
+        self._app.show_jobs_picker(self.agent.session.title or self.agent.session.session_id, self.agent.jobs, self._open_tree)
 
     def _open_history(self) -> None:
         """Open the Ctrl-R conversation search (branch by content)."""
@@ -457,43 +554,8 @@ class TuiSession:
         self._app.call_from_thread(self._app.show_approval, request.code, _resolve)
 
     def _on_job_finished(self, ev: JobFinished) -> None:
-        """Inject a synthetic turn so the agent can surface completed media.
-
-        Names the *specific* assets this bg task produced so the agent
-        doesn't grab unrelated older items from session state.
-        """
-        bg_id, error = ev.job_id, ev.error
-        if error:
-            msg = (
-                f"[system] Background task {bg_id} failed:\n{error}\n\n"
-                "DO NOT re-run an expensive generation call to recover. "
-                "If this is a parsing error after the generation line, the "
-                "generation likely succeeded — check $OKONOMI_SESSION_DIR "
-                "for its output files and `/logs` for the run's stdout "
-                "before re-running anything. If the generation call itself "
-                "raised (network/500/timeout), surface the error to the "
-                "user and ask before retrying."
-            )
-            self._submit(msg)
-            return
-
-        asset_lines: list[str] = []
-        for ref_info in ev.artifact_refs:
-            ref = ref_info.get("path") or ref_info.get("url") or ""
-            kind = ref_info.get("artifact_type") or "artifact"
-            if ref:
-                asset_lines.append(f"  - {kind}: {ref}")
-        produced_block = "\n".join(asset_lines) if asset_lines else "  (none)"
-
-        msg = (
-            f"[system] Background task {bg_id} completed.\n\n"
-            f"Assets produced by THIS task:\n{produced_block}\n\n"
-            "Use ONLY these specific URLs/paths when presenting to the user. "
-            "Do NOT reference older session assets and do NOT regenerate. "
-            "The list above is authoritative for what "
-            f"{bg_id} just produced."
-        )
-        self._submit(msg)
+        """Hand the finished job's result to the agent (see ``_deliver_notice``)."""
+        self._loop.call_soon_threadsafe(self._deliver_notice, job_notice(ev))
 
     # --- Status-bar callables passed to ReplApp ---
 
@@ -544,7 +606,7 @@ class TuiSession:
 
         self.emitter.emit(Banner())
         self.emitter.emit(SystemNote(
-            "type a message or /help. Ctrl+D to exit. Scroll and select text "
+            "type a message or /help. Ctrl+C or Ctrl+D to exit. Scroll and select text "
             "natively; /verbose toggles full tool output.",
         ))
 
@@ -575,6 +637,22 @@ class TuiSession:
         resume retries anything missing)."""
         if self._agent_running:
             self.cancel_current_turn()
+        # Background work dies with the REPL: detached tool calls, term-N
+        # jobs, and sub-agents' commands are all bash subprocesses in their
+        # own process groups, so they'd outlive us otherwise. Killing them
+        # also unblocks the tool-pool threads the interpreter joins at exit.
+        from ..tools.terminal import kill_all_processes
+
+        killed = kill_all_processes()
+        if killed:
+            self.emitter.emit(SystemNote(f"Killed {killed} running background command{'s' if killed != 1 else ''}."))
+        self.agent._tool_pool.shutdown(wait=False, cancel_futures=True)
+        # MCP connections are held open across turns on the worker loop; close
+        # them there so stdio servers exit instead of outliving the REPL.
+        try:
+            asyncio.run_coroutine_threadsafe(self.agent.close_mcp(), self._loop).result(timeout=2.0)
+        except Exception:  # noqa: BLE001
+            pass
         self._submit(None)
         try:
             self._worker_loop_future.result(timeout=2.0)
