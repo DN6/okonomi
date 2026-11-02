@@ -11,7 +11,7 @@ from types import SimpleNamespace
 
 from pydantic_ai.messages import ModelResponse, TextPart
 from pydantic_ai.models.function import AgentInfo, DeltaToolCall, FunctionModel
-from test_mid_turn_messages import _users, okonomi_agent  # noqa: F401
+from test_mid_turn_messages import _users
 
 from okonomi.events import EventEmitter, SystemNote
 from okonomi.tui.session import TuiSession
