@@ -13,7 +13,7 @@ from types import SimpleNamespace
 import pytest
 from pydantic_ai.messages import ModelResponse, TextPart
 from pydantic_ai.models.function import AgentInfo, DeltaToolCall, FunctionModel
-from test_mid_turn_messages import _model_calling_web_fetch, _patch_web_fetch, okonomi_agent  # noqa: F401
+from test_mid_turn_messages import _model_calling_web_fetch, _patch_web_fetch
 
 from okonomi.agent import agent as agent_mod
 from okonomi.events import EventEmitter, JobFinished
@@ -55,7 +55,6 @@ def test_stopped_tool_call_does_not_become_a_job(okonomi_agent, monkeypatch):
 
 
 def test_stop_kills_the_agents_bash_command(okonomi_agent, monkeypatch):
-    monkeypatch.setenv("OKONOMI_NO_SANDBOX", "1")
 
     async def _stream(messages, info: AgentInfo):
         if len(messages) == 1:

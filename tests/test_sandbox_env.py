@@ -15,20 +15,59 @@ def test_scrub_env_drops_secret_like_vars():
     assert out["PATH"] == "/usr/bin" and out["HOME"] == "/tmp/h"
 
 
-@pytest.mark.skipif(sys.platform != "darwin", reason="sandbox-exec is macOS-only")
-def test_sandbox_blocks_out_of_scope_write(tmp_path, monkeypatch):
+@pytest.mark.skipif(sys.platform not in ("darwin", "linux"), reason="okonomi sandboxes only macOS and Linux")
+def test_sandbox_blocks_out_of_scope_write(tmp_path):
     import subprocess
+    import uuid
+    from pathlib import Path
 
-    monkeypatch.delenv("OKONOMI_NO_SANDBOX", raising=False)
-    _sandbox._sandbox_ok = None  # force a fresh probe
-    target = tmp_path / "blocked.txt"  # tmp_path is under /private/var/folders → allowed
-    argv = _sandbox.wrap_command(["/bin/bash", "-c", f"echo hi > {target}"], cwd=str(tmp_path))
-    if argv[0] != "sandbox-exec":
-        pytest.skip("sandbox-exec unavailable on this machine")
-    # Allowed: within tmp (var/folders subpath)
-    assert subprocess.run(argv, capture_output=True).returncode == 0
+    _sandbox._probed = False
+    inside = tmp_path / "allowed.txt"
+    argv = _sandbox.wrap_command(["/bin/bash", "-c", f"echo hi > {inside}"], cwd=str(tmp_path))
+    assert subprocess.run(argv, capture_output=True).returncode == 0, "write inside cwd must succeed"
 
-    # Blocked: a path outside every allowed subpath
-    argv2 = _sandbox.wrap_command(["/bin/bash", "-c", "echo hi > /Users/blocked-probe.txt"], cwd=str(tmp_path))
-    result = subprocess.run(argv2, capture_output=True)
-    assert result.returncode != 0, "write outside scoped roots must fail"
+    # $HOME is writable outside the sandbox but is not a scoped root.
+    outside = Path.home() / f"okonomi-sandbox-probe-{uuid.uuid4().hex}.txt"
+    try:
+        argv = _sandbox.wrap_command(["/bin/bash", "-c", f"echo hi > {outside}"], cwd=str(tmp_path))
+        result = subprocess.run(argv, capture_output=True)
+        assert result.returncode != 0 and not outside.exists(), "write outside scoped roots must fail"
+    finally:
+        outside.unlink(missing_ok=True)
+
+
+def test_unsupported_platform_refuses(monkeypatch):
+    monkeypatch.setattr(_sandbox.sys, "platform", "win32")
+    with pytest.raises(_sandbox.SandboxUnavailable, match="'win32'"):
+        _sandbox.wrap_command(["true"])
+
+
+def test_failed_probe_refuses_with_install_hint(monkeypatch):
+    monkeypatch.setattr(_sandbox, "_probed", False)
+    monkeypatch.setitem(_sandbox._RUNNERS, sys.platform, (lambda cwd: ["/nonexistent-okonomi-runner"], "install-hint"))
+    with pytest.raises(_sandbox.SandboxUnavailable, match="install-hint"):
+        _sandbox.wrap_command(["true"])
+    assert _sandbox._probed is False, "a failed probe must be retried, not cached as success"
+
+
+def test_env_file_injects_scrubbed_credential_into_bash(tmp_path, monkeypatch):
+    from okonomi.tools.terminal import TerminalTools
+
+    env_file = tmp_path / "creds.env"
+    env_file.write_text("FAL_KEY=fal-secret-value-123\n")
+    monkeypatch.setenv("OKONOMI_ENV_FILE", str(env_file))
+
+    result = TerminalTools().bash('[ "$FAL_KEY" = fal-secret-value-123 ] && echo injected; echo "$FAL_KEY"')
+    assert "injected" in result["output"], f"FAL_KEY not injected: {result!r}"
+    assert "fal-secret-value-123" not in result["output"], f"env-file value leaked into output: {result!r}"
+    assert "[FAL_KEY redacted]" in result["output"]
+
+
+def test_env_file_missing_fails_command(tmp_path, monkeypatch):
+    from okonomi.tools.terminal import TerminalTools
+
+    monkeypatch.setenv("OKONOMI_ENV_FILE", str(tmp_path / "missing.env"))
+
+    result = TerminalTools().bash("echo should-not-run")
+    assert result["exit_code"] != 0, f"command ran without its env file: {result!r}"
+    assert "OKONOMI_ENV_FILE" in result["output"]
