@@ -7,6 +7,7 @@ without either pulling in the other's dependency.
 
 from __future__ import annotations
 
+
 ACCENT = "#d787af"  # pink — prompt, spinner, selection, bullets
 AMBER = "#ffaf00"  # approval prompts / warnings
 ERROR = "#ff5f5f"  # errors

@@ -222,10 +222,7 @@ class ContextManager:
                 f"Session compressed {self.compression_count}× — "
                 "consider /clear for a fresh start or /save to preserve this work."
             )
-            if self.emitter is not None:
-                self.emitter.emit(SystemNote(msg, level="warn"))
-            else:
-                print(f"\033[33m{msg}\033[0m")
+            self.emitter.emit(SystemNote(msg, level="warn"))
         return compressed
 
     # ------------------------------------------------------------------

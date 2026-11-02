@@ -13,6 +13,8 @@ from .agent import OkonomiAgent
 from .agent.jobs import REPORTED_KINDS, job_notice
 from .config import load_env_or_raise
 from .events import JobFinished, SystemNote
+from .tools._command_guard import load_approval_rules
+from .tools._sandbox import wrap_command
 
 
 # ANSI colors for the startup chrome (session resolution, one-shot notes) —
@@ -174,17 +176,18 @@ async def run_agent_async(args: argparse.Namespace, user_request: str) -> None:
 def main() -> None:
     try:
         load_env_or_raise()
-    except EnvironmentError as e:
+        load_approval_rules()
+        wrap_command(["true"])
+    except (EnvironmentError, ValueError) as e:
         print(f"{RED}{BOLD}Error:{RST} {e}", file=sys.stderr)
         sys.exit(1)
     args = parse_arguments()
 
-    is_interactive = not args.task
-    if is_interactive:
+    if not args.task:
         asyncio.run(run_agent_async(args, ""))
     else:
-        user_request = (args.task or "").strip()
-        if not user_request.strip():
+        user_request = args.task.strip()
+        if not user_request:
             print(f"{DIM}No task provided.{RST}")
             return
 

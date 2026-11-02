@@ -1,13 +1,12 @@
 """Web tools — search via DuckDuckGo and page fetching via httpx."""
 
 import re
-from typing_extensions import TypedDict
 
 import httpx
 import lxml.html
 from ddgs import DDGS
+from typing_extensions import TypedDict
 
-from okonomi.tools._metadata import ToolMetadataMixin
 
 _FETCH_HEADERS = {
     "User-Agent": (
@@ -44,9 +43,7 @@ class WebFetchResult(TypedDict, total=False):
     error: str
 
 
-class WebTools(ToolMetadataMixin):
-    __namespace__ = "web"
-    __description__ = "Web search via DuckDuckGo and page fetching."
+class WebTools:
 
     def web_search(self, query: str, max_results: int = 5) -> WebSearchResult:
         """Search the web for a query via DuckDuckGo.

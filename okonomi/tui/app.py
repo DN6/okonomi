@@ -14,8 +14,8 @@ approval answer is not, so it leaves no residue.
 
 Exposes the same surface ``TuiSession`` calls on the app: ``run_async``,
 ``exit``, ``call_from_thread``, ``show_approval``, ``show_find_picker``,
-``show_asset_picker``, ``show_tree_picker``, ``prefill_input``,
-``toggle_verbose``.
+``show_asset_picker``, ``show_tree_picker``, ``show_history_picker``,
+``show_jobs_picker``, ``prefill_input``, ``toggle_verbose``.
 """
 
 from __future__ import annotations
@@ -51,7 +51,6 @@ from prompt_toolkit.patch_stdout import patch_stdout
 from prompt_toolkit.widgets import Frame
 
 from ..events import EventEmitter, SystemNote
-from .events import UserMessage
 from .completion import SlashCompleter
 from .style import REPL_STYLE
 from .transcript import ReplTranscript
@@ -101,14 +100,14 @@ class ReplApp:
         self,
         emitter: EventEmitter,
         on_submit: Callable[[str], None],
-        on_interrupt: Callable[[], bool] | None = None,
-        spinner_label_fn: Callable[[], str] | None = None,
-        usage_fn: Callable[[], str] | None = None,
-        bg_tasks_fn: Callable[[], list] | None = None,
-        on_double_escape: Callable[[], None] | None = None,
-        on_history_search: Callable[[], None] | None = None,
-        on_jobs: Callable[[], None] | None = None,
-        is_busy: Callable[[], bool] | None = None,
+        on_interrupt: Callable[[], bool],
+        spinner_label_fn: Callable[[], str],
+        usage_fn: Callable[[], str],
+        bg_tasks_fn: Callable[[], list],
+        on_double_escape: Callable[[], None],
+        on_history_search: Callable[[], None],
+        on_jobs: Callable[[], None],
+        is_busy: Callable[[], bool],
     ) -> None:
         self.emitter = emitter
         self.on_submit_cb = on_submit
@@ -118,7 +117,7 @@ class ReplApp:
         self.on_double_escape = on_double_escape
         self.on_history_search = on_history_search
         self.on_jobs = on_jobs
-        self.is_busy = is_busy or (lambda: False)
+        self.is_busy = is_busy
         self.spinner_label_fn = spinner_label_fn
         self.usage_fn = usage_fn
         self.bg_tasks_fn = bg_tasks_fn
@@ -127,6 +126,7 @@ class ReplApp:
         self._loop: asyncio.AbstractEventLoop | None = None
         self._exit = False
         self._approval_resolve: Callable[[object], None] | None = None
+        self._approval_reason = ""
         # A picker requested by a slash command; the app exits so the outer
         # loop can run the (full-screen) modal, then re-enters.
         self._pending_modal: tuple | None = None
@@ -233,8 +233,8 @@ class ReplApp:
 
     def _approval_fragments(self):
         return [
-            ("class:approval.q", " Run this code? "),
-            ("class:approval.hint", "[Enter] approve · [a] approve all · [n] skip · or type feedback"),
+            ("class:approval.q", f" Run this command? ({self._approval_reason}) "),
+            ("class:approval.hint", "[Enter] once · [s] session · [a] always · [n] deny · or type feedback"),
         ]
 
     def _toolbar(self):
@@ -252,12 +252,12 @@ class ReplApp:
         if usage:
             groups.append([("class:bottom-toolbar.meta", f"↓ {usage}")])
         try:
-            bg = self.bg_tasks_fn() if self.bg_tasks_fn else []
+            bg = self.bg_tasks_fn()
         except Exception:
             bg = []
         if bg:
             parts = []
-            for job_id, label, _kind, elapsed in bg[:3]:
+            for job_id, label, elapsed in bg[:3]:
                 label = label if len(label) <= 18 else label[:17] + "…"
                 parts.append(f"{job_id} {label} {elapsed}".replace("  ", " "))
             text = "bg: " + " · ".join(parts)
@@ -276,8 +276,6 @@ class ReplApp:
 
     @staticmethod
     def _safe_str(fn) -> str:
-        if fn is None:
-            return ""
         try:
             return str(fn() or "")
         except Exception:
@@ -310,7 +308,7 @@ class ReplApp:
 
         @kb.add("c-r", eager=True)
         def _(event):
-            if self._approval_resolve is None and self.on_history_search is not None:
+            if self._approval_resolve is None:
                 self.on_history_search()
 
         @kb.add("escape", "enter")
@@ -330,8 +328,7 @@ class ReplApp:
             filter=Condition(lambda: self._approval_resolve is None and self.is_busy() and not _enter_queued()),
         )
         def _(event):
-            if self.on_interrupt_cb is not None:
-                self.on_interrupt_cb()
+            self.on_interrupt_cb()
 
         @kb.add(
             "escape",
@@ -344,8 +341,7 @@ class ReplApp:
             ),
         )
         def _(event):
-            if self.on_double_escape is not None:
-                self.on_double_escape()
+            self.on_double_escape()
 
         @kb.add(
             "down",
@@ -356,8 +352,7 @@ class ReplApp:
             ),
         )
         def _(event):
-            if self.on_jobs is not None:
-                self.on_jobs()
+            self.on_jobs()
 
         return kb
 
@@ -417,7 +412,7 @@ class ReplApp:
             self._invalidate()
             self._safe_resolve(resolver, False)
             return
-        if self.on_interrupt_cb is not None and self.on_interrupt_cb():
+        if self.on_interrupt_cb():
             return  # a running turn was cancelled
         if not self.input.text:
             if time.monotonic() - self._exit_armed_at < 2.0:
@@ -430,13 +425,14 @@ class ReplApp:
 
     # --- inline approval (runs on the main loop via call_from_thread) ---
 
-    def show_approval(self, code: str, resolve: Callable[[object], None]) -> None:
-        self._unless_modal(lambda: self._show_approval(code, resolve))
+    def show_approval(self, code: str, reason: str, resolve: Callable[[object], None]) -> None:
+        self._unless_modal(lambda: self._show_approval(code, reason, resolve))
 
-    def _show_approval(self, code: str, resolve: Callable[[object], None]) -> None:
+    def _show_approval(self, code: str, reason: str, resolve: Callable[[object], None]) -> None:
         self._approval_resolve = resolve
+        self._approval_reason = reason
         if code:
-            self.transcript.print_code(code)  # persists in scrollback (highlighted)
+            self.transcript.print_code(code, lang="bash")  # persists in scrollback (highlighted)
         # The "Run this code?" prompt renders in the ephemeral approval pane
         # (see _approval_fragments), so it collapses on answer instead of
         # leaving a log line behind.
@@ -447,13 +443,14 @@ class ReplApp:
         low = stripped.lower()
         if stripped == "" or low in ("y", "yes"):
             decision: object = True
-        elif low in ("a", "all", "approve all"):
-            decision = "__auto_approve__"
-        elif low in ("n", "no", "skip"):
+        elif low in ("s", "session"):
+            decision = "__session__"
+        elif low in ("a", "always"):
+            decision = "__always__"
+        elif low in ("n", "no", "deny"):
             decision = False
         else:
             decision = text
-            self.emitter.emit(UserMessage(text))  # echo feedback so it isn't lost
         resolver = self._approval_resolve
         self._approval_resolve = None
         self._invalidate()
@@ -520,8 +517,6 @@ class ReplApp:
     async def _run_modal(self) -> None:
         modal = self._pending_modal
         self._pending_modal = None
-        if modal is None:
-            return
         with self._held_lock:
             self._in_modal = True
         try:

@@ -26,7 +26,7 @@ class JobRegistry:
         """Record a starting job (term, launched agent, /bg task) and emit
         ``JobStarted``. ``kind`` defaults to the task_id prefix so ``/jobs``
         renders the right column without each call site threading it through."""
-        prefix = kind or (task_id.split("-", 1)[0] if "-" in task_id else "task")
+        prefix = kind or task_id.split("-", 1)[0]
         self.entries[task_id] = {
             "kind": prefix,
             "label": label,
@@ -50,7 +50,6 @@ class JobRegistry:
         bg_id: str,
         error: str | None = None,
         output: str | None = None,
-        new_artifacts: int = 0,
         produced_artifacts: list | None = None,
     ) -> None:
         """Emit ``JobFinished`` for a completed background job (term
@@ -63,7 +62,6 @@ class JobRegistry:
                 status="error" if error else "ok",
                 error=error,
                 output=output,
-                new_artifacts=new_artifacts,
                 artifact_refs=refs,
             )
         )
@@ -84,6 +82,17 @@ def job_notice(ev: JobFinished) -> str:
     return term_notice(ev)
 
 
+def _produced_block(ev: JobFinished) -> str:
+    """The job's artifacts as an indented list, or ``(none)``."""
+    asset_lines: list[str] = []
+    for ref_info in ev.artifact_refs:
+        ref = ref_info.get("path") or ref_info.get("url") or ""
+        kind = ref_info.get("artifact_type") or "artifact"
+        if ref:
+            asset_lines.append(f"  - {kind}: {ref}")
+    return "\n".join(asset_lines) if asset_lines else "  (none)"
+
+
 def term_notice(ev: JobFinished) -> str:
     """The message for a finished background shell job (term-N). Names the
     *specific* assets it produced so the agent doesn't grab unrelated older
@@ -101,13 +110,7 @@ def term_notice(ev: JobFinished) -> str:
             "user and ask before retrying."
         )
 
-    asset_lines: list[str] = []
-    for ref_info in ev.artifact_refs:
-        ref = ref_info.get("path") or ref_info.get("url") or ""
-        kind = ref_info.get("artifact_type") or "artifact"
-        if ref:
-            asset_lines.append(f"  - {kind}: {ref}")
-    produced_block = "\n".join(asset_lines) if asset_lines else "  (none)"
+    produced_block = _produced_block(ev)
     return (
         f"[system] Background task {ev.job_id} completed.{output}\n\n"
         f"Assets produced by THIS task:\n{produced_block}\n\n"
@@ -134,13 +137,7 @@ def agent_notice(ev: JobFinished) -> str:
     if ev.error:
         return f"[system] Background agent {ev.job_id} failed before it finished:\n{ev.error}"
 
-    asset_lines: list[str] = []
-    for ref_info in ev.artifact_refs:
-        ref = ref_info.get("path") or ref_info.get("url") or ""
-        kind = ref_info.get("artifact_type") or "artifact"
-        if ref:
-            asset_lines.append(f"  - {kind}: {ref}")
-    produced_block = "\n".join(asset_lines) if asset_lines else "  (none)"
+    produced_block = _produced_block(ev)
 
     if ev.output:
         closing = f"Its closing message:\n{ev.output}"

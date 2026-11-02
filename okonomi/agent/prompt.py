@@ -38,29 +38,14 @@ def _build_skills_index(skills) -> str:
     return "\n".join(lines)
 
 
-def _build_storage_paths() -> dict[str, str]:
-    """Resolve the storage directories the agent should know about.
-
-    Honors $OKONOMI_HOME (via ``okonomi.config``). The model reads
-    these paths, so they must reflect the user's actual filesystem
-    layout — not the documented defaults.
-    """
-    return {
-        "sessions": str(OKONOMI_SESSIONS_DIR),
-        "mind": str(OKONOMI_MIND_DIR),
-        "skills": str(OKONOMI_SKILLS_DIR),
-    }
-
-
 def build_system_prompt(*, skills) -> str:
     """Build the full system prompt for the agent."""
     skills_index = _build_skills_index(skills)
-    paths = _build_storage_paths()
-    # f-string can't subscript with bare keys (`{paths[sessions]}` is
-    # a NameError), so bind each path to its own local.
-    sessions_dir = paths["sessions"]
-    mind_dir = paths["mind"]
-    skills_dir = paths["skills"]
+    # The model reads these paths, so they must reflect $OKONOMI_HOME,
+    # not the documented defaults.
+    sessions_dir = OKONOMI_SESSIONS_DIR
+    mind_dir = OKONOMI_MIND_DIR
+    skills_dir = OKONOMI_SKILLS_DIR
     subagent_model_ids = subagent_models()
     if subagent_model_ids:
         subagent_models_note = (

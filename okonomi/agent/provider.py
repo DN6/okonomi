@@ -1,11 +1,10 @@
 """Provider glue — builds the pydantic-ai model for the active provider.
 
 Each provider uses its stock pydantic-ai model class. Provider-specific
-SDKs (anthropic, huggingface_hub, openai) are imported lazily inside the
+SDKs (anthropic, openai) are imported lazily inside the
 matching branch so a user only needs the SDK for the provider they use.
 """
 
-import logging
 import os
 
 from pydantic_ai.models import Model
@@ -23,8 +22,6 @@ except Exception:
     pass
 
 
-logger = logging.getLogger(__name__)
-
 
 def build_model(provider: str, model_id: str, timeout: float) -> Model:
     """Construct the pydantic-ai model for ``provider``.
@@ -35,7 +32,7 @@ def build_model(provider: str, model_id: str, timeout: float) -> Model:
     if provider == "openrouter":
         # openrouter_usage={"include": True} makes OpenRouter return
         # usage.cost (actual USD spent) per response — pulled out in
-        # _accumulate_usage and persisted as actual_cost_usd.
+        # _accumulate_usage and persisted as cost_usd.
         return OpenRouterModel(
             model_id,
             settings=OpenRouterModelSettings(

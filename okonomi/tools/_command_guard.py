@@ -1,15 +1,19 @@
 """Command guard: hardline blocklist and dangerous-pattern detection.
 
-Hardline patterns are unconditionally blocked. Dangerous patterns are blocked
-by default and can be bypassed by setting OKONOMI_YOLO=1. Ported from
+Hardline patterns and the user's deny rules are unconditionally blocked.
+Dangerous patterns need the user's approval (prompted by the agent) unless
+approvals are off or the pattern is on the "always" allowlist. Ported from
 hermes-agent's tools/approval.py.
 """
 
 from __future__ import annotations
 
+import json
 import os
 import re
 import unicodedata
+
+from okonomi.config import OKONOMI_APPROVALS_FILE, approval_mode
 
 
 _ANSI_RE = re.compile(r"\x1b\[[0-?]*[ -/]*[@-~]|\x1b\][^\x07]*(?:\x07|\x1b\\)")
@@ -162,12 +166,52 @@ _SUDO_STDIN_RE = re.compile(
 )
 
 
-def _yolo_enabled() -> bool:
-    return os.environ.get("OKONOMI_YOLO", "").lower() in {"1", "true", "yes", "on"}
+def load_approval_rules() -> dict:
+    """``{"allow": set[str], "deny": list[re.Pattern]}`` from
+    ``$OKONOMI_HOME/approvals.json``. ``allow`` holds dangerous-pattern
+    descriptions the user approved "always"; ``deny`` holds regexes that
+    block a command unconditionally. Re-read on every check so edits apply
+    without a restart."""
+    if not OKONOMI_APPROVALS_FILE.exists():
+        return {"allow": set(), "deny": []}
+    data = json.loads(OKONOMI_APPROVALS_FILE.read_text())
+    if not isinstance(data, dict) or not all(isinstance(data.get(k, []), list) for k in ("allow", "deny")):
+        raise ValueError(
+            f"{OKONOMI_APPROVALS_FILE} must be an object like "
+            '{"allow": ["recursive delete"], "deny": ["\\\\bgit\\\\s+push\\\\b"]}, got: ' + repr(data)
+        )
+    deny = []
+    for pattern in data.get("deny", []):
+        try:
+            deny.append(re.compile(pattern, _RE_FLAGS))
+        except (re.error, TypeError) as e:
+            raise ValueError(f"Invalid deny regex {pattern!r} in {OKONOMI_APPROVALS_FILE}: {e}") from e
+    return {"allow": set(data.get("allow", [])), "deny": deny}
 
 
-def check_command(command: str) -> tuple[bool, str | None]:
-    """Return (allowed, reason). When not allowed, reason describes the block."""
+def approve_always(keys: list[str]) -> None:
+    """Add dangerous-pattern descriptions to the persistent allowlist."""
+    data = json.loads(OKONOMI_APPROVALS_FILE.read_text()) if OKONOMI_APPROVALS_FILE.exists() else {}
+    data["allow"] = sorted(set(data.get("allow", [])) | set(keys))
+    data.setdefault("deny", [])
+    OKONOMI_APPROVALS_FILE.parent.mkdir(parents=True, exist_ok=True)
+    OKONOMI_APPROVALS_FILE.write_text(json.dumps(data, indent=2) + "\n")
+
+
+def dangerous_matches(command: str) -> list[str]:
+    """Descriptions of every dangerous pattern ``command`` matches. These
+    are also the keys the allowlist stores."""
+    normalized = _normalize(command).lower()
+    return [description for pattern_re, description in _DANGEROUS_COMPILED if pattern_re.search(normalized)]
+
+
+def check_command(command: str, approved: bool = False) -> tuple[bool, str | None]:
+    """Return (allowed, reason). When not allowed, reason describes the block.
+
+    Hardline patterns, ``sudo -S`` and deny rules always block. Dangerous
+    patterns block unless ``approved`` (the user answered a prompt),
+    approvals are off, or every match is on the "always" allowlist.
+    """
     normalized = _normalize(command).lower()
 
     for pattern_re, description in _HARDLINE_COMPILED:
@@ -176,7 +220,7 @@ def check_command(command: str) -> tuple[bool, str | None]:
                 False,
                 f"BLOCKED (hardline): {description}. "
                 "This command is on the unconditional blocklist and cannot "
-                "be executed via okonomi, even with OKONOMI_YOLO. Run it "
+                "be executed via okonomi, even with OKONOMI_APPROVALS=off. Run it "
                 "yourself in a terminal outside the agent if you genuinely "
                 "need to.",
             )
@@ -189,16 +233,25 @@ def check_command(command: str) -> tuple[bool, str | None]:
             "manually in your own terminal.",
         )
 
-    if _yolo_enabled():
-        return (True, None)
-
-    for pattern_re, description in _DANGEROUS_COMPILED:
+    rules = load_approval_rules()
+    for pattern_re in rules["deny"]:
         if pattern_re.search(normalized):
             return (
                 False,
-                f"BLOCKED (dangerous): {description}. "
-                "Set OKONOMI_YOLO=1 to bypass this check, or run the "
-                "command manually in your own terminal.",
+                f"BLOCKED (deny rule {pattern_re.pattern!r} in {OKONOMI_APPROVALS_FILE}). "
+                "The user has forbidden this command. Do not retry or rephrase it.",
             )
+
+    if approved or approval_mode() == "off":
+        return (True, None)
+
+    pending = [key for key in dangerous_matches(command) if key not in rules["allow"]]
+    if pending:
+        return (
+            False,
+            f"BLOCKED (needs approval): {', '.join(pending)}. "
+            "No one is available to approve this command. Ask the user to run it "
+            "themselves, or to set OKONOMI_APPROVALS=off.",
+        )
 
     return (True, None)

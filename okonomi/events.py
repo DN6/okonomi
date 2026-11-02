@@ -7,7 +7,7 @@ Two related things live here:
    conversation types carry whole pydantic-ai messages as payloads
    (classified by ``classify_message``, indexed via ``extract_content``);
    the rest serialize the typed objects below (``SystemNote``, ``Title``,
-   ``Interrupt``) through ``event_to_payload``/``event_from_payload``.
+   ``Interrupt``) through ``event_to_payload``.
 
 2. **Live-rendering events** the agent emits through ``EventEmitter``
    for the TUI to draw (``TurnStart``/``TurnEnd``, ``AssistantStream``,
@@ -144,12 +144,6 @@ def _next_id() -> str:
         return f"evt-{next(_id_counter)}"
 
 
-# type tag → Event subclass, auto-populated by Event.__init_subclass__.
-# The wire-format contract: a frame is {"type": ev.type, "id": ev.id,
-# "payload": event_to_payload(ev)} and rebuilds via event_from_payload.
-EVENT_REGISTRY: dict[str, type["Event"]] = {}
-
-
 @dataclass
 class Event:
     """Base event. All events carry a unique id for addressing and a
@@ -159,12 +153,6 @@ class Event:
 
     type: ClassVar[str] = "event"
     id: str = field(default_factory=_next_id, kw_only=True)
-
-    def __init_subclass__(cls, **kwargs: Any) -> None:
-        super().__init_subclass__(**kwargs)
-        tag = cls.__dict__.get("type")
-        if isinstance(tag, str):
-            EVENT_REGISTRY[tag] = cls
 
 
 @dataclass
@@ -219,7 +207,6 @@ class ToolCallDisplay(Event):
     args: str = ""
     details: str = ""
     output: str = ""
-    expanded: bool = False
     status: str = "running"  # running | ok | error
     tool_call_id: str = ""
 
@@ -265,12 +252,13 @@ class Interrupt(Event):
 
 @dataclass
 class ApprovalRequest(Event):
-    """The agent wants permission to run expensive code and has suspended
-    until someone answers via ``respond``:
+    """The agent wants permission to run a dangerous command and has
+    suspended until someone answers via ``respond``:
 
-    - ``True`` — run it
-    - ``False`` — skip
-    - ``"__auto_approve__"`` — run it and stop asking this turn
+    - ``True`` — run it once
+    - ``"__session__"`` — run it and approve ``reason``'s patterns for this session
+    - ``"__always__"`` — run it and add the patterns to ``approvals.json``
+    - ``False`` — deny
     - any other ``str`` — feedback sent back to the model instead of running
 
     ``respond`` is an in-process resolve handle (thread-safe, one-shot;
@@ -281,6 +269,7 @@ class ApprovalRequest(Event):
     type: ClassVar[str] = "approval_request"
 
     code: str = ""
+    reason: str = ""
     respond: Callable[[bool | str], None] | None = field(default=None, repr=False, compare=False)
 
 
@@ -320,19 +309,8 @@ class JobFinished(Event):
     status: str = "ok"  # ok | error
     error: str | None = None
     output: str | None = None
-    new_artifacts: int = 0
     # Lean refs of artifacts this job produced: {artifact_type, path, url}
     artifact_refs: list[dict[str, str]] = field(default_factory=list)
-
-
-# Event classes whose instances persist to the events table, keyed by the
-# EventType they row as. Conversation types are absent on purpose — their
-# payloads are pydantic-ai messages, not these objects.
-PERSISTABLE_EVENTS: dict[EventType, type[Event]] = {
-    EventType.SYSTEM_NOTE: SystemNote,
-    EventType.TITLE: Title,
-    EventType.INTERRUPT: Interrupt,
-}
 
 
 def event_to_payload(event: Event) -> dict[str, Any]:
@@ -343,12 +321,6 @@ def event_to_payload(event: Event) -> dict[str, Any]:
     data = asdict(event)
     data.pop("id", None)
     return {k: v for k, v in data.items() if not callable(v)}
-
-
-def event_from_payload(event_type: str, payload: dict[str, Any]) -> Event:
-    """Rebuild an event object from its type tag + payload dict."""
-    cls = EVENT_REGISTRY[str(event_type)]
-    return cls(**payload)
 
 
 class EventEmitter:

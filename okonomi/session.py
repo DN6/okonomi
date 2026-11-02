@@ -32,8 +32,6 @@ if TYPE_CHECKING:
     from .agent.agent import OkonomiState
 
 
-SessionStatus = Literal["in_progress", "completed", "interrupted", "error", "abandoned"]
-
 from . import db
 from .config import OKONOMI_MIND_DIR, OKONOMI_SESSIONS_DIR
 from .events import (
@@ -45,6 +43,9 @@ from .events import (
     extract_content,
     message_accounting,
 )
+
+
+SessionStatus = Literal["in_progress", "completed", "interrupted", "error", "abandoned"]
 
 
 @dataclass
@@ -151,8 +152,8 @@ class Session:
     :class:`TokenTracker`, flattened to columns only at the DB boundary),
     and the conversation body as an attached :class:`OkonomiState`.
     ``save`` persists the metadata plus ``state``'s persistent fields;
-    reads via :meth:`load` / :meth:`_from_row` return metadata with an
-    empty state — callers populate it with ``load_messages`` /
+    reads via :meth:`load` / :meth:`_from_row` return metadata with
+    ``state=None`` — callers populate it with ``load_messages`` /
     ``load_artifacts`` when they need the body.
 
     ``title`` is display-only and owned by the title path (the
@@ -232,12 +233,6 @@ class Session:
     def display_name(self) -> str:
         return self.title or (self.task_input[:60] if self.task_input else self.session_id[:8])
 
-    def record_usage(self, **kwargs: Any) -> None:
-        """Accumulate one request's token + cost usage. Delegates to the
-        embedded :class:`TokenTracker`; see ``TokenTracker.add`` for the
-        accepted keyword arguments."""
-        self.tokens.add(**kwargs)
-
     def metadata_dict(self) -> dict[str, Any]:
         """Flat, column-shaped dict for the sessions table (tokens unpacked)."""
         t = self.tokens
@@ -312,17 +307,12 @@ class Session:
         with db.transaction(conn):
             return db.deactivate_events(conn, self.session_id)
 
-    def load_messages(self, *, around_event_id: int | None = None, window: int = 5) -> list[Any]:
+    def load_messages(self) -> list[Any]:
         """The active conversation, rebuilt from event rows through the
-        pydantic-ai adapter. With ``around_event_id``, only the ±``window``
-        slice — for quoting a past moment without loading the transcript."""
+        pydantic-ai adapter."""
         from pydantic_ai.messages import ModelMessagesTypeAdapter
 
-        conn = db.connection()
-        if around_event_id is not None:
-            rows = db.fetch_events_window(conn, self.session_id, around_event_id, window, types=CONVERSATION_TYPES)
-        else:
-            rows = db.fetch_events(conn, self.session_id, types=CONVERSATION_TYPES)
+        rows = db.fetch_events(db.connection(), self.session_id, types=CONVERSATION_TYPES)
         try:
             raw = [json.loads(r["payload"]) for r in rows]
             return list(ModelMessagesTypeAdapter.validate_python(raw))
@@ -332,12 +322,7 @@ class Session:
     def load_artifacts(self) -> list[Artifact]:
         return [Artifact.from_dict(r) for r in db.fetch_artifacts(db.connection(), self.session_id)]
 
-    def artifact_id(self, *, url: str = "", path: str = "") -> int | None:
-        """Row id of this session's artifact matching ``url`` or ``path``,
-        or None if not yet indexed."""
-        return db.find_artifact_id(db.connection(), self.session_id, url=url, path=path)
-
-    # ── title / delete ───────────────────────────────────────────────────
+    # ── title ───────────────────────────────────────────────────
 
     def set_title(self, title: str) -> bool:
         """Set the display title (never touches the session folder) and
@@ -351,16 +336,6 @@ class Session:
             db.update_session_title(conn, self.session_id, title)
             db.append_events(conn, self.session_id, [_event_row(Title(title))])
         self.title = title
-        return True
-
-    def delete(self) -> bool:
-        conn = db.connection()
-        row = db.fetch_session(conn, self.session_id)
-        if row is None and not self.session_dir.exists():
-            return False
-        shutil.rmtree(self.session_dir, ignore_errors=True)
-        with db.transaction(conn):
-            db.delete_session(conn, self.session_id)
         return True
 
 
@@ -406,8 +381,8 @@ def _event_row(event: Event) -> dict[str, Any]:
 # ── cross-session reads ──────────────────────────────────────────────────
 
 
-def list_sessions(*, limit: int | None = None, status: str | None = None) -> list[Session]:
-    rows = db.list_sessions(db.connection(), status=status, limit=limit)
+def list_sessions(*, limit: int | None = None) -> list[Session]:
+    rows = db.list_sessions(db.connection(), limit=limit)
     return [Session._from_row(r) for r in rows]
 
 
@@ -417,8 +392,8 @@ def search_sessions(query: str, *, limit: int = 50) -> list[dict[str, Any]]:
     return db.search_sessions_fts(db.connection(), query, limit=limit)
 
 
-def search_artifacts(query: str, *, artifact_type: str | None = None, limit: int = 50) -> list[dict[str, Any]]:
-    return db.search_artifacts_fts(db.connection(), query, artifact_type=artifact_type, limit=limit)
+def search_artifacts(query: str, *, limit: int = 50) -> list[dict[str, Any]]:
+    return db.search_artifacts_fts(db.connection(), query, limit=limit)
 
 
 def search_events(
@@ -599,13 +574,12 @@ def prune_empty_sessions(*, min_age_hours: int = 24) -> int:
 # ── favorites ────────────────────────────────────────────────────────────
 
 
-def favorite(*, artifact_id: int | None = None, url: str = "", artifact_type: str = "") -> int:
-    """Favorite an asset — internal (``artifact_id``) or external (``url``,
-    which accepts URLs or bare local paths). Idempotent; returns the
-    favorite row id."""
+def favorite(*, url: str, artifact_type: str = "") -> int:
+    """Favorite an asset by ``url``, which accepts URLs or bare local paths.
+    Idempotent; returns the favorite row id."""
     conn = db.connection()
     with db.transaction(conn):
-        return db.add_favorite(conn, artifact_id=artifact_id, url=url, artifact_type=artifact_type)
+        return db.add_favorite(conn, url=url, artifact_type=artifact_type)
 
 
 def unfavorite(favorite_id: int) -> bool:
@@ -651,21 +625,11 @@ def favorite_hits(*, limit: int | None = None) -> list[dict[str, Any]]:
     return hits
 
 
-def list_favorites(
-    *,
-    artifact_type: str | None = None,
-    artifact_source: str | None = None,
-    limit: int | None = None,
-) -> list[dict[str, Any]]:
+def list_favorites(*, limit: int | None = None) -> list[dict[str, Any]]:
     """Newest-first favorites joined with artifact + session context.
 
     Returns plain dicts (not Artifact) since each row carries
     cross-session fields (``session_id``, ``session_title``,
     ``favorited_at``) that don't fit the Artifact dataclass.
     """
-    return db.list_favorites(
-        db.connection(),
-        artifact_type=artifact_type,
-        artifact_source=artifact_source,
-        limit=limit,
-    )
+    return db.list_favorites(db.connection(), limit=limit)

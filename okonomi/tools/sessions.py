@@ -15,12 +15,9 @@ import re
 from datetime import date
 
 from okonomi import session as _session
-from okonomi.tools._metadata import ToolMetadataMixin
 
 
-class SessionsTools(ToolMetadataMixin):
-    __namespace__ = "sessions"
-    __description__ = "Search and recall past work and the mind wiki; remember things into the mind wiki."
+class SessionsTools:
 
     def recall(
         self,

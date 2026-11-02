@@ -12,7 +12,6 @@ Supports conditional activation via frontmatter metadata:
       platforms: [macos, linux]        # restrict to specific OS platforms
 """
 
-import logging
 import os
 import re
 import shutil
@@ -24,10 +23,7 @@ import httpx
 import yaml
 
 from okonomi.config import OKONOMI_SKILLS_DIR
-from okonomi.tools._metadata import ToolMetadataMixin
 
-
-logger = logging.getLogger(__name__)
 
 BUNDLED_SKILLS_DIR = Path(__file__).parent.parent / "skills"
 USER_SKILLS_DIR = OKONOMI_SKILLS_DIR
@@ -461,11 +457,9 @@ def install_skill_from_github(spec: str) -> dict:
     return {"success": True, "name": metadata.get("name") or folder, "path": str(dest)}
 
 
-class SkillTools(ToolMetadataMixin):
+class SkillTools:
     """Tools for discovering, loading, and managing workflow skills."""
 
-    __namespace__ = "skills"
-    __description__ = "Tools for discovering, loading, and managing workflow skills"
 
     def __init__(self, available_tools: set[str] | None = None):
         self._available_tools = available_tools
@@ -503,8 +497,8 @@ class SkillTools(ToolMetadataMixin):
         }
 
     def _load_full(self, name: str) -> dict:
-        """Internal: full SKILL.md body. Used by core-skill inlining and
-        slash-command paths that legitimately need every line."""
+        """Internal: full SKILL.md body, for the slash-command paths that
+        legitimately need every line."""
         skills = self._get_skills()
         if name not in skills:
             return {
@@ -690,7 +684,6 @@ class SkillTools(ToolMetadataMixin):
             }
 
         skill_dir = USER_SKILLS_DIR / category / name if category else USER_SKILLS_DIR / name
-        skill_dir.mkdir(parents=True, exist_ok=True)
         _atomic_write(skill_dir / "SKILL.md", content)
 
         self._invalidate_cache()

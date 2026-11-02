@@ -1,4 +1,4 @@
-"""On-demand full-screen pickers for the REPL (session + asset + tree).
+"""On-demand full-screen pickers for the REPL (find, asset, tree, history, jobs).
 
 Each is a transient ``prompt_toolkit`` ``Application`` run on the alternate
 screen and awaited; selecting exits with the chosen value, Esc / Ctrl-C exit
@@ -7,7 +7,7 @@ scroll + copy are unaffected once the picker closes.
 
 The find picker (also ``/session``, as a scoped view) focuses a
 live search buffer backed by ``session.search``. The asset picker has
-single-letter action verbs (o/c/h/a/x) that would collide with a focused text
+single-letter action verbs (a/x/o/c/f/v) that would collide with a focused text
 buffer, so it omits live search for now and navigates with the arrow keys.
 """
 
@@ -305,7 +305,10 @@ def _tree_rows(events: list[dict]) -> list[dict]:
     while stack:
         eid, guide, cont, heads = stack.pop()
         e = by_id[eid]
-        if e["type"] == EventType.USER_MESSAGE.value:
+        if e["type"] in (EventType.USER_MESSAGE.value, EventType.ASSISTANT_MESSAGE.value):
+            # A user row re-submits from its parent with the prompt prefilled;
+            # an assistant row continues from itself.
+            is_user = e["type"] == EventType.USER_MESSAGE.value
             rows.append({
                 "event_id": eid,
                 "type": e["type"],
@@ -315,21 +318,8 @@ def _tree_rows(events: list[dict]) -> list[dict]:
                 "preview": (e["content"] or "").splitlines()[0] if e["content"] else "(empty)",
                 "active": bool(e["active"]),
                 "is_current": eid == current_id,
-                "checkout_target": e["parent_id"],
-                "prefill": _prompt_text(e["payload"]),
-            })
-        elif e["type"] == EventType.ASSISTANT_MESSAGE.value:
-            rows.append({
-                "event_id": eid,
-                "type": e["type"],
-                "guide": guide,
-                "branch": guide != cont,
-                "heads": heads,
-                "preview": (e["content"] or "").splitlines()[0] if e["content"] else "(empty)",
-                "active": bool(e["active"]),
-                "is_current": eid == current_id,
-                "checkout_target": eid,
-                "prefill": "",
+                "checkout_target": e["parent_id"] if is_user else eid,
+                "prefill": _prompt_text(e["payload"]) if is_user else "",
             })
         kids = children.get(eid, [])
         if guide != cont:
@@ -344,15 +334,16 @@ def _tree_rows(events: list[dict]) -> list[dict]:
     return rows
 
 
-def _abandoned_count(events: list[dict], parents: dict, conv_types: set, target: int | None) -> int:
+def _abandoned(events: list[dict], parents: dict, conv_types: set, target: int | None) -> list[dict]:
     """Active conversation turns that a checkout to ``target`` would leave
-    off the active path. Shared by the tree navigator and history search."""
+    off the active path. Shared by the tree navigator, history search, and
+    the branch summary on checkout."""
     path: set[int] = set()
     node = target
     while node is not None:
         path.add(node)
         node = parents.get(node)
-    return sum(1 for e in events if e["active"] and e["type"] in conv_types and e["event_id"] not in path)
+    return [e for e in events if e["active"] and e["type"] in conv_types and e["event_id"] not in path]
 
 
 async def pick_tree(session_id: str) -> tuple[int | None, str, bool] | None:
@@ -461,7 +452,7 @@ async def pick_tree(session_id: str) -> tuple[int | None, str, bool] | None:
             e.app.exit(result=None)
             return
         r = rows[state["idx"]]
-        if _abandoned_count(events, parents, conv_types, r["checkout_target"]):
+        if _abandoned(events, parents, conv_types, r["checkout_target"]):
             state["confirm"] = True
         else:
             e.app.exit(result=(r["checkout_target"], r["prefill"], False))
@@ -680,7 +671,7 @@ async def pick_history(session_id: str) -> tuple[int | None, str, bool] | None:
             e.app.exit(result=None)
             return
         r = rows[state["idx"]]
-        if _abandoned_count(events, parents, conv_types, r["checkout_target"]):
+        if _abandoned(events, parents, conv_types, r["checkout_target"]):
             state["confirm"] = True
         else:
             e.app.exit(result=(r["checkout_target"], r["prefill"], False))

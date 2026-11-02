@@ -18,9 +18,8 @@ from typing import Any
 
 from okonomi.config import OKONOMI_HOME
 from okonomi.tools._command_guard import check_command
-from okonomi.tools._metadata import ToolMetadataMixin
 from okonomi.tools._sandbox import wrap_command
-from okonomi.utils import redact_secrets, scrub_env
+from okonomi.utils import read_env_file, redact_secrets, scrub_env
 
 
 MAX_OUTPUT_CHARS = 50_000
@@ -81,16 +80,14 @@ def _drain_pipe(pipe, chunks: list) -> None:
 _MATCH_RE = re.compile(r"^([A-Za-z]:)?(.*?):(\d+):(.*)$")
 
 
-class TerminalTools(ToolMetadataMixin):
+class TerminalTools:
     """Tools for executing shell commands on the local machine."""
 
-    __namespace__ = "terminal"
-    __description__ = "Execute shell commands locally with timeout and output capture"
 
-    def __init__(self, interrupt_event: threading.Event | None = None):
+    def __init__(self):
         self._cwd = os.getcwd()
         self._bash = _find_bash()
-        self._interrupt = interrupt_event or threading.Event()
+        self._interrupt = threading.Event()
         self._has_rg = shutil.which("rg") is not None
         self._on_bg_complete: Any | None = None
         # Hook called when a background job (term-N) starts. Receives
@@ -105,12 +102,13 @@ class TerminalTools(ToolMetadataMixin):
         # exported to children as $OKONOMI_SESSION_DIR. Set by the agent.
         self._session_dir_fn: Any | None = None
 
-    def interrupt(self) -> None:
+    def _kill_foreground(self) -> None:
         """Kill the foreground command, if one is running (Ctrl+C)."""
         self._interrupt.set()
 
     def _make_env(self) -> dict:
         env = scrub_env(os.environ)
+        env.update(read_env_file())
         env["OKONOMI_HOME"] = str(OKONOMI_HOME)
         if self._session_dir_fn is not None:
             try:
@@ -129,6 +127,7 @@ class TerminalTools(ToolMetadataMixin):
         background: bool = False,
         _chunks_sink: list | None = None,
         _kill: threading.Event | None = None,
+        _approved: bool = False,
     ) -> dict:
         """Execute a shell command and return its output.
 
@@ -152,7 +151,7 @@ class TerminalTools(ToolMetadataMixin):
             Sync mode: dict with 'output' (str), 'exit_code' (int), and 'cwd' (str).
             Background mode: dict with 'task_id' (str) and 'message' (str).
         """
-        allowed, reason = check_command(command)
+        allowed, reason = check_command(command, approved=_approved)
         if not allowed:
             return {
                 "output": reason,
@@ -161,7 +160,7 @@ class TerminalTools(ToolMetadataMixin):
             }
 
         if background:
-            return self._bash_background(command, workdir)
+            return self._bash_background(command, workdir, _approved)
 
         if workdir:
             cwd = str(Path(workdir).expanduser().resolve())
@@ -256,11 +255,11 @@ class TerminalTools(ToolMetadataMixin):
             "cwd": self._cwd,
         }
 
-    def _bash_background(self, command: str, workdir: str | None) -> dict:
+    def _bash_background(self, command: str, workdir: str | None, approved: bool) -> dict:
         """Spawn a command in a thread and notify on completion.
 
         Returns immediately. The thread runs the same code path as a
-        synchronous ``run()`` (capturing output, exit code, cwd update)
+        synchronous ``bash()`` (capturing output, exit code, cwd update)
         and fires ``self._on_bg_complete`` when done (the agent wires it
         to emit a ``JobFinished`` event; subscribers react from there).
         """
@@ -285,7 +284,7 @@ class TerminalTools(ToolMetadataMixin):
                 pass
 
         def _worker() -> None:
-            result = self.bash(command, timeout=3600, workdir=workdir, _chunks_sink=chunks)
+            result = self.bash(command, timeout=3600, workdir=workdir, _chunks_sink=chunks, _approved=approved)
             output = result.get("output", "")
             exit_code = result.get("exit_code", 0)
             error = None if exit_code == 0 else f"exit_code={exit_code}"
@@ -300,7 +299,6 @@ class TerminalTools(ToolMetadataMixin):
                         bg_id=task_id,
                         error=error,
                         output=output,
-                        new_artifacts=0,
                         produced_artifacts=[],
                     )
                 except Exception:
@@ -467,7 +465,7 @@ class TerminalTools(ToolMetadataMixin):
         try:
             pgid = os.getpgid(proc.pid)
             os.killpg(pgid, signal.SIGTERM)
-        except (OSError, ProcessLookupError):
+        except OSError:
             pass
         try:
             proc.wait(timeout=3)
@@ -475,6 +473,6 @@ class TerminalTools(ToolMetadataMixin):
             try:
                 pgid = os.getpgid(proc.pid)
                 os.killpg(pgid, signal.SIGKILL)
-            except (OSError, ProcessLookupError):
+            except OSError:
                 pass
             proc.wait(timeout=2)
