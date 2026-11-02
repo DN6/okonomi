@@ -72,22 +72,8 @@ def _command(name: str, description: str) -> Callable[[Handler], Handler]:
     return register
 
 
-# Names + descriptions for the slash completer, derived from the registry so
-# there's nothing to keep in sync. Populated after the handlers below register.
-SLASH_COMMANDS: list[tuple[str, str]] = []
-
-
 def is_slash_command(text: str) -> bool:
     return text.startswith("/") and len(text) > 1
-
-
-def _discovered_skills() -> dict[str, dict]:
-    """All discoverable skills (user + bundled), name → metadata. Empty on
-    any discovery error so slash dispatch/completion degrade gracefully."""
-    try:
-        return _discover_skills([USER_SKILLS_DIR, BUNDLED_SKILLS_DIR])
-    except Exception:
-        return {}
 
 
 def _skill_commands() -> list[tuple[str, str, str]]:
@@ -97,9 +83,14 @@ def _skill_commands() -> list[tuple[str, str, str]]:
     (skill names may contain spaces, so the name part is slugged);
     ``real_name`` is what ``load_skill`` expects. Built-in commands win on a
     slug clash, and the first skill wins on slug collisions between skills."""
+    # Empty on any discovery error so slash dispatch/completion degrade gracefully.
+    try:
+        skills = _discover_skills([USER_SKILLS_DIR, BUNDLED_SKILLS_DIR])
+    except Exception:
+        skills = {}
     out: list[tuple[str, str, str]] = []
     seen: set[str] = set()
-    for name, info in _discovered_skills().items():
+    for name, info in skills.items():
         prefix = "user" if info.get("source") == "user" else "okonomi"
         slug = f"{prefix}:{_slugify_heading(name)}"
         if f"/{slug}" in COMMANDS or slug in seen:
@@ -468,4 +459,6 @@ def _exit(arg: str, agent: "OkonomiAgent", emitter: EventEmitter) -> "CommandRes
     return CommandResult(Action.EXIT)
 
 
+# Names + descriptions for the slash completer, derived from the registry so
+# there's nothing to keep in sync.
 SLASH_COMMANDS = [(c.name, c.description) for c in COMMANDS.values()]

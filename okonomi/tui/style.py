@@ -11,11 +11,23 @@ from prompt_toolkit.styles import Style
 
 from .palette import (
     ACCENT as _ACCENT,
+)
+from .palette import (
     AMBER as _AMBER,
+)
+from .palette import (
     FAINT as _FAINT,
+)
+from .palette import (
     MUTED as _MUTED,
+)
+from .palette import (
     SURFACE as _SURFACE,
+)
+from .palette import (
     SURFACE_HI as _SURFACE_HI,
+)
+from .palette import (
     TEXT as _TEXT,
 )
 
@@ -24,7 +36,6 @@ REPL_STYLE = Style.from_dict(
     {
         "prompt": _ACCENT,
         "prompt.approval": f"{_AMBER} bold",
-        "rule": _MUTED,  # full-width delimiter above the input
         "frame.border": _MUTED,  # the input box
         # Inline tool-status pane (above the input box).
         "tool.glyph": _ACCENT,
@@ -46,8 +57,7 @@ REPL_STYLE = Style.from_dict(
         "completion-menu.completion.current": f"bg:{_SURFACE_HI} {_ACCENT} bold",
         "completion-menu.meta.completion": f"bg:{_SURFACE} {_MUTED}",
         "completion-menu.meta.completion.current": f"bg:{_SURFACE_HI} {_ACCENT}",
-        # Picker rows (session / asset modals) — these were referenced but
-        # never defined, so the selected row had no highlight.
+        # Picker rows (session / asset modals).
         "picker-highlight": f"bg:{_SURFACE_HI} {_ACCENT} bold",
         # Session-tree role tags: who wrote the row.
         "tree.user": f"{_ACCENT} bold",

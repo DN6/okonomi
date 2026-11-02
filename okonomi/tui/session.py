@@ -30,12 +30,13 @@ class TuiSession:
 
     def __init__(self, agent: OkonomiAgent) -> None:
         self.agent = agent
+        self.agent.can_prompt = True
         self.emitter = agent.emitter
 
         # Persistent worker loop on its own thread. Turns are submitted
-        # via run_coroutine_threadsafe, serialized through an asyncio
-        # queue consumed by _worker_loop. Cancellation flips a flag
-        # on self._current_task via the same loop.
+        # via call_soon_threadsafe, serialized through an asyncio
+        # queue consumed by _worker_loop. Cancellation cancels the
+        # running turn's task on the same loop.
         self._loop = asyncio.new_event_loop()
         self._agent_thread = threading.Thread(target=self._loop.run_forever, daemon=True, name="okonomi-agent")
         self._agent_thread.start()
@@ -77,8 +78,7 @@ class TuiSession:
         self._quiet = False
         self._held_notices: list[str] = []
 
-        # Background full-agent tasks (/bg). Keyed by bg-N id.
-        self._bg_tasks: dict[str, threading.Thread] = {}
+        # Background full-agent tasks (/bg) are numbered bg-N.
         self._bg_counter = 0
 
         # The prompt_toolkit streaming-scrollback REPL front-end. Prints the
@@ -176,24 +176,16 @@ class TuiSession:
         self._app.prefill_input(draft)
         self.emitter.emit(SystemNote("Your unsent message is back in the input box — Enter to send it."))
 
-    def _safe_save_session(
-        self,
-        *,
-        status: SessionStatus,
-        download_assets: bool = False,
-    ) -> None:
+    def _safe_save_session(self, *, status: SessionStatus) -> None:
         """Save the session swallowing any exception.
 
         Called from multiple places (per-turn finally, app exit, atexit)
         so it must never raise — a save error must not crash the session.
-        ``download_assets`` defaults to False because the agent's eager
-        background download pool keeps assets up to date independently.
+        Assets aren't downloaded here: the agent's eager background
+        download pool keeps them up to date independently.
         """
         try:
-            self.agent.save_session(
-                status=status,
-                download_assets=download_assets,
-            )
+            self.agent.save_session(status=status, download_assets=False)
         except Exception:  # noqa: BLE001
             pass
 
@@ -212,7 +204,7 @@ class TuiSession:
                 # Cancelling the task abandons the executor thread running
                 # a sync tool; the subprocess would otherwise live on until
                 # its own timeout.
-                self.agent.terminal.interrupt()
+                self.agent.terminal._kill_foreground()
 
         self._loop.call_soon_threadsafe(_do_cancel)
 
@@ -338,8 +330,7 @@ class TuiSession:
     def _spawn_bg_task(self, task_input: str) -> None:
         """Run a task in the background with a separate OkonomiAgent.
 
-        Mirrors the prompt_toolkit CLI's _run_bg_task. Outputs merge back
-        into the parent agent's session on completion.
+        Outputs merge back into the parent agent's session on completion.
         """
         self._bg_counter += 1
         task_id = f"bg-{self._bg_counter}"
@@ -378,6 +369,7 @@ class TuiSession:
             # job completions, and the note below surface to the user.
             bg_agent.emitter = EventEmitter()
             bg_agent.emitter.subscribe(_forward)
+            bg_agent.can_prompt = True
             parent.jobs.entries[task_id]["jobs"] = bg_agent.jobs
             try:
                 reply = asyncio.run(bg_agent.run_async(task_input, reset=True))
@@ -392,12 +384,9 @@ class TuiSession:
             finally:
                 progress["status"] = status
                 parent._mark_bg_log_done(task_id=task_id, status=status)
-                self._bg_tasks.pop(task_id, None)
 
         label = task_input[:50] + "…" if len(task_input) > 50 else task_input
-        thread = threading.Thread(target=_run, daemon=True, name=label)
-        self._bg_tasks[task_id] = thread
-        thread.start()
+        threading.Thread(target=_run, daemon=True, name=label).start()
 
     def _open_hit(self, action: str, hit: dict) -> None:
         """Callback from the find picker. Enter keeps you in okonomi: a
@@ -470,6 +459,7 @@ class TuiSession:
 
         from .. import db
         from ..events import CONVERSATION_TYPES
+        from .pickers import _abandoned
 
         session_id = self.agent.session.session_id
         conn = db.connection()
@@ -478,13 +468,8 @@ class TuiSession:
         if summarize:
             rows = db.fetch_events(conn, session_id, active_only=False)
             parents = {r["event_id"]: r["parent_id"] for r in rows}
-            path: set[int] = set()
-            node = target_event_id
-            while node is not None:
-                path.add(node)
-                node = parents.get(node)
             conv_types = {t.value for t in CONVERSATION_TYPES}
-            abandoned = [r for r in rows if r["active"] and r["type"] in conv_types and r["event_id"] not in path]
+            abandoned = _abandoned(rows, parents, conv_types, target_event_id)
             if abandoned:
                 self.emitter.emit(SystemNote("Summarizing abandoned branch…"))
                 try:
@@ -551,7 +536,7 @@ class TuiSession:
                 if nxt is not None:
                     self._show_approval(nxt)
 
-        self._app.call_from_thread(self._app.show_approval, request.code, _resolve)
+        self._app.call_from_thread(self._app.show_approval, request.code, request.reason, _resolve)
 
     def _on_job_finished(self, ev: JobFinished) -> None:
         """Hand the finished job's result to the agent (see ``_deliver_notice``)."""
@@ -578,16 +563,16 @@ class TuiSession:
             return ""
         return str(usage)
 
-    def _bg_tasks_list(self) -> list[tuple[str, str, str, str]]:
-        """(id, label, kind, elapsed) for running background jobs, read
+    def _bg_tasks_list(self) -> list[tuple[str, str, str]]:
+        """(id, label, elapsed) for running background jobs, read
         from the shared JobRegistry — covers term-N, launched
         agents, and /bg tasks in one place."""
         now = time.time()
-        out: list[tuple[str, str, str, str]] = []
+        out: list[tuple[str, str, str]] = []
         for job_id, job in list(self.agent.jobs.entries.items()):
             if job.get("status") != "running":
                 continue
-            out.append((job_id, job.get("label", ""), job.get("kind", ""), f"{now - job['started_at']:.0f}s"))
+            out.append((job_id, job.get("label", ""), f"{now - job['started_at']:.0f}s"))
         return out
 
     # --- Entry points ---
@@ -664,4 +649,4 @@ class TuiSession:
             self.agent._asset_dl_pool.shutdown(wait=False, cancel_futures=True)
         except Exception:  # noqa: BLE001
             pass
-        self._safe_save_session(status="completed", download_assets=False)
+        self._safe_save_session(status="completed")

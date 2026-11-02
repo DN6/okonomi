@@ -39,7 +39,10 @@ from ..events import (
 )
 from ..utils import format_elapsed
 from .events import Banner, Divider, UserMessage
-from .palette import ACCENT as _ACCENT, AMBER as _WARN, ERROR as _ERROR, MUTED as _RULE
+from .palette import ACCENT as _ACCENT
+from .palette import AMBER as _WARN
+from .palette import ERROR as _ERROR
+from .palette import MUTED as _RULE
 
 
 _ASSISTANT_STYLE = "color(110)"  # LLM gray
@@ -200,12 +203,9 @@ class ReplTranscript:
             head += f"  {detail}"
         self.console.print(Text(f"⏺ {head}", style=_ACCENT))
         if self.tool_detail == "full" and ev.details:
-            self._print_details(ev)
+            self.console.print(text_with_path_links(ev.details), style=_DIM)
         if ev.output:
             self._print_output(ev.output)
-
-    def _print_details(self, ev: ToolCallDisplay) -> None:
-        self.console.print(text_with_path_links(ev.details), style=_DIM)
 
     def _print_output(self, output: str, style: str = _DIM) -> None:
         # Tree-branch render: first line under a ⎿, the rest aligned beneath.
@@ -376,19 +376,14 @@ def replay_history(history: list, emitter: EventEmitter) -> None:
     Synthetic injections (resume markers, ``[system]`` notes, interrupt
     framings) are skipped — they're scaffolding, not user turns.
     """
-    if not history:
-        return
-    try:
-        from pydantic_ai.messages import (
-            ModelRequest,
-            ModelResponse,
-            TextPart,
-            ToolCallPart,
-            ToolReturnPart,
-            UserPromptPart,
-        )
-    except Exception:
-        return
+    from pydantic_ai.messages import (
+        ModelRequest,
+        ModelResponse,
+        TextPart,
+        ToolCallPart,
+        ToolReturnPart,
+        UserPromptPart,
+    )
 
     pending_tool_calls: dict[str, ToolCallDisplay] = {}
     any_emitted = False
@@ -404,14 +399,11 @@ def replay_history(history: list, emitter: EventEmitter) -> None:
                     emitter.emit(UserMessage(text))
                     any_emitted = True
                 elif isinstance(part, ToolReturnPart):
-                    tc = pending_tool_calls.pop(getattr(part, "tool_call_id", ""), None)
+                    tc = pending_tool_calls.pop(part.tool_call_id, None)
                     if tc is None:
                         continue
                     content = part.content if isinstance(part.content, str) else str(part.content)
-                    try:
-                        emitter.emit(tc.finish(output=content[:2000]))
-                    except Exception:
-                        pass
+                    emitter.emit(tc.finish(output=content[:2000]))
         elif isinstance(msg, ModelResponse):
             stream = None
             for part in msg.parts:
@@ -431,10 +423,10 @@ def replay_history(history: list, emitter: EventEmitter) -> None:
                             tool_name=part.tool_name,
                             args=args_repr[:80],
                             details=args_repr[:5000],
-                            tool_call_id=getattr(part, "tool_call_id", ""),
+                            tool_call_id=part.tool_call_id,
                         )
                     )
-                    pending_tool_calls[getattr(part, "tool_call_id", "")] = tc
+                    pending_tool_calls[part.tool_call_id] = tc
                     any_emitted = True
             if stream is not None:
                 stream.done = True
@@ -442,7 +434,4 @@ def replay_history(history: list, emitter: EventEmitter) -> None:
     # Sessions saved before cancelled turns were stripped can end on a call
     # with no return; close it here or it shows as running forever.
     for tc in pending_tool_calls.values():
-        try:
-            emitter.emit(tc.finish(error="interrupted — no result"))
-        except Exception:
-            pass
+        emitter.emit(tc.finish(error="interrupted — no result"))

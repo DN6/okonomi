@@ -27,7 +27,10 @@ Expect these to be rebuilt, replaced, or removed as the experiments continue.
 
 ## Installation
 
-Requires Python 3.11+ and [uv](https://docs.astral.sh/uv/) (or pip).
+Requires Python 3.11+ and [uv](https://docs.astral.sh/uv/) (or pip), on macOS or Linux.
+Shell commands always run in an OS sandbox (Seatbelt on macOS, bubblewrap on Linux) that limits
+writes to the working directory, temp dirs and `$OKONOMI_HOME`; okonomi refuses to start without one.
+On Linux, install bubblewrap (`sudo apt install bubblewrap` or `sudo dnf install bubblewrap`).
 
 ```shell
 git clone https://github.com/dn6/okonomi.git
@@ -65,8 +68,21 @@ Everything else is optional:
 # Storage root for sessions, research, skills and favorites (default: ~/.okonomi)
 OKONOMI_HOME=/path/to/okonomi/home
 
-# Skip the shell-command safety checks in the `bash` tool
-OKONOMI_YOLO=false
+# Prompt before dangerous `bash` commands (manual, the default) or run them without asking (off).
+# Hardline patterns and deny rules are blocked either way.
+OKONOMI_APPROVALS=manual
+
+# Dotenv file of credentials injected into `bash` commands (re-read per command, values redacted from output)
+OKONOMI_ENV_FILE=~/.okonomi/tool.env
+```
+
+When a `bash` command matches a dangerous pattern, the prompt offers: Enter (run once),
+`s` (approve the pattern for this session), `a` (always, saved to `$OKONOMI_HOME/approvals.json`),
+`n` (deny), or typed feedback for the model. Without an interactive UI the command is refused.
+`approvals.json` also takes deny rules, regexes that block a command unconditionally:
+
+```json
+{"allow": ["git reset --hard (destroys uncommitted changes)"], "deny": ["\\bgit\\s+push\\b"]}
 ```
 
 Sessions, generated files, saved research and skills all live under `$OKONOMI_HOME`

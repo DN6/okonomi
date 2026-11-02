@@ -3,6 +3,8 @@ import os
 import re
 import threading
 
+from dotenv import dotenv_values
+
 
 logger = logging.getLogger(__name__)
 
@@ -12,23 +14,35 @@ _SECRET_ENV_NAME_RE = re.compile(r"(KEY|TOKEN|SECRET|PASSWORD|PASSWD|CREDENTIALS
 def scrub_env(environ) -> dict:
     """A copy of ``environ`` without secret-looking variables.
 
-    Drops every var whose name matches ``_SECRET_ENV_NAME_RE`` unless it
-    is named in ``OKONOMI_ENV_ALLOW`` (comma-separated) — the escape
-    hatch for keys that model-run code legitimately needs (e.g.
-    ``OKONOMI_ENV_ALLOW=FAL_KEY``). Same regex as ``redact_secrets``,
-    so what the scrub misses the redaction still catches.
+    Drops every var whose name matches ``_SECRET_ENV_NAME_RE``. Keys that
+    model-run code legitimately needs go in ``OKONOMI_ENV_FILE`` instead.
+    Same regex as ``redact_secrets``, so what the scrub misses the
+    redaction still catches.
     """
-    allow = {n.strip() for n in (environ.get("OKONOMI_ENV_ALLOW") or "").split(",") if n.strip()}
-    return {
-        name: value
-        for name, value in environ.items()
-        if name in allow or not _SECRET_ENV_NAME_RE.search(name)
-    }
+    return {name: value for name, value in environ.items() if not _SECRET_ENV_NAME_RE.search(name)}
+
+
+def read_env_file() -> dict:
+    """Credentials from the dotenv file at ``OKONOMI_ENV_FILE``, injected
+    into model-run subprocesses after ``scrub_env``.
+
+    Re-read on every call so edits apply without a restart. Raises when
+    the variable is set but the file is missing, so commands never run
+    silently without the credentials they were promised.
+    """
+    path = os.environ.get("OKONOMI_ENV_FILE")
+    if not path:
+        return {}
+    path = os.path.expanduser(path)
+    if not os.path.isfile(path):
+        raise FileNotFoundError(f"OKONOMI_ENV_FILE points to {path!r}, which is not a file. Create it or unset OKONOMI_ENV_FILE.")
+    return {name: value for name, value in dotenv_values(path).items() if value is not None}
 
 
 def redact_secrets(text: str) -> str:
     """Replace occurrences of secret-looking env-var values (``*_KEY``,
-    ``*_TOKEN``, ``*_SECRET``, …) with a ``[NAME redacted]`` marker.
+    ``*_TOKEN``, ``*_SECRET``, …) and every ``OKONOMI_ENV_FILE`` value
+    with a ``[NAME redacted]`` marker.
 
     Applied to tool output at the capture boundary so leaked credentials
     never reach the transcript, the persisted session log, or the FTS
@@ -36,8 +50,13 @@ def redact_secrets(text: str) -> str:
     """
     if not text:
         return text
-    for name, value in os.environ.items():
-        if len(value) >= 8 and _SECRET_ENV_NAME_RE.search(name) and value in text:
+    secrets = {name: value for name, value in os.environ.items() if _SECRET_ENV_NAME_RE.search(name)}
+    try:
+        secrets.update(read_env_file())
+    except FileNotFoundError:
+        pass
+    for name, value in secrets.items():
+        if len(value) >= 8 and value in text:
             text = text.replace(value, f"[{name} redacted]")
     return text
 
@@ -97,16 +116,13 @@ _TITLE_PROMPT = (
 def _compact_messages(messages: list, max_chars: int = 4000) -> str:
     """Compact transcript for titling: user prompts + assistant text + tool-call
     args (where image prompts — i.e. the actual subject — live)."""
-    try:
-        from pydantic_ai.messages import (
-            ModelRequest,
-            ModelResponse,
-            TextPart,
-            ToolCallPart,
-            UserPromptPart,
-        )
-    except Exception:
-        return ""
+    from pydantic_ai.messages import (
+        ModelRequest,
+        ModelResponse,
+        TextPart,
+        ToolCallPart,
+        UserPromptPart,
+    )
 
     lines: list[str] = []
     for msg in messages or []:
@@ -127,7 +143,7 @@ def _compact_messages(messages: list, max_chars: int = 4000) -> str:
     return "\n".join(lines)[:max_chars]
 
 
-def generate_session_title(messages: list, model: str | None = None) -> str:
+def generate_session_title(messages: list) -> str:
     """One-sentence title summarizing the conversation so far. ``""`` on failure.
 
     The transcript is passed as delimited material to summarize, NOT as a live
@@ -139,11 +155,9 @@ def generate_session_title(messages: list, model: str | None = None) -> str:
     client = create_chat_client()
     if client is None:
         return ""
-    if model is None:
-        model = _title_model()
     try:
         resp = client.chat.completions.create(
-            model=model,
+            model=_title_model(),
             messages=[{"role": "user", "content": _TITLE_PROMPT.format(body=body)}],
             temperature=0.3,
             max_tokens=40,

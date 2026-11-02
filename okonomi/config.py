@@ -19,6 +19,15 @@ OKONOMI_MIND_DIR = OKONOMI_HOME / "mind"
 OKONOMI_SKILLS_DIR = OKONOMI_HOME / "skills"
 OKONOMI_FAVORITES_DIR = OKONOMI_HOME / "favorites"
 OKONOMI_MCP_CONFIG = OKONOMI_HOME / "mcp.json"
+OKONOMI_APPROVALS_FILE = OKONOMI_HOME / "approvals.json"
+
+
+def approval_mode() -> str:
+    """``manual`` (prompt before dangerous commands, the default) or ``off``."""
+    mode = os.getenv("OKONOMI_APPROVALS", "manual").strip().lower()
+    if mode not in ("manual", "off"):
+        raise EnvironmentError(f"OKONOMI_APPROVALS must be 'manual' or 'off', got {mode!r}.")
+    return mode
 
 
 # --- Model providers ---
@@ -104,3 +113,7 @@ def load_env_or_raise() -> None:
     """
     load_dotenv()
     select_provider()
+    env_file = os.getenv("OKONOMI_ENV_FILE")
+    if env_file and not Path(env_file).expanduser().is_file():
+        raise EnvironmentError(f"OKONOMI_ENV_FILE points to {env_file!r}, which is not a file. Create it or unset OKONOMI_ENV_FILE.")
+    approval_mode()

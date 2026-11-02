@@ -202,7 +202,6 @@ class AgentTools:
                     bg_id=task_id,
                     error=bg_task.error or None,
                     output=reply,
-                    new_artifacts=bg_task.outputs,
                     produced_artifacts=produced,
                 )
 

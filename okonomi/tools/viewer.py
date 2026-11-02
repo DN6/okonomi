@@ -22,7 +22,6 @@ from urllib.parse import quote, unquote, urlparse
 from typing_extensions import TypedDict
 
 from okonomi.session import favorite_hits, favorite_refs, norm_ref
-from okonomi.tools._metadata import ToolMetadataMixin
 from okonomi.tui.assets import set_favorite
 
 
@@ -272,11 +271,9 @@ class _ViewerServer(ThreadingHTTPServer):
         self.session_fn = session_fn
 
 
-class ViewerTools(ToolMetadataMixin):
+class ViewerTools:
     """Live media viewer for the current session."""
 
-    __namespace__ = "viewer"
-    __description__ = "Open a local web app that shows the session's outputs as they are created"
 
     def __init__(self, session_fn: Callable[[], Any]):
         # A callable, not the session: /new and resume swap the agent's session.

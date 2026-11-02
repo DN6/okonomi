@@ -1,19 +1,16 @@
-"""macOS Seatbelt wrapper for model-run subprocesses.
+"""OS sandbox for model-run subprocesses: Seatbelt on macOS, bubblewrap on Linux.
 
-``wrap_command`` prepends ``sandbox-exec`` with a write-scoping profile:
+``wrap_command`` prepends the platform runner with a write-scoping profile:
 reads, network, and exec stay open; file writes are limited to
 $OKONOMI_HOME, the temp dirs, and the current working directory.
 
-``sandbox-exec`` is deprecated-but-functional (the kernel mechanism is
-load-bearing for macOS itself), so treat it as best-effort hardening:
-the first call probes it and any failure degrades to unwrapped
-execution with a single logged warning. Non-darwin platforms and
-``OKONOMI_NO_SANDBOX=1`` pass through unchanged.
+The first call probes the runner. If it is missing or cannot apply the
+profile, or the platform has no runner, ``SandboxUnavailable`` is raised
+and the command does not run: there is no unsandboxed fallback.
+``bwrap`` is used from the system rather than bundled.
 """
 
-import logging
 import os
-import shutil
 import subprocess
 import sys
 import tempfile
@@ -21,13 +18,14 @@ import tempfile
 from okonomi.config import OKONOMI_HOME
 
 
-logger = logging.getLogger(__name__)
-
-# None = not probed yet; True/False after the first wrap_command call.
-_sandbox_ok: bool | None = None
+class SandboxUnavailable(EnvironmentError):
+    pass
 
 
-def _build_profile(cwd: str) -> str:
+_probed = False
+
+
+def _seatbelt_prefix(cwd: str) -> list[str]:
     # Later rules win in SBPL: allow everything, deny all writes, then
     # re-allow writes under the scoped roots. /private/var/folders is
     # the real location behind tempfile on macOS; /dev for tty/null.
@@ -40,34 +38,52 @@ def _build_profile(cwd: str) -> str:
         "/dev",
     ]
     allow = "\n".join(f'    (subpath "{p}")' for p in subpaths)
-    return f"(version 1)\n(allow default)\n(deny file-write*)\n(allow file-write*\n{allow})\n"
+    profile = f"(version 1)\n(allow default)\n(deny file-write*)\n(allow file-write*\n{allow})\n"
+    return ["sandbox-exec", "-p", profile]
 
 
-def _probe(profile: str) -> bool:
+def _bwrap_prefix(cwd: str) -> list[str]:
+    # Read-only view of the whole filesystem, then writable binds over the
+    # scoped roots (later binds win). The real /dev is bound so ttys,
+    # /dev/null and /dev/shm behave as outside. --bind-try skips roots that
+    # do not exist yet, such as a fresh $OKONOMI_HOME.
+    args = ["bwrap", "--ro-bind", "/", "/", "--dev-bind", "/dev", "/dev"]
+    for path in (str(OKONOMI_HOME), tempfile.gettempdir(), "/tmp", cwd):
+        args += ["--bind-try", path, path]
+    return [*args, "--"]
+
+
+_RUNNERS = {
+    "darwin": (_seatbelt_prefix, "sandbox-exec ships with macOS; check that /usr/bin/sandbox-exec is present and runnable."),
+    "linux": (
+        _bwrap_prefix,
+        "Install bubblewrap (`sudo apt install bubblewrap` or `sudo dnf install bubblewrap`) and make sure "
+        "unprivileged user namespaces are enabled (on Ubuntu 24.04+: `sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0`).",
+    ),
+}
+
+
+def _probe(prefix: list[str], hint: str) -> None:
     try:
-        result = subprocess.run(
-            ["sandbox-exec", "-p", profile, "/usr/bin/true"],
-            capture_output=True,
-            timeout=10,
+        result = subprocess.run([*prefix, "true"], capture_output=True, text=True, timeout=10)
+    except (OSError, subprocess.SubprocessError) as e:
+        raise SandboxUnavailable(f"Cannot start the sandbox runner {prefix[0]!r}: {e}. {hint}") from e
+    if result.returncode != 0:
+        raise SandboxUnavailable(
+            f"The sandbox runner {prefix[0]!r} failed its probe (exit {result.returncode}): {result.stderr.strip()}. {hint}"
         )
-        return result.returncode == 0
-    except (OSError, subprocess.SubprocessError):
-        return False
 
 
 def wrap_command(argv: list[str], cwd: str | None = None) -> list[str]:
-    """Wrap ``argv`` in sandbox-exec when available; pass through otherwise."""
-    global _sandbox_ok
-    if sys.platform != "darwin" or os.getenv("OKONOMI_NO_SANDBOX"):
-        return argv
-    if shutil.which("sandbox-exec") is None:
-        return argv
-
-    profile = _build_profile(cwd or os.getcwd())
-    if _sandbox_ok is None:
-        _sandbox_ok = _probe(profile)
-        if not _sandbox_ok:
-            logger.warning("sandbox-exec probe failed — running commands without a sandbox.")
-    if not _sandbox_ok:
-        return argv
-    return ["sandbox-exec", "-p", profile, *argv]
+    """Wrap ``argv`` in the platform sandbox. Raises ``SandboxUnavailable``
+    when there is none, instead of running unsandboxed."""
+    global _probed
+    runner = _RUNNERS.get(sys.platform)
+    if runner is None:
+        raise SandboxUnavailable(f"okonomi only sandboxes commands on macOS and Linux, not {sys.platform!r}.")
+    prefix_fn, hint = runner
+    prefix = prefix_fn(cwd or os.getcwd())
+    if not _probed:
+        _probe(prefix, hint)
+        _probed = True
+    return [*prefix, *argv]

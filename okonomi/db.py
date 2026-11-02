@@ -215,8 +215,7 @@ def open_db(db_path: Path) -> sqlite3.Connection:
 
     ``check_same_thread=False`` is required because the connection is
     created on the main thread but reads happen on the agent worker
-    thread (e.g. when the ``search_sessions`` / ``search_artifacts``
-    tools fire mid-turn). WAL mode + serialized writes through
+    thread (e.g. when the ``recall`` tool fires mid-turn). WAL mode + serialized writes through
     ``transaction()`` make this safe; the Python-side guard would
     otherwise raise a ``ProgrammingError`` on every cross-thread access.
     """
@@ -288,16 +287,10 @@ def fetch_session(conn: sqlite3.Connection, session_id: str) -> dict[str, Any] |
     return dict(row) if row else None
 
 
-def list_sessions(
-    conn: sqlite3.Connection, *, status: str | None = None, limit: int | None = None
-) -> list[dict[str, Any]]:
-    """Newest-first by ``updated_at``. Optionally filter by status."""
-    sql = "SELECT * FROM sessions"
+def list_sessions(conn: sqlite3.Connection, *, limit: int | None = None) -> list[dict[str, Any]]:
+    """Newest-first by ``updated_at``."""
+    sql = "SELECT * FROM sessions ORDER BY updated_at DESC"
     params: list[Any] = []
-    if status:
-        sql += " WHERE status = ?"
-        params.append(status)
-    sql += " ORDER BY updated_at DESC"
     if limit:
         sql += " LIMIT ?"
         params.append(limit)
@@ -369,16 +362,6 @@ def replace_artifacts(conn: sqlite3.Connection, session_id: str, artifacts: Iter
             "description, tool_name, model_id, timestamp) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
             rows,
         )
-
-
-def find_artifact_id(conn: sqlite3.Connection, session_id: str, *, url: str = "", path: str = "") -> int | None:
-    """Row id of a session's artifact matching ``url`` or ``path``
-    (newest first), or None if not yet indexed."""
-    row = conn.execute(
-        "SELECT id FROM artifacts WHERE session_id = ? AND (url = ? OR path = ?) ORDER BY id DESC LIMIT 1",
-        (session_id, url, path),
-    ).fetchone()
-    return int(row["id"]) if row else None
 
 
 def fetch_artifacts(conn: sqlite3.Connection, session_id: str) -> list[dict[str, Any]]:
@@ -553,20 +536,6 @@ def checkout_events(conn: sqlite3.Connection, session_id: str, target_event_id: 
             [session_id, *path],
         )
     return len(path)
-
-
-def sum_session_usage(conn: sqlite3.Connection, session_id: str) -> dict[str, Any]:
-    """Recompute the session's token/cost totals from its active events —
-    the audit for (or rebuild of) the cached columns on ``sessions``."""
-    row = conn.execute(
-        "SELECT SUM(input_tokens) AS input_tokens, SUM(output_tokens) AS output_tokens, "
-        "SUM(cache_read_tokens) AS cache_read_tokens, SUM(cache_write_tokens) AS cache_write_tokens, "
-        "SUM(reasoning_tokens) AS reasoning_tokens, SUM(cost_usd) AS cost_usd, "
-        "COUNT(input_tokens) AS requests "
-        "FROM events WHERE session_id = ? AND active = 1",
-        (session_id,),
-    ).fetchone()
-    return {k: (row[k] or 0) for k in row.keys()}
 
 
 # ── search ──────────────────────────────────────────────────────────────
@@ -782,13 +751,7 @@ def search_mind_fts(mind_dir: Path, query: str, limit: int = 20) -> list[dict[st
     return [_mind_page(Path(r["path"]), r["content"], snippet=r["snippet"], score=r["score"]) for r in rows]
 
 
-def search_artifacts_fts(
-    conn: sqlite3.Connection,
-    query: str,
-    *,
-    artifact_type: str | None = None,
-    limit: int = 50,
-) -> list[dict[str, Any]]:
+def search_artifacts_fts(conn: sqlite3.Connection, query: str, *, limit: int = 50) -> list[dict[str, Any]]:
     """Find artifacts by BM25-ranked FTS5 search over prompt /
     description / tool_name, OR by URL / local-path substring.
 
@@ -828,13 +791,9 @@ def search_artifacts_fts(
             JOIN artifacts a ON a.id = f.rowid
             JOIN sessions s ON s.session_id = a.session_id
             WHERE artifacts_fts MATCH ?
+            ORDER BY score LIMIT ?
         """
-        params: list[Any] = [expand_prefixes(conn, "artifacts_vocab", sanitize_fts_query(query))]
-        if artifact_type:
-            sql += " AND a.artifact_type = ?"
-            params.append(artifact_type)
-        sql += " ORDER BY score LIMIT ?"
-        params.append(limit)
+        params: list[Any] = [expand_prefixes(conn, "artifacts_vocab", sanitize_fts_query(query)), limit]
         fts_rows = conn.execute(sql, params).fetchall()
     except sqlite3.OperationalError:
         # FTS5 raises on punctuation-heavy queries (URL-like inputs).
@@ -856,13 +815,9 @@ def search_artifacts_fts(
         FROM artifacts a
         JOIN sessions s ON s.session_id = a.session_id
         WHERE (a.url LIKE ? OR a.path LIKE ?)
+        ORDER BY a.timestamp DESC LIMIT ?
     """
-    params = [like, like]
-    if artifact_type:
-        sql += " AND a.artifact_type = ?"
-        params.append(artifact_type)
-    sql += " ORDER BY a.timestamp DESC LIMIT ?"
-    params.append(limit)
+    params = [like, like, limit]
     seen = {r["artifact_id"] for r in fts_rows}
     like_rows = [r for r in conn.execute(sql, params).fetchall() if r["artifact_id"] not in seen]
     return _normalize([*fts_rows, *like_rows][:limit])
@@ -928,13 +883,7 @@ def remove_favorite(conn: sqlite3.Connection, favorite_id: int) -> bool:
     return cur.rowcount > 0
 
 
-def list_favorites(
-    conn: sqlite3.Connection,
-    *,
-    artifact_type: str | None = None,
-    artifact_source: str | None = None,
-    limit: int | None = None,
-) -> list[dict[str, Any]]:
+def list_favorites(conn: sqlite3.Connection, *, limit: int | None = None) -> list[dict[str, Any]]:
     """Newest-first favorites with artifact + session context via LEFT JOIN.
     Internal favorites join on ``artifact_id``; external favorites join on the
     newest artifact whose path or URL equals the stored ref, so a favorite
@@ -944,10 +893,6 @@ def list_favorites(
     ``artifact_source``, ``url`` (URL or local path), ``artifact_type``,
     ``favorited_at``, plus ``session_id`` / ``session_title`` / ``prompt``
     / ``tool_name`` / ``model_id`` when the favorite is internal.
-
-    ``artifact_type`` and ``artifact_source`` are optional filters. The
-    type filter matches against the resolved type (favorite's own type
-    if set, else the artifact's).
     """
     sql = """
         SELECT f.id, f.artifact_id, f.artifact_source, f.favorited_at,
@@ -963,18 +908,9 @@ def list_favorites(
              ORDER BY x.id DESC LIMIT 1)
         )
         LEFT JOIN sessions  s ON s.session_id = a.session_id
+        ORDER BY f.favorited_at DESC
     """
-    where: list[str] = []
     params: list[Any] = []
-    if artifact_type:
-        where.append("COALESCE(NULLIF(f.artifact_type, ''), a.artifact_type) = ?")
-        params.append(artifact_type)
-    if artifact_source:
-        where.append("f.artifact_source = ?")
-        params.append(artifact_source)
-    if where:
-        sql += " WHERE " + " AND ".join(where)
-    sql += " ORDER BY f.favorited_at DESC"
     if limit:
         sql += " LIMIT ?"
         params.append(limit)

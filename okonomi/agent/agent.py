@@ -6,8 +6,8 @@ container (``AgentDependencies``), asset-download helpers and
 image-reference parsing. The class is assembled from focused modules:
 the turn loop, event wiring, and session save/load live here; code runs
 through the sandboxed ``bash`` tool (``tools.terminal``); system-prompt
-construction (``prompt``), provider glue (``provider``), and tool
-wrappers (``wrappers``) are plain modules.
+construction (``prompt``) and provider glue (``provider``) are plain
+modules.
 """
 
 import asyncio
@@ -49,6 +49,7 @@ from pydantic_ai.models import Model
 from ..config import resolve_model_id, select_provider
 from ..context import _CHARS_PER_TOKEN, ContextManager, count_tokens, strip_unanswered_tool_calls
 from ..events import (
+    ApprovalRequest,
     AssistantStream,
     Event,
     EventEmitter,
@@ -70,6 +71,7 @@ from ..tools import (
     ViewerTools,
     WebTools,
 )
+from ..tools._command_guard import approve_always, check_command, dangerous_matches, load_approval_rules
 from ..traces import TracingModel
 from ..utils import redact_secrets
 from .jobs import JobRegistry
@@ -98,10 +100,7 @@ def _tool_result_display(part: ToolReturnPart | RetryPromptPart) -> dict[str, st
         return {"error": str(content["error"])}
     if isinstance(content, dict) and content.get("pending"):
         return {"output": f"still running — moved to background as {content['pending']}; its result arrives as a follow-up message"}
-    try:
-        return {"output": _short_repr(content)}
-    except Exception:  # noqa: BLE001
-        return {"output": repr(content)}
+    return {"output": _short_repr(content)}
 
 
 def _short_repr(obj: Any, limit: int = 2000) -> str:
@@ -373,8 +372,6 @@ class OkonomiAgent:
         # don't block process exit. Cap at 4 so a burst of generations
         # doesn't saturate bandwidth.
         self._asset_dl_pool = ThreadPoolExecutor(max_workers=4, thread_name_prefix="okonomi-dl")
-        # Tracked so quit can bounded-wait for in-flight downloads.
-        self._asset_dl_futures: list[Future] = []
 
         # Set on cancel/timeout so the NEXT turn knows to prepend a
         # "you were interrupted, focus on the new instruction" marker.
@@ -429,6 +426,11 @@ class OkonomiAgent:
         # Tools run on this pool so a call that outlives TOOL_DETACH_AFTER can
         # keep running as a background job after the turn moves on.
         self._tool_pool = ThreadPoolExecutor(thread_name_prefix="okonomi-tool")
+        # Set by a UI that answers ApprovalRequest events. Without one, bash
+        # refuses dangerous commands instead of waiting for an answer that
+        # never comes.
+        self.can_prompt = False
+        self._session_approvals: set[str] = set()
         # MCP connections held open across turns (see _ensure_mcp_connected),
         # with the event loop and toolsets they were opened for.
         self._mcp_stack: contextlib.AsyncExitStack | None = None
@@ -457,9 +459,7 @@ class OkonomiAgent:
         if value == self._status:
             return
         self._status = value
-        emitter = getattr(self, "emitter", None)
-        if emitter is not None:
-            emitter.emit(StatusChanged(value))
+        self.emitter.emit(StatusChanged(value))
 
     def _job_finished(
         self,
@@ -467,7 +467,6 @@ class OkonomiAgent:
         bg_id: str,
         error: str | None = None,
         output: str | None = None,
-        new_artifacts: int = 0,
         produced_artifacts: list | None = None,
     ) -> None:
         """Delegate to the shared JobRegistry (see ``okonomi.agent.jobs``),
@@ -481,7 +480,6 @@ class OkonomiAgent:
             bg_id=bg_id,
             error=error,
             output=output,
-            new_artifacts=new_artifacts,
             produced_artifacts=produced_artifacts,
         )
 
@@ -547,14 +545,14 @@ class OkonomiAgent:
         self._register_tool(agent, self.files)
         self._register_tool(agent, self.viewer)
         self.agents._bind(self)
-        self._register_tool(agent, self.agents, rename={"launch": "launch_agent", "list_agents": "list_agents"})
+        self._register_tool(agent, self.agents, rename={"launch": "launch_agent"})
 
         return agent
 
     def _get_system_prompt(self) -> str:
         return build_system_prompt(skills=self.skills)
 
-    # Per-HTTP-request timeout for the OpenRouter client. Safety belt
+    # Per-HTTP-request timeout for the provider client. Safety belt
     # against a single hung API call — distinct from ``self.timeout``
     # (which budgets the whole multi-round turn). 60s is generous for a
     # single completion; tools have their own bg/term mechanism for
@@ -598,6 +596,16 @@ class OkonomiAgent:
                     detach_now = agent_self._detach_now
                     kill = threading.Event()
                     if tn == "bash":
+                        # Asked here rather than inside bash: time spent
+                        # waiting on the user must not count toward the
+                        # detach deadline below.
+                        command = kwargs.get("command", args[0] if args else "")
+                        pending = agent_self._unapproved_patterns(command)
+                        if pending and agent_self.can_prompt:
+                            denial = agent_self._ask_approval(command, pending)
+                            if denial is not None:
+                                return denial
+                        kwargs["_approved"] = not pending or agent_self.can_prompt
                         # Live output for /logs tool-N. ``kill`` replaces the
                         # shared Ctrl+C flag: it is only set while the call is
                         # still attached, so a detached call survives later stops.
@@ -640,6 +648,46 @@ class OkonomiAgent:
                 return wrapper
 
             agent.tool(make_wrapper(method, sig, tool_name), name=tool_name)
+
+    def _unapproved_patterns(self, command: str) -> list[str]:
+        """Dangerous patterns in ``command`` the user has not approved for
+        this session or always. Empty when approvals are off or the command
+        is hard-blocked anyway (bash reports that block itself)."""
+        if check_command(command, approved=True)[0] is False:
+            return []
+        if check_command(command)[0]:
+            return []
+        approved = self._session_approvals | load_approval_rules()["allow"]
+        return [key for key in dangerous_matches(command) if key not in approved]
+
+    def _ask_approval(self, command: str, patterns: list[str]) -> dict | None:
+        """Block until the user answers an ApprovalRequest for ``command``.
+        Returns None to run it, or the tool result to return instead."""
+        answered = threading.Event()
+        box: dict[str, Any] = {}
+
+        def _respond(decision: bool | str) -> None:
+            if not answered.is_set():
+                box["decision"] = decision
+                answered.set()
+
+        self.emitter.emit(ApprovalRequest(code=command, reason=", ".join(patterns), respond=_respond))
+        while not answered.wait(0.1):
+            if self._turn_cancelled.is_set():
+                return {"error": "interrupted by the user"}
+
+        decision = box["decision"]
+        if decision is True:
+            return None
+        if decision == "__session__":
+            self._session_approvals.update(patterns)
+            return None
+        if decision == "__always__":
+            approve_always(patterns)
+            return None
+        if decision is False:
+            return {"error": f"The user denied this command ({', '.join(patterns)}). Do not retry or rephrase it; ask the user how to proceed."}
+        return {"error": f"The user did not run this command and replied: {decision}"}
 
     async def _process_mcp_tool_call(self, ctx: RunContext[AgentDependencies], call_tool, name: str, args: dict):
         """Apply TOOL_DETACH_AFTER to MCP calls, which bypass
@@ -728,15 +776,15 @@ class OkonomiAgent:
             on_artifact_added=self._eager_download_artifact,
         )
 
-    def _register_bg_log(self, *, task_id: str, label: str, reader, kind: str | None = None) -> None:
+    def _register_bg_log(self, *, task_id: str, label: str, reader) -> None:
         """Delegate to the shared JobRegistry (see ``okonomi.agent.jobs``)."""
-        self.jobs.register(task_id=task_id, label=label, reader=reader, kind=kind)
+        self.jobs.register(task_id=task_id, label=label, reader=reader)
 
     def _mark_bg_log_done(self, *, task_id: str, status: str) -> None:
         """Delegate to the shared JobRegistry (see ``okonomi.agent.jobs``)."""
         self.jobs.mark_done(task_id=task_id, status=status)
 
-    def _sync_session_assets(self, deps: "AgentDependencies", *, tool_name: str = "bash") -> int:
+    def _sync_session_assets(self, deps: "AgentDependencies") -> int:
         """Register media files in the session dir that aren't tracked yet.
 
         bash commands write images/video/audio/etc. straight to the session
@@ -790,7 +838,7 @@ class OkonomiAgent:
                 Artifact(
                     artifact_type=artifact_type,
                     path=str(p),
-                    tool_name=tool_name,
+                    tool_name="bash",
                     description=description,
                     timestamp=datetime.now().isoformat(),
                 )
@@ -819,9 +867,7 @@ class OkonomiAgent:
                 pass
 
         try:
-            future = self._asset_dl_pool.submit(_run)
-            self._asset_dl_futures.append(future)
-            future.add_done_callback(self._asset_dl_futures.remove)
+            self._asset_dl_pool.submit(_run)
         except RuntimeError:
             _run()
 
@@ -857,9 +903,9 @@ class OkonomiAgent:
         except Exception:
             pass
 
-        self.session.record_usage(
-            input_tokens=in_toks or 0,
-            output_tokens=out_toks or 0,
+        self.session.tokens.add(
+            input_tokens=in_toks,
+            output_tokens=out_toks,
             requests=getattr(usage, "requests", 0) or 1,
             cache_read_tokens=getattr(usage, "cache_read_tokens", 0) or 0,
             cache_write_tokens=getattr(usage, "cache_write_tokens", 0) or 0,

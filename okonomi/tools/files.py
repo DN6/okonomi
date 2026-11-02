@@ -9,10 +9,10 @@ surface.
 """
 
 from pathlib import Path
+
 from typing_extensions import TypedDict
 
 from okonomi.config import OKONOMI_MIND_DIR
-from okonomi.tools._metadata import ToolMetadataMixin
 
 
 _DEFAULT_READ_LIMIT = 500
@@ -53,11 +53,9 @@ def _looks_binary(data: bytes) -> bool:
     return b"\x00" in data[:_BINARY_SNIFF_BYTES]
 
 
-class FileTools(ToolMetadataMixin):
+class FileTools:
     """Local file operations: read, write, edit."""
 
-    __namespace__ = "files"
-    __description__ = "Read, write, and edit local files with bounded output and read-before-write checks"
 
     def __init__(self):
         # Track per-path mtime captured at read time. write_file / edit_file
