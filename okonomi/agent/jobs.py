@@ -6,6 +6,7 @@ inspect them after they finish, and emits their lifecycle events. Not core
 to request/tool/context handling — the agent just holds one instance.
 """
 
+import asyncio
 import time
 from typing import Any
 
@@ -91,6 +92,33 @@ def _produced_block(ev: JobFinished) -> str:
         if ref:
             asset_lines.append(f"  - {kind}: {ref}")
     return "\n".join(asset_lines) if asset_lines else "  (none)"
+
+
+async def run_until_jobs_report(agent, message: str) -> str | None:
+    """Run ``message`` as a turn, then one more turn per agent or detached
+    tool call the turn started, until all have reported. For callers with
+    no input loop to deliver completion notices later (one-shot runs,
+    launched sub-agents); returning after the first turn would drop their
+    results. Returns the reply to the last turn."""
+    loop = asyncio.get_running_loop()
+    notices: asyncio.Queue[JobFinished] = asyncio.Queue()
+
+    def _collect(ev) -> None:
+        if isinstance(ev, JobFinished) and ev.kind in REPORTED_KINDS:
+            loop.call_soon_threadsafe(notices.put_nowait, ev)
+
+    agent.emitter.subscribe(_collect)
+    reply = await agent.run_async(message, reset=True)
+    # Counted by job id rather than by "still running": a job is marked
+    # done just before its notice is emitted.
+    reported: set[str] = set()
+    while True:
+        launched = {job_id for job_id, entry in agent.jobs.entries.items() if entry["kind"] in REPORTED_KINDS}
+        if launched <= reported:
+            return reply
+        ev = await notices.get()
+        reported.add(ev.job_id)
+        reply = await agent.run_async(job_notice(ev))
 
 
 def term_notice(ev: JobFinished) -> str:

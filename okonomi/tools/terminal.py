@@ -385,7 +385,7 @@ class TerminalTools:
         if not stdout.strip():
             return self._empty_result(output_mode)
 
-        return self._parse_search_output(stdout, output_mode, limit, offset, context)
+        return self._parse_search_output(stdout, output_mode, limit, offset)
 
     def _search_grep(self, pattern, path, file_glob, limit, offset, output_mode, context):
         parts = ["grep", "-rnH", "--exclude-dir='.*'"]
@@ -410,9 +410,9 @@ class TerminalTools:
         if not stdout.strip():
             return self._empty_result(output_mode)
 
-        return self._parse_search_output(stdout, output_mode, limit, offset, context)
+        return self._parse_search_output(stdout, output_mode, limit, offset)
 
-    def _parse_search_output(self, stdout, output_mode, limit, offset, context):
+    def _parse_search_output(self, stdout, output_mode, limit, offset):
         if output_mode == "files_only":
             all_files = [f for f in stdout.strip().split("\n") if f]
             return {
