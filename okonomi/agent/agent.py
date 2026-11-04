@@ -1074,7 +1074,7 @@ class OkonomiAgent:
                             self._end_text_stream()
 
                 except (asyncio.CancelledError, TimeoutError) as exc:
-                    self._handle_interruption(agent_run, deps, isinstance(exc, TimeoutError))
+                    self._handle_interruption(agent_run, isinstance(exc, TimeoutError))
                     if isinstance(exc, asyncio.CancelledError):
                         raise
 
@@ -1084,7 +1084,7 @@ class OkonomiAgent:
                 result = agent_run.result
 
             messages = result.all_messages()
-            self._commit_turn(agent_run, deps, messages)
+            self._commit_turn(agent_run, messages)
             return result.output
 
         except Exception as e:
@@ -1102,14 +1102,14 @@ class OkonomiAgent:
             self.status = ""
             self.emitter.emit(TurnEnd(turn=turn))
 
-    def _handle_interruption(self, agent_run, deps: AgentDependencies, timed_out: bool) -> None:
+    def _handle_interruption(self, agent_run, timed_out: bool) -> None:
         """Commit partial state and surface a timeout note. Caller decides
         whether to re-raise CancelledError or return an empty string."""
         self._was_interrupted = True
         self._turn_cancelled.set()
         self._interrupted_partial = self._current_stream.text if self._current_stream is not None else ""
         self._pending_stream_events.append(Interrupt("timeout" if timed_out else "cancelled"))
-        self._commit_turn(agent_run, deps, strip_unanswered_tool_calls(agent_run.all_messages()))
+        self._commit_turn(agent_run, strip_unanswered_tool_calls(agent_run.all_messages()))
         if timed_out:
             self.emitter.emit(
                 SystemNote(
@@ -1118,7 +1118,7 @@ class OkonomiAgent:
                 )
             )
 
-    def _commit_turn(self, agent_run, deps: AgentDependencies, post_messages: list) -> None:
+    def _commit_turn(self, agent_run, post_messages: list) -> None:
         """Fold the run's results into ``self.state``. Shared by the
         normal-completion and cancellation paths."""
         self._accumulate_usage(agent_run)

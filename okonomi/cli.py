@@ -10,9 +10,9 @@ import asyncio
 import sys
 
 from .agent import OkonomiAgent
-from .agent.jobs import REPORTED_KINDS, job_notice
+from .agent.jobs import run_until_jobs_report
 from .config import load_env_or_raise
-from .events import JobFinished, SystemNote
+from .events import SystemNote
 from .tools._command_guard import load_approval_rules
 from .tools._sandbox import wrap_command
 
@@ -97,30 +97,7 @@ async def _run_single_task(agent: OkonomiAgent, user_message: str) -> None:
     agent.emitter.subscribe(transcript.on_event)
     loop = asyncio.get_running_loop()
 
-    # A one-shot run has no input loop to deliver completion notices later,
-    # so it takes one more turn per launched agent; exiting after the first
-    # turn would drop their results.
-    async def _run_until_agents_report() -> None:
-        notices: asyncio.Queue[JobFinished] = asyncio.Queue()
-
-        def _collect(ev) -> None:
-            if isinstance(ev, JobFinished) and ev.kind in REPORTED_KINDS:
-                loop.call_soon_threadsafe(notices.put_nowait, ev)
-
-        agent.emitter.subscribe(_collect)
-        await agent.run_async(user_message, reset=True)
-        # Counted by job id rather than by "still running": a job is marked
-        # done just before its notice is emitted.
-        reported: set[str] = set()
-        while True:
-            launched = {job_id for job_id, entry in agent.jobs.entries.items() if entry["kind"] in REPORTED_KINDS}
-            if launched <= reported:
-                return
-            ev = await notices.get()
-            reported.add(ev.job_id)
-            await agent.run_async(job_notice(ev))
-
-    agent_task = asyncio.create_task(_run_until_agents_report())
+    agent_task = asyncio.create_task(run_until_jobs_report(agent, user_message))
     interrupted = False
 
     def on_sigint():

@@ -11,7 +11,7 @@ from dataclasses import dataclass
 from datetime import datetime
 
 from ..config import subagent_models
-from ..events import JobFinished, SystemNote
+from ..events import SystemNote
 from ..utils import shutdown_loop
 
 
@@ -121,7 +121,7 @@ class AgentTools:
 
         def _run():
             from okonomi.agent import OkonomiAgent
-            from okonomi.agent.jobs import REPORTED_KINDS, job_notice
+            from okonomi.agent.jobs import run_until_jobs_report
 
             final_status = "ok"
             reply = None
@@ -138,32 +138,8 @@ class AgentTools:
                 loop = asyncio.new_event_loop()
                 asyncio.set_event_loop(loop)
 
-                # This thread has no input loop to deliver completion notices
-                # later, so it takes one more turn per agent the sub-agent
-                # launched itself; returning after the first turn would drop
-                # their results.
-                async def _run_until_agents_report() -> str:
-                    notices: asyncio.Queue[JobFinished] = asyncio.Queue()
-
-                    def _collect(ev) -> None:
-                        if isinstance(ev, JobFinished) and ev.kind in REPORTED_KINDS:
-                            loop.call_soon_threadsafe(notices.put_nowait, ev)
-
-                    agent.emitter.subscribe(_collect)
-                    reply = await agent.run_async(task, reset=True)
-                    # Counted by job id rather than by "still running": a job
-                    # is marked done just before its notice is emitted.
-                    reported: set[str] = set()
-                    while True:
-                        launched = {job_id for job_id, entry in agent.jobs.entries.items() if entry["kind"] in REPORTED_KINDS}
-                        if launched <= reported:
-                            return reply
-                        ev = await notices.get()
-                        reported.add(ev.job_id)
-                        reply = await agent.run_async(job_notice(ev))
-
                 try:
-                    reply = loop.run_until_complete(_run_until_agents_report())
+                    reply = loop.run_until_complete(run_until_jobs_report(agent, task))
                     bg_task.output = reply or ""
                     produced = list(agent.state.artifacts)
                     parent.state.artifacts.extend(produced)

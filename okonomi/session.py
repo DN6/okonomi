@@ -23,7 +23,7 @@ import json
 import shutil
 import uuid
 from dataclasses import asdict, dataclass, field, fields
-from datetime import datetime, timedelta
+from datetime import datetime
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Literal
 
@@ -550,17 +550,11 @@ def resolve_session(query: str) -> Session | None:
     return Session.load(hits[0]["session_id"]) if hits else None
 
 
-def prune_empty_sessions(*, min_age_hours: int = 24) -> int:
-    """Delete sessions with no artifacts.
-
-    Truly empty rows (no task_input, no title) go regardless of age —
-    they never got past the prompt. Rows with content but no
-    artifacts get ``min_age_hours`` of grace so an in-flight
-    generation isn't killed.
-    """
+def prune_empty_sessions() -> int:
+    """Delete sessions that never got past the prompt: no artifacts, no
+    task_input, no title."""
     conn = db.connection()
-    cutoff = (datetime.now() - timedelta(hours=min_age_hours)).isoformat()
-    rows = db.find_prunable_sessions(conn, cutoff)
+    rows = db.find_prunable_sessions(conn)
     if not rows:
         return 0
 

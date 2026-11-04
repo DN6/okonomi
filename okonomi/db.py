@@ -313,15 +313,12 @@ def resolve_session_loose(conn: sqlite3.Connection, query: str) -> dict[str, Any
     return dict(row) if row else None
 
 
-def find_prunable_sessions(conn: sqlite3.Connection, cutoff: str) -> list[dict[str, Any]]:
-    """Sessions with no artifacts: truly empty rows (no task_input, no
-    title) regardless of age; rows with content only when created before
-    ``cutoff``."""
+def find_prunable_sessions(conn: sqlite3.Connection) -> list[dict[str, Any]]:
+    """Sessions with no artifacts, no task_input and no title."""
     rows = conn.execute(
         "SELECT session_id FROM sessions "
         "WHERE NOT EXISTS (SELECT 1 FROM artifacts a WHERE a.session_id = sessions.session_id) "
-        "AND ((task_input = '' AND title = '') OR created_at < ?)",
-        (cutoff,),
+        "AND task_input = '' AND title = ''",
     ).fetchall()
     return [dict(r) for r in rows]
 
