@@ -11,13 +11,41 @@ payloads).
 
 from __future__ import annotations
 
+import logging
 import re
+import subprocess
+from collections.abc import Callable
 from datetime import date
+from pathlib import Path
 
 from okonomi import session as _session
 
 
+logger = logging.getLogger(__name__)
+
+
+def _commit_mind_page(mind_dir: Path, slug: str, message: str) -> None:
+    """Keep the wiki's history: every ``remember`` is one commit, so a
+    page's evolution is ``git log -p <slug>.md``. Failures only warn —
+    the page is already written."""
+    def git(*args: str) -> None:
+        subprocess.run(["git", *args], cwd=mind_dir, check=True, capture_output=True, text=True)
+
+    try:
+        if not (mind_dir / ".git").exists():
+            git("init", "-q")
+        git("add", f"{slug}.md")
+        git("-c", "user.name=okonomi", "-c", "user.email=okonomi@localhost", "commit", "-q", "-m", message)
+    except (OSError, subprocess.CalledProcessError) as e:
+        detail = getattr(e, "stderr", "") or str(e)
+        logger.warning("Mind wiki commit failed for %s: %s", slug, detail.strip())
+
+
 class SessionsTools:
+
+    def __init__(self, session_fn: Callable[[], _session.Session] | None = None):
+        # A callable, not the session: /new and resume swap the agent's session.
+        self._session_fn = session_fn
 
     def recall(
         self,
@@ -98,6 +126,9 @@ class SessionsTools:
         path = mind_dir / f"{slug}.md"
         today = date.today().isoformat()
         created = today
+        # Every session that wrote the page, oldest first — the join from a
+        # concept to the conversations and artifacts that shaped it.
+        sessions: list[str] = []
         if path.exists():
             current = path.read_text(encoding="utf-8")
             if not update:
@@ -108,14 +139,23 @@ class SessionsTools:
                 }
             if m := re.search(r"^created:\s*(\S+)", current, re.MULTILINE):
                 created = m.group(1)
+            if m := re.search(r"^sessions:\s*\[(.*)\]", current, re.MULTILINE):
+                sessions = [s.strip() for s in m.group(1).split(",") if s.strip()]
+        session_id = self._session_fn().session_id if self._session_fn is not None else ""
+        if session_id and session_id not in sessions:
+            sessions.append(session_id)
         heading = "" if body.lstrip().startswith("# ") else f"# {title}\n\n"
         links = ", ".join(f"[[{r}]]" for r in related or [])
         page = (
             f"---\ntitle: {title}\ntags: [{', '.join(tags or [])}]\ncreated: {created}\nupdated: {today}\n"
-            f"related: {links}\n---\n\n{heading}{body.strip()}\n"
+            f"related: {links}\nsessions: [{', '.join(sessions)}]\n---\n\n{heading}{body.strip()}\n"
         )
         mind_dir.mkdir(parents=True, exist_ok=True)
         path.write_text(page, encoding="utf-8")
+        message = f"{'update' if update else 'create'} {slug}"
+        if session_id:
+            message += f" ({session_id})"
+        _commit_mind_page(mind_dir, slug, message)
         return {"path": str(path), "slug": slug, "updated" if update else "created": True}
 
     def _discover(self, query: str, limit: int) -> dict:

@@ -1,10 +1,14 @@
 """Env scrub + sandbox wrapper for model-run subprocesses (bash)."""
 
+import subprocess
 import sys
+import uuid
+from pathlib import Path
 
 import pytest
 
 from okonomi.tools import _sandbox
+from okonomi.tools.terminal import TerminalTools
 from okonomi.utils import scrub_env
 
 
@@ -17,10 +21,6 @@ def test_scrub_env_drops_secret_like_vars():
 
 @pytest.mark.skipif(sys.platform not in ("darwin", "linux"), reason="okonomi sandboxes only macOS and Linux")
 def test_sandbox_blocks_out_of_scope_write(tmp_path):
-    import subprocess
-    import uuid
-    from pathlib import Path
-
     _sandbox._probed = False
     inside = tmp_path / "allowed.txt"
     argv = _sandbox.wrap_command(["/bin/bash", "-c", f"echo hi > {inside}"], cwd=str(tmp_path))
@@ -51,8 +51,6 @@ def test_failed_probe_refuses_with_install_hint(monkeypatch):
 
 
 def test_env_file_injects_scrubbed_credential_into_bash(tmp_path, monkeypatch):
-    from okonomi.tools.terminal import TerminalTools
-
     env_file = tmp_path / "creds.env"
     env_file.write_text("FAL_KEY=fal-secret-value-123\n")
     monkeypatch.setenv("OKONOMI_ENV_FILE", str(env_file))
@@ -64,10 +62,17 @@ def test_env_file_injects_scrubbed_credential_into_bash(tmp_path, monkeypatch):
 
 
 def test_env_file_missing_fails_command(tmp_path, monkeypatch):
-    from okonomi.tools.terminal import TerminalTools
-
     monkeypatch.setenv("OKONOMI_ENV_FILE", str(tmp_path / "missing.env"))
 
     result = TerminalTools().bash("echo should-not-run")
     assert result["exit_code"] != 0, f"command ran without its env file: {result!r}"
     assert "OKONOMI_ENV_FILE" in result["output"]
+
+
+def test_session_and_scratch_dirs_are_exported_to_bash():
+    terminal = TerminalTools()
+    terminal._session_dir_fn = lambda: "/tmp/okonomi-test/artifacts"
+    terminal._scratch_dir_fn = lambda: "/tmp/okonomi-test/scratch"
+
+    result = terminal.bash('echo "$OKONOMI_SESSION_DIR|$OKONOMI_SCRATCH_DIR"')
+    assert result["output"].strip() == "/tmp/okonomi-test/artifacts|/tmp/okonomi-test/scratch", result

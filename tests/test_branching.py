@@ -1,12 +1,14 @@
 """Session-tree branching: the checkout primitive, tree-row flattening,
-branch summaries, and branch-aware saves."""
+and branch-aware saves."""
 
 import json
+from types import SimpleNamespace
 
 import pytest
 from pydantic_ai.messages import ModelRequest, ModelResponse, TextPart, UserPromptPart
 
 from okonomi import db
+from okonomi import session as session_store
 from okonomi.context import BRANCH_SUMMARY_PREFIX
 from okonomi.events import CONVERSATION_TYPES, EventType
 from okonomi.tui.pickers import _tree_rows
@@ -16,11 +18,9 @@ SID = "2026-07-30_treetest"
 
 
 @pytest.fixture
-def conn(tmp_path):
-    c = db.open_db(tmp_path / "test.db")
-    db.upsert_session(c, {"session_id": SID})
-    yield c
-    c.close()
+def conn(store):
+    db.upsert_session(store, {"session_id": SID})
+    return store
 
 
 def _row(text: str, type_: EventType = EventType.USER_MESSAGE) -> dict:
@@ -108,7 +108,6 @@ def test_tree_rows_forked_session():
     heads = [r["heads"] for r in rows]
     assert heads == [(), (), (), (2,), (), (), (), ()], f"enclosing heads: {heads}"
 
-
     by_id = {r["event_id"]: r for r in rows}
     assert by_id[0]["checkout_target"] is None, "root user row must check out to empty path"
     assert by_id[2]["checkout_target"] == 1 and by_id[4]["checkout_target"] == 1
@@ -120,26 +119,13 @@ def test_tree_rows_forked_session():
     assert not by_id[5]["active"] and by_id[6]["active"]
 
 
-# ── pickers._abandoned_count + history search filter ─────────────────────
-
-
-# ── ContextManager.summarize_branch ──────────────────────────────────────
-
-
 # ── Session save/load across a checkout ──────────────────────────────────
 
 
-def test_checkout_reload_sync(conn, tmp_path, monkeypatch):
+def test_checkout_reload_sync(conn):
     """A checkout followed by reload keeps _sync_conversation's count
     heuristic consistent: the next save appends only the new tail, chained
     from the checked-out leaf."""
-    from types import SimpleNamespace
-
-    import okonomi.session as session_store
-
-    monkeypatch.setattr(db, "_connection", conn)
-    monkeypatch.setattr(session_store, "OKONOMI_SESSIONS_DIR", tmp_path)
-
     history = [
         ModelRequest(parts=[UserPromptPart(content="ask one")]),
         ModelResponse(parts=[TextPart(content="answer one")]),

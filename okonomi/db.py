@@ -28,7 +28,7 @@ from enum import Enum
 from pathlib import Path
 from typing import Any, Iterable
 
-from .config import OKONOMI_SESSIONS_DIR
+from .config import OKONOMI_HOME
 
 
 DB_FILENAME = "okonomi.db"
@@ -118,18 +118,18 @@ CREATE TABLE IF NOT EXISTS artifacts (
     description     TEXT NOT NULL DEFAULT '',
     tool_name       TEXT NOT NULL DEFAULT '',
     model_id        TEXT NOT NULL DEFAULT '',
-    timestamp       TEXT NOT NULL DEFAULT ''
+    timestamp       TEXT NOT NULL DEFAULT '',
+    tool_call_id    TEXT NOT NULL DEFAULT ''
 );
 
 CREATE INDEX IF NOT EXISTS idx_artifacts_session ON artifacts(session_id);
 CREATE INDEX IF NOT EXISTS idx_artifacts_type    ON artifacts(artifact_type);
 CREATE INDEX IF NOT EXISTS idx_artifacts_ts      ON artifacts(timestamp DESC);
 
--- User-curated favorites. Two flavors share one table:
---   internal: artifact_id set → CASCADE-deletes with the artifact
---   external: artifact_id NULL → user bookmarked a bare URL or local path
--- Dedup via partial unique indexes: same artifact / same URL / same path
--- can each be favorited at most once.
+-- User-curated favorites, keyed by ``url`` (a remote URL or a resolved
+-- local path) and joined to artifacts by that ref at read time. The
+-- ``artifact_id`` / ``artifact_source`` columns are unused leftovers of
+-- an earlier id-keyed design, kept only because SQLite can't drop them.
 CREATE TABLE IF NOT EXISTS favorites (
     id              INTEGER PRIMARY KEY AUTOINCREMENT,
     artifact_id     INTEGER REFERENCES artifacts(id) ON DELETE CASCADE,
@@ -158,10 +158,19 @@ CREATE VIRTUAL TABLE IF NOT EXISTS events_fts USING fts5(
     tokenize = 'porter unicode61'
 );
 
+-- The mind wiki's pages. The files stay the record (they are written by
+-- ``remember`` and versioned in git); this is the search index over
+-- them, reconciled from file mtimes on every read (see sync_mind_index).
+CREATE VIRTUAL TABLE IF NOT EXISTS mind_fts USING fts5(
+    path UNINDEXED, title UNINDEXED, tags UNINDEXED, mtime UNINDEXED, content,
+    tokenize = 'porter unicode61'
+);
+
 -- Indexed terms, for expanding a typed prefix (see expand_prefixes).
 CREATE VIRTUAL TABLE IF NOT EXISTS sessions_vocab  USING fts5vocab(sessions_fts, row);
 CREATE VIRTUAL TABLE IF NOT EXISTS artifacts_vocab USING fts5vocab(artifacts_fts, row);
 CREATE VIRTUAL TABLE IF NOT EXISTS events_vocab    USING fts5vocab(events_fts, row);
+CREATE VIRTUAL TABLE IF NOT EXISTS mind_vocab      USING fts5vocab(mind_fts, row);
 
 CREATE TRIGGER IF NOT EXISTS events_ai AFTER INSERT ON events BEGIN
     INSERT INTO events_fts(rowid, content) VALUES (new.rowid, new.content);
@@ -225,8 +234,29 @@ def open_db(db_path: Path) -> sqlite3.Connection:
     conn.execute("PRAGMA journal_mode = WAL")
     conn.execute("PRAGMA foreign_keys = ON")
     conn.executescript(_SCHEMA)
+    _migrate(conn)
 
     return conn
+
+
+# Columns added after a table first shipped: CREATE TABLE IF NOT EXISTS
+# leaves an existing table alone, so each is added here when missing.
+_ADDED_COLUMNS = (
+    ("artifacts", "tool_call_id", "TEXT NOT NULL DEFAULT ''"),
+)
+
+
+def _migrate(conn: sqlite3.Connection) -> None:
+    for table, column, decl in _ADDED_COLUMNS:
+        present = {r["name"] for r in conn.execute(f"PRAGMA table_info({table})")}
+        if column not in present:
+            conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} {decl}")
+    # Artifacts used to be dropped and re-inserted on every save, which
+    # left duplicate rows for one file; upsert_artifacts keys on the ref now.
+    conn.execute(
+        "DELETE FROM artifacts WHERE id NOT IN "
+        "(SELECT MIN(id) FROM artifacts GROUP BY session_id, path, url)"
+    )
 
 
 _connection: sqlite3.Connection | None = None
@@ -240,7 +270,7 @@ def connection() -> sqlite3.Connection:
     global _connection
     with _connection_lock:
         if _connection is None:
-            _connection = open_db(OKONOMI_SESSIONS_DIR / DB_FILENAME)
+            _connection = open_db(OKONOMI_HOME / DB_FILENAME)
         return _connection
 
 
@@ -335,36 +365,34 @@ def update_session_title(conn: sqlite3.Connection, session_id: str, title: str) 
 # ── artifacts ───────────────────────────────────────────────────────────
 
 
-def replace_artifacts(conn: sqlite3.Connection, session_id: str, artifacts: Iterable[dict[str, Any]]) -> None:
-    """Drop and re-insert all artifacts for a session. Cheap — artifact
-    lists are small and append-only within a turn."""
-    conn.execute("DELETE FROM artifacts WHERE session_id = ?", (session_id,))
-    rows = [
-        (
-            session_id,
-            a.get("artifact_type") or "",
-            a.get("url") or "",
-            a.get("path") or "",
-            a.get("prompt") or "",
-            a.get("description") or "",
-            a.get("tool_name") or "",
-            a.get("model_id") or "",
-            a.get("timestamp") or "",
+_ARTIFACT_COLS = (
+    "artifact_type", "url", "path", "prompt", "description", "tool_name", "model_id", "timestamp", "tool_call_id",
+)
+
+
+def upsert_artifacts(conn: sqlite3.Connection, session_id: str, artifacts: Iterable[dict[str, Any]]) -> None:
+    """Insert new artifacts and update existing ones, keyed on the ref
+    (``path``, else ``url``) within the session. Rows are never deleted,
+    so an artifact's ``id`` is stable for the life of the session."""
+    for a in artifacts:
+        values = [a.get(c) or "" for c in _ARTIFACT_COLS]
+        updated = conn.execute(
+            f"UPDATE artifacts SET {', '.join(f'{c} = ?' for c in _ARTIFACT_COLS)} "
+            "WHERE session_id = ? AND path = ? AND url = ?",
+            (*values, session_id, a.get("path") or "", a.get("url") or ""),
         )
-        for a in artifacts
-    ]
-    if rows:
-        conn.executemany(
-            "INSERT INTO artifacts (session_id, artifact_type, url, path, prompt, "
-            "description, tool_name, model_id, timestamp) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
-            rows,
-        )
+        if updated.rowcount == 0:
+            conn.execute(
+                f"INSERT INTO artifacts (session_id, {', '.join(_ARTIFACT_COLS)}) "
+                f"VALUES (?, {', '.join('?' for _ in _ARTIFACT_COLS)})",
+                (session_id, *values),
+            )
 
 
 def fetch_artifacts(conn: sqlite3.Connection, session_id: str) -> list[dict[str, Any]]:
     rows = conn.execute(
         "SELECT artifact_type, url, path, prompt, description, "
-        "tool_name, model_id, timestamp FROM artifacts WHERE session_id = ? ORDER BY id",
+        "tool_name, model_id, timestamp, tool_call_id FROM artifacts WHERE session_id = ? ORDER BY id",
         (session_id,),
     ).fetchall()
     return [dict(r) for r in rows]
@@ -683,69 +711,70 @@ def search_sessions_fts(conn: sqlite3.Connection, query: str, limit: int = 20) -
 
 
 _MIND_TITLE = re.compile(r"^title:\s*(.+)$", re.MULTILINE)
-_MIND_SUMMARY = re.compile(r"^tags:\s*(.+)$", re.MULTILINE)
+_MIND_TAGS = re.compile(r"^tags:\s*(.+)$", re.MULTILINE)
 
 
-def _mind_page(path: Path, content: str, **extra: Any) -> dict[str, Any]:
-    title = _MIND_TITLE.search(content)
+def sync_mind_index(conn: sqlite3.Connection, mind_dir: Path) -> None:
+    """Reconcile ``mind_fts`` with the files on disk. ``remember`` is the
+    only tool that writes pages, but they can be edited or deleted by
+    hand, so every read reconciles from mtimes instead of trusting a
+    write hook — one stat per page, and the wiki is small."""
+    indexed = {r["path"]: r["mtime"] for r in conn.execute("SELECT path, mtime FROM mind_fts")}
+    seen: set[str] = set()
+    for p in mind_dir.glob("*.md") if mind_dir.is_dir() else ():
+        path, mtime = str(p), p.stat().st_mtime
+        seen.add(path)
+        if indexed.get(path) == mtime:
+            continue
+        content = p.read_text(encoding="utf-8", errors="replace")
+        title = _MIND_TITLE.search(content)
+        tags = _MIND_TAGS.search(content)
+        conn.execute("DELETE FROM mind_fts WHERE path = ?", (path,))
+        conn.execute(
+            "INSERT INTO mind_fts (path, title, tags, mtime, content) VALUES (?, ?, ?, ?, ?)",
+            (path, title.group(1).strip() if title else p.stem, tags.group(1).strip() if tags else "", mtime, content),
+        )
+    for path in indexed.keys() - seen:
+        conn.execute("DELETE FROM mind_fts WHERE path = ?", (path,))
+
+
+def _mind_hit(row: sqlite3.Row, **extra: Any) -> dict[str, Any]:
     return {
-        "path": str(path),
-        "title": title.group(1).strip() if title else path.stem,
-        "timestamp": datetime.fromtimestamp(path.stat().st_mtime).isoformat(timespec="seconds"),
+        "path": row["path"],
+        "title": row["title"],
+        "timestamp": datetime.fromtimestamp(row["mtime"]).isoformat(timespec="seconds"),
         **extra,
     }
 
 
-def list_mind_pages(mind_dir: Path) -> list[dict[str, Any]]:
+def list_mind_pages(conn: sqlite3.Connection, mind_dir: Path) -> list[dict[str, Any]]:
     """Every mind wiki page, most recently edited first, with its
     frontmatter tags as the snippet."""
-    if not mind_dir.is_dir():
-        return []
-    pages = []
-    for p in mind_dir.glob("*.md"):
-        content = p.read_text(encoding="utf-8", errors="replace")
-        summary = _MIND_SUMMARY.search(content)
-        pages.append(_mind_page(p, content, snippet=summary.group(1).strip() if summary else "", score=0.0))
-    pages.sort(key=lambda h: h["timestamp"], reverse=True)
-    return pages
+    sync_mind_index(conn, mind_dir)
+    rows = conn.execute("SELECT path, title, tags, mtime FROM mind_fts ORDER BY mtime DESC").fetchall()
+    return [_mind_hit(r, snippet=r["tags"], score=0.0) for r in rows]
 
 
-def search_mind_fts(mind_dir: Path, query: str, limit: int = 20) -> list[dict[str, Any]]:
-    """BM25-ranked FTS5 search over the mind wiki's markdown pages.
-
-    The pages are plain files written by the agent through any file tool,
-    so there is no write hook to keep a persistent index in sync; the
-    wiki is small, so it is indexed into a throwaway in-memory table per
-    query instead.
-    """
+def search_mind_fts(conn: sqlite3.Connection, mind_dir: Path, query: str, limit: int = 20) -> list[dict[str, Any]]:
+    """BM25-ranked FTS5 search over the mind wiki's pages."""
     q = sanitize_fts_query(query)
-    if not q.strip() or not mind_dir.is_dir():
+    if not q.strip():
         return []
-    mem = sqlite3.connect(":memory:")
-    mem.row_factory = sqlite3.Row
+    sync_mind_index(conn, mind_dir)
+    q = expand_prefixes(conn, "mind_vocab", q)
+    sql = """
+        SELECT path, title, mtime, snippet(mind_fts, 4, '>>>', '<<<', '…', 20) AS snippet,
+               bm25(mind_fts) AS score
+        FROM mind_fts
+        WHERE mind_fts MATCH ?
+        ORDER BY score
+        LIMIT ?
+        """
     try:
-        mem.execute("CREATE VIRTUAL TABLE mind_fts USING fts5(path UNINDEXED, content, tokenize = 'porter unicode61')")
-        mem.execute("CREATE VIRTUAL TABLE mind_vocab USING fts5vocab(mind_fts, row)")
-        mem.executemany(
-            "INSERT INTO mind_fts(path, content) VALUES (?, ?)",
-            [(str(p), p.read_text(encoding="utf-8", errors="replace")) for p in sorted(mind_dir.glob("*.md"))],
-        )
-        q = expand_prefixes(mem, "mind_vocab", q)
-        sql = """
-            SELECT path, content, snippet(mind_fts, 1, '>>>', '<<<', '…', 20) AS snippet,
-                   bm25(mind_fts) AS score
-            FROM mind_fts
-            WHERE mind_fts MATCH ?
-            ORDER BY score
-            LIMIT ?
-            """
-        try:
-            rows = mem.execute(sql, (q, limit)).fetchall()
-        except sqlite3.OperationalError:
-            rows = mem.execute(sql, (_force_phrase(query), limit)).fetchall()
-    finally:
-        mem.close()
-    return [_mind_page(Path(r["path"]), r["content"], snippet=r["snippet"], score=r["score"]) for r in rows]
+        rows = conn.execute(sql, (q, limit)).fetchall()
+    except sqlite3.OperationalError:
+        rows = conn.execute(sql, (_force_phrase(query), limit)).fetchall()
+    return [_mind_hit(r, snippet=r["snippet"], score=r["score"]) for r in rows]
 
 
 def search_artifacts_fts(conn: sqlite3.Connection, query: str, *, limit: int = 50) -> list[dict[str, Any]]:
@@ -823,37 +852,14 @@ def search_artifacts_fts(conn: sqlite3.Connection, query: str, *, limit: int = 5
 # ── favorites ───────────────────────────────────────────────────────────
 
 
-def add_favorite(
-    conn: sqlite3.Connection,
-    *,
-    artifact_id: int | None = None,
-    url: str = "",
-    artifact_type: str = "",
-) -> int:
-    """Favorite an asset. Idempotent — re-favoriting the same target refreshes
-    the timestamp and returns the existing row id.
-
-    Identity:
-      - ``artifact_id`` set → internal favorite (de-duped per artifact)
-      - else ``url`` set    → external favorite (de-duped per URL/path string)
-
-    The ``url`` arg accepts either a remote URL (``http``/``https``/
-    ``file``/``data``) or a bare local filesystem path.
-
-    Returns the favorite row's id.
-    """
-    if artifact_id is None and not url:
-        raise ValueError("add_favorite needs artifact_id or url")
+def add_favorite(conn: sqlite3.Connection, *, url: str, artifact_type: str = "") -> int:
+    """Favorite a ref — a remote URL or a resolved local path. Idempotent:
+    re-favoriting refreshes the timestamp and returns the existing row id."""
+    if not url:
+        raise ValueError("add_favorite needs a url or path")
 
     now = datetime.now().isoformat()
-    if artifact_id is not None:
-        match_sql = "SELECT id FROM favorites WHERE artifact_id = ?"
-        match_params = (artifact_id,)
-    else:
-        match_sql = "SELECT id FROM favorites WHERE artifact_id IS NULL AND url = ?"
-        match_params = (url,)
-
-    row = conn.execute(match_sql, match_params).fetchone()
+    row = conn.execute("SELECT id FROM favorites WHERE url = ?", (url,)).fetchone()
     if row is not None:
         # Refresh the timestamp; preserve artifact_type unless the caller
         # supplied a non-empty one.
@@ -865,11 +871,9 @@ def add_favorite(
         )
         return int(row["id"])
 
-    source = "internal" if artifact_id is not None else "external"
     cur = conn.execute(
-        "INSERT INTO favorites (artifact_id, artifact_source, url, artifact_type, "
-        "favorited_at) VALUES (?, ?, ?, ?, ?)",
-        (artifact_id, source, url, artifact_type, now),
+        "INSERT INTO favorites (url, artifact_type, favorited_at) VALUES (?, ?, ?)",
+        (url, artifact_type, now),
     )
     return int(cur.lastrowid or 0)
 
@@ -881,28 +885,23 @@ def remove_favorite(conn: sqlite3.Connection, favorite_id: int) -> bool:
 
 
 def list_favorites(conn: sqlite3.Connection, *, limit: int | None = None) -> list[dict[str, Any]]:
-    """Newest-first favorites with artifact + session context via LEFT JOIN.
-    Internal favorites join on ``artifact_id``; external favorites join on the
-    newest artifact whose path or URL equals the stored ref, so a favorite
-    from the viewer or asset picker still knows its prompt and session.
+    """Newest-first favorites joined to the artifact whose path or URL
+    equals the stored ref, so a favorite from the viewer or asset picker
+    still knows its prompt and session.
 
-    Each row carries: ``id``, ``artifact_id`` (or None),
-    ``artifact_source``, ``url`` (URL or local path), ``artifact_type``,
-    ``favorited_at``, plus ``session_id`` / ``session_title`` / ``prompt``
-    / ``tool_name`` / ``model_id`` when the favorite is internal.
+    Each row carries: ``id``, ``url`` (URL or local path),
+    ``artifact_type``, ``favorited_at``, plus ``artifact_id`` /
+    ``session_id`` / ``session_title`` / ``prompt`` / ``tool_name`` /
+    ``model_id`` when the ref is a tracked artifact.
     """
     sql = """
-        SELECT f.id, f.artifact_id, f.artifact_source, f.favorited_at,
-               COALESCE(NULLIF(f.url, ''), a.path, a.url) AS url,
+        SELECT f.id, f.favorited_at, f.url,
                COALESCE(NULLIF(f.artifact_type, ''), a.artifact_type) AS artifact_type,
-               a.session_id, a.prompt, a.description, a.tool_name, a.model_id, a.timestamp,
+               a.id AS artifact_id, a.session_id, a.prompt, a.description, a.tool_name, a.model_id, a.timestamp,
                COALESCE(NULLIF(s.title, ''), substr(s.task_input, 1, 60)) AS session_title
         FROM favorites f
-        LEFT JOIN artifacts a ON a.id = COALESCE(
-            f.artifact_id,
-            (SELECT x.id FROM artifacts x
-             WHERE f.url != '' AND (x.path = f.url OR x.url = f.url)
-             ORDER BY x.id DESC LIMIT 1)
+        LEFT JOIN artifacts a ON a.id = (
+            SELECT x.id FROM artifacts x WHERE x.path = f.url OR x.url = f.url ORDER BY x.id LIMIT 1
         )
         LEFT JOIN sessions  s ON s.session_id = a.session_id
         ORDER BY f.favorited_at DESC

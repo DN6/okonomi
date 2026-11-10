@@ -15,7 +15,7 @@ from typing import TYPE_CHECKING
 
 from .. import session as _session
 from ..config import OKONOMI_FAVORITES_DIR
-from ..events import EventEmitter, SystemNote
+from ..events import AssetAction, EventEmitter, SystemNote
 from ..utils import copy_to_clipboard
 
 
@@ -73,14 +73,21 @@ def _symlink_into_favorites(src: Path, label: str) -> Path:
     return link
 
 
-def set_favorite(ref: str, *, artifact_type: str, favorite: bool, label: str) -> None:
+def record_asset_action(session, action: str, refs: list[str]) -> None:
+    """Persist a user action on assets (favorite / open / copy) onto the
+    session's event stream, so the act sits at its place in the conversation."""
+    session.append_stream_events([AssetAction(action=action, refs=[_session.norm_ref(r) for r in refs])])
+
+
+def set_favorite(ref: str, *, artifact_type: str, favorite: bool, session) -> None:
     """Add or remove one favorite ref (viewer or asset picker). Removing drops every
     favorite row resolving to ``ref`` (internal or external) and its symlinks."""
     target = _session.norm_ref(ref)
+    record_asset_action(session, "favorite" if favorite else "unfavorite", [target])
     if favorite:
         _session.favorite(url=target, artifact_type=artifact_type)
         if Path(target).is_file():
-            _symlink_into_favorites(Path(target), label)
+            _symlink_into_favorites(Path(target), session.session_id)
         return
     for f in _session.list_favorites():
         if f.get("url") and _session.norm_ref(f["url"]) == target:
@@ -112,18 +119,19 @@ def handle_asset_action(
     if not paths:
         return
     if action == "open":
-        _open_paths(paths, emitter)
+        _open_paths(paths, agent, emitter)
     elif action == "copy":
-        _copy_paths(paths, emitter)
+        _copy_paths(paths, agent, emitter)
     elif action == "favorite":
         _favorite_paths(paths, agent, emitter)
 
 
-def _open_paths(paths: list[str], emitter: EventEmitter) -> None:
+def _open_paths(paths: list[str], agent: "OkonomiAgent", emitter: EventEmitter) -> None:
     opener = {"darwin": "open", "linux": "xdg-open"}.get(sys.platform)
     if opener is None:
         emitter.emit(SystemNote(f"Don't know how to open files on {sys.platform}.", level="warn"))
         return
+    record_asset_action(agent.session, "open", paths)
     for p in paths:
         try:
             subprocess.Popen([opener, p], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
@@ -140,8 +148,9 @@ def _open_viewer(agent: "OkonomiAgent", emitter: EventEmitter) -> None:
     emitter.emit(SystemNote(f"Viewer open at {result['url']}"))
 
 
-def _copy_paths(paths: list[str], emitter: EventEmitter) -> None:
+def _copy_paths(paths: list[str], agent: "OkonomiAgent", emitter: EventEmitter) -> None:
     if copy_to_clipboard("\n".join(paths)):
+        record_asset_action(agent.session, "copy", paths)
         emitter.emit(SystemNote(f"Copied {len(paths)} path{'s' if len(paths) != 1 else ''} to clipboard."))
     else:
         emitter.emit(SystemNote("Clipboard copy failed (no pbcopy / xclip / xsel found).", level="warn"))
@@ -153,7 +162,7 @@ def _favorite_paths(paths: list[str], agent: "OkonomiAgent", emitter: EventEmitt
         artifact = next((a for a in agent.state.artifacts if (a.path or a.url) == p), None)
         artifact_type = (artifact.artifact_type if artifact else "") or guess_artifact_type(p)
         try:
-            set_favorite(p, artifact_type=artifact_type, favorite=True, label=agent.session.session_id)
+            set_favorite(p, artifact_type=artifact_type, favorite=True, session=agent.session)
             n += 1
         except Exception:
             continue

@@ -23,7 +23,7 @@ def test_tool_round_trip_records_each_call(tmp_path):
 
     def respond(messages, info):
         if len(messages) == 1:
-            return ModelResponse(parts=[ToolCallPart("add", {"a": 1, "b": 2}, tool_call_id="c1")])
+            return ModelResponse(parts=[ToolCallPart("add", {"a": 1, "b": 2}, tool_call_id="c1")], provider_response_id="pr1")
         return ModelResponse(parts=[TextPart("3")])
 
     agent = Agent(TracingModel(FunctionModel(respond), lambda: session), system_prompt="sys")
@@ -36,6 +36,7 @@ def test_tool_round_trip_records_each_call(tmp_path):
 
     first, second = _read_traces(session)
     assert first["session_id"] == "s1", first
+    assert first["provider_response_id"] == "pr1" and "run_id" in first, "trace lines must join to their event row"
     assert first["messages"] == [
         {"role": "system", "content": "sys"},
         {"role": "user", "content": "1+2?"},

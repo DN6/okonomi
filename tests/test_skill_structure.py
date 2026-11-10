@@ -29,12 +29,8 @@ def test_well_formed_skill_has_no_error_or_warning():
     assert warnings == []
 
 
-def test_create_skill_rejects_duplicate_slugs(tmp_path, monkeypatch):
-    monkeypatch.setattr(skills, "USER_SKILLS_DIR", tmp_path)
-    tool = SkillTools()
-    result = tool.create_skill(
-        "dupe", _mk("## Overview\na\n\n## Overview\nb\n")
-    )
+def test_create_skill_rejects_duplicate_slugs(store):
+    result = SkillTools().create_skill("dupe", _mk("## Overview\na\n\n## Overview\nb\n"))
     assert result["success"] is False
     assert "Duplicate" in result["error"]
-    assert not (tmp_path / "dupe").exists()
+    assert not (skills.USER_SKILLS_DIR / "dupe").exists()

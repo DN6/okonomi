@@ -62,12 +62,12 @@ def _fs_url(p: Path) -> str:
 
 
 def _items(session: Any) -> dict:
-    """Viewer payload: every non-hidden file in the session dir plus tracked
-    artifacts that live elsewhere or are still remote-only, oldest first.
-    Favorites from other sessions ride along flagged ``elsewhere`` so the ♥
-    filter is the one gallery of every favorite; the other filters
-    leave them out."""
-    root = session.session_dir.resolve()
+    """Viewer payload: every non-hidden file in the session's artifacts dir
+    plus tracked artifacts that live elsewhere or are still remote-only,
+    oldest first. Favorites from other sessions ride along flagged
+    ``elsewhere`` so the ♥ filter is the one gallery of every favorite; the
+    other filters leave them out."""
+    root = session.artifacts_dir.resolve()
     by_path: dict[str, Any] = {}
     extra: list[Any] = []
     for a in session.state.artifacts:
@@ -149,7 +149,7 @@ def _items(session: Any) -> dict:
 
 
 def _servable(session: Any, p: Path) -> bool:
-    if p.is_relative_to(session.session_dir.resolve()) or str(p) in favorite_refs():
+    if p.is_relative_to(session.artifacts_dir.resolve()) or str(p) in favorite_refs():
         return True
     return any(a.path and Path(a.path).resolve() == p for a in session.state.artifacts)
 
@@ -172,7 +172,7 @@ def _favorite(session: Any, body: dict) -> bool:
         ref,
         artifact_type="" if artifact_type == "file" else artifact_type,
         favorite=bool(body.get("favorite")),
-        label=session.session_id,
+        session=session,
     )
     return True
 

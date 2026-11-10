@@ -9,9 +9,8 @@ import threading
 import time
 from types import SimpleNamespace
 
-from pydantic_ai.messages import ModelResponse, TextPart
-from pydantic_ai.models.function import AgentInfo, DeltaToolCall, FunctionModel
-from test_mid_turn_messages import _users
+from _helpers import patch_web_fetch, streaming_model, users
+from pydantic_ai.models.function import AgentInfo, DeltaToolCall
 
 from okonomi.events import EventEmitter, SystemNote
 from okonomi.tui.session import TuiSession
@@ -26,11 +25,27 @@ def _wait(cond, seconds: float = 5.0) -> bool:
     return True
 
 
+def _drive(session: TuiSession, first: str, steer: str, started) -> float:
+    """Submit ``first``, wait for ``started()``, submit ``steer``; returns
+    the time of the steer. Always tears the session's loop down."""
+    try:
+        session._on_submit(first)
+        assert _wait(started), "the first turn never got going"
+        steered_at = time.monotonic()
+        session._on_submit(steer)
+        assert _wait(lambda: not session._agent_running and session._input_queue.empty())
+        return steered_at
+    finally:
+        session._submit(None)
+        session._worker_loop_future.result(timeout=5)
+        session._loop.call_soon_threadsafe(session._loop.stop)
+
+
 def test_message_typed_mid_reply_cuts_in_with_the_partial_reply(okonomi_agent):
     requests: list[tuple[float, list[str]]] = []
 
     async def _stream(messages, info: AgentInfo):
-        requests.append((time.monotonic(), _users(messages)))
+        requests.append((time.monotonic(), users(messages)))
         if len(requests) == 1:
             yield "Once upon a time, "
             for _ in range(100):
@@ -39,19 +54,12 @@ def test_message_typed_mid_reply_cuts_in_with_the_partial_reply(okonomi_agent):
         else:
             yield "Rocks are aggregates of minerals."
 
-    okonomi_agent.agent.model = FunctionModel(lambda m, i: ModelResponse(parts=[TextPart("unused")]), stream_function=_stream)
+    okonomi_agent.agent.model = streaming_model(_stream)
     session = TuiSession(okonomi_agent)
-    try:
-        session._on_submit("tell me a story")
-        assert _wait(lambda: okonomi_agent.streaming_text), "model never started streaming"
-        steered_at = time.monotonic()
-        session._on_submit("actually, tell me about rocks")
-        assert _wait(lambda: len(requests) >= 2), "the steer never reached the model"
-        assert _wait(lambda: not session._agent_running and session._input_queue.empty())
-    finally:
-        session._submit(None)
-        session._worker_loop_future.result(timeout=2)
-        session._loop.call_soon_threadsafe(session._loop.stop)
+
+    steered_at = _drive(
+        session, "tell me a story", "actually, tell me about rocks", lambda: okonomi_agent.streaming_text
+    )
 
     at, prompt = requests[1]
     assert at - steered_at < 1.0, f"steer waited {at - steered_at:.1f}s for the reply to finish"
@@ -60,41 +68,7 @@ def test_message_typed_mid_reply_cuts_in_with_the_partial_reply(okonomi_agent):
     assert len(requests) == 2, f"the story must not resume after the steer: {len(requests)} requests"
 
 
-def _loop_session(**kw) -> SimpleNamespace:
-    queued: list[str] = []
-    notes: list[str] = []
-    emitter = EventEmitter()
-    emitter.subscribe(lambda ev: isinstance(ev, SystemNote) and notes.append(ev.text))
-    fake = SimpleNamespace(
-        _quiet=False,
-        _held_notices=[],
-        _steer_texts=[],
-        _agent_running=False,
-        agent=SimpleNamespace(enqueue=lambda t: False, streaming_text=False, status=""),
-        _input_queue=SimpleNamespace(put_nowait=queued.append),
-        emitter=emitter,
-        queued=queued,
-        notes=notes,
-    )
-    fake.__dict__.update(kw)
-    return fake
-
-
-def test_job_result_after_a_stop_waits_for_the_users_next_message():
-    fake = _loop_session(_quiet=True)
-
-    TuiSession._deliver_notice(fake, "[system] Background tool call tool-1 finished.")
-    assert fake.queued == [], f"a stopped agent must not be woken by a job: {fake.queued}"
-    assert fake.notes, "the user must be told a result is waiting"
-
-    TuiSession._deliver_on_loop(fake, "now crop the video")
-    assert fake.queued == ["now crop the video\n\n[system] Background tool call tool-1 finished."], fake.queued
-    assert not fake._quiet and not fake._held_notices
-
-
 def test_message_typed_mid_tool_reaches_the_model_without_waiting(okonomi_agent, monkeypatch):
-    from test_mid_turn_messages import _patch_web_fetch
-
     started = threading.Event()
 
     def _body():
@@ -102,31 +76,47 @@ def test_message_typed_mid_tool_reaches_the_model_without_waiting(okonomi_agent,
         time.sleep(3)
         return {"ok": True}
 
-    _patch_web_fetch(monkeypatch, okonomi_agent, _body)
+    patch_web_fetch(monkeypatch, okonomi_agent, _body)
     requests: list[tuple[float, list[str]]] = []
 
     async def _stream(messages, info: AgentInfo):
-        requests.append((time.monotonic(), _users(messages)))
+        requests.append((time.monotonic(), users(messages)))
         if len(requests) == 1:
             yield {1: DeltaToolCall(name="web_fetch", json_args='{"url": "u"}', tool_call_id="w")}
         else:
             yield "ok"
 
-    okonomi_agent.agent.model = FunctionModel(lambda m, i: ModelResponse(parts=[TextPart("unused")]), stream_function=_stream)
+    okonomi_agent.agent.model = streaming_model(_stream)
     session = TuiSession(okonomi_agent)
-    try:
-        session._on_submit("fetch the page")
-        assert started.wait(5), "tool never started"
-        steered_at = time.monotonic()
-        session._on_submit("use the mirror instead")
-        assert _wait(lambda: len(requests) >= 2, 2), "the message waited on the tool"
-    finally:
-        session._submit(None)
-        session._worker_loop_future.result(timeout=5)
-        session._loop.call_soon_threadsafe(session._loop.stop)
+
+    steered_at = _drive(session, "fetch the page", "use the mirror instead", started.is_set)
 
     at, prompt = requests[1]
     assert at - steered_at < 1.0, f"message reached the model {at - steered_at:.1f}s later"
     assert "use the mirror instead" in prompt, prompt
     kinds = [j["kind"] for j in okonomi_agent.jobs.entries.values()]
     assert kinds == ["tool"], f"the tool must carry on as a background job: {kinds}"
+
+
+def test_job_result_after_a_stop_waits_for_the_users_next_message():
+    queued: list[str] = []
+    notes: list[str] = []
+    emitter = EventEmitter()
+    emitter.subscribe(lambda ev: isinstance(ev, SystemNote) and notes.append(ev.text))
+    fake = SimpleNamespace(
+        _quiet=True,
+        _held_notices=[],
+        _steer_texts=[],
+        _agent_running=False,
+        agent=SimpleNamespace(enqueue=lambda t: False, streaming_text=False, status=""),
+        _input_queue=SimpleNamespace(put_nowait=queued.append),
+        emitter=emitter,
+    )
+
+    TuiSession._deliver_notice(fake, "[system] Background tool call tool-1 finished.")
+    assert queued == [], f"a stopped agent must not be woken by a job: {queued}"
+    assert notes, "the user must be told a result is waiting"
+
+    TuiSession._deliver_on_loop(fake, "now crop the video")
+    assert queued == ["now crop the video\n\n[system] Background tool call tool-1 finished."], queued
+    assert not fake._quiet and not fake._held_notices

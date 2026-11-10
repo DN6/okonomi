@@ -5,7 +5,7 @@ from __future__ import annotations
 
 import threading
 
-from test_agent_completion_notice import WAIT_SECONDS, _child_agent, _fake_parent
+from _helpers import WAIT_SECONDS, child_agent, fake_agent
 
 import okonomi.agent as agent_pkg
 from okonomi.events import JobFinished
@@ -19,8 +19,8 @@ def test_launched_agent_exposes_its_jobs_and_closing_message(monkeypatch):
         self.jobs.mark_done(task_id="term-1", status="ok")
         return "segmented 3 images"
 
-    monkeypatch.setattr(agent_pkg, "OkonomiAgent", _child_agent(run_async))
-    parent = _fake_parent()
+    monkeypatch.setattr(agent_pkg, "OkonomiAgent", child_agent(run_async))
+    parent = fake_agent()
     done = threading.Event()
     parent.emitter.subscribe(lambda ev: isinstance(ev, JobFinished) and done.set())
     tools = AgentTools()

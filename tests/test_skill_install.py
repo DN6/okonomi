@@ -53,8 +53,7 @@ def _handler(request: httpx.Request) -> httpx.Response:
 
 
 @pytest.fixture
-def user_dir(tmp_path, monkeypatch):
-    monkeypatch.setattr(skills, "USER_SKILLS_DIR", tmp_path / "skills")
+def github(store, monkeypatch):
     real_client = httpx.Client
 
     def _mock_client(**kwargs):
@@ -62,7 +61,6 @@ def user_dir(tmp_path, monkeypatch):
         return real_client(**kwargs)
 
     monkeypatch.setattr(skills.httpx, "Client", _mock_client)
-    return tmp_path / "skills"
 
 
 def test_parse_shorthand_and_tree_url():
@@ -73,13 +71,13 @@ def test_parse_shorthand_and_tree_url():
     assert _parse_github_spec("https://example.com/x/y") is None, "non-GitHub URLs are rejected"
 
 
-def test_install_copies_skill_and_allowed_subdirs_only(user_dir):
+def test_install_copies_skill_and_allowed_subdirs_only(github):
     result = install_skill_from_github("o/r/skills/demo")
     assert result["success"], result
     assert result["name"] == "demo"
-    dest = user_dir / "demo"
+    dest = skills.USER_SKILLS_DIR / "demo"
     assert (dest / "SKILL.md").read_text() == SKILL_MD
     assert (dest / "README.md").read_text() == "readme"
     assert (dest / "references" / "api.md").read_text() == "api ref"
     assert not (dest / "node_modules").exists(), "dirs outside ALLOWED_SUBDIRS must be skipped"
-    assert not list(user_dir.glob(".tmp.*")), "staging dir must be renamed away"
+    assert not list(skills.USER_SKILLS_DIR.glob(".tmp.*")), "staging dir must be renamed away"

@@ -40,6 +40,7 @@ class EventType(str, Enum):
     SYSTEM_NOTE = "system_note"
     TITLE = "title"
     INTERRUPT = "interrupt"
+    ASSET_ACTION = "asset_action"
 
 
 CONVERSATION_TYPES = (
@@ -248,6 +249,21 @@ class Interrupt(Event):
     type: ClassVar[str] = "interrupt"
 
     reason: str = ""  # cancelled | timeout
+    # The text streamed before the cut. Not a completion, so it never
+    # reaches the traces file, but it is the direction the user rejected.
+    partial: str = ""
+
+
+@dataclass
+class AssetAction(Event):
+    """The user acted on assets outside the conversation: favorited,
+    opened or copied them from the viewer or the asset picker. Persisted
+    on the session stream so the act has a position in the conversation."""
+
+    type: ClassVar[str] = "asset_action"
+
+    action: str = ""  # favorite | unfavorite | open | copy
+    refs: list[str] = field(default_factory=list)
 
 
 @dataclass
