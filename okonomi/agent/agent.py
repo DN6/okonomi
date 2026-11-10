@@ -208,15 +208,18 @@ _MEDIA_EXT_TO_TYPE = {
     ".ply": "3d",
     ".html": "html",
     ".htm": "html",
+    # Briefs, prompt packages and research strands: tracked so a later
+    # generation that reads one links back to it in the artifact lineage.
+    ".md": "research",
 }
 
 _KNOWN_ASSET_EXTS = {".jpg", ".jpeg", ".png", ".webp", ".gif", ".mp4", ".webm", ".mov"}
 
 
-def download_asset(url: str, session_dir: Path, asset_type: str) -> str:
-    """Download ``url`` into ``<session_dir>/assets/<subdir>/`` and return
-    the local path. Returns ``""`` on any failure (network blip, fal
-    expiry) — callers retry on the next save."""
+def download_asset(url: str, artifacts_dir: Path, asset_type: str) -> str:
+    """Download ``url`` into ``<artifacts_dir>/<subdir>/`` and return the
+    local path. Returns ``""`` on any failure (network blip, fal expiry) —
+    callers retry on the next save."""
     try:
         url_filename = Path(urlparse(url).path).name
         if Path(url_filename).suffix.lower() in _KNOWN_ASSET_EXTS:
@@ -225,7 +228,7 @@ def download_asset(url: str, session_dir: Path, asset_type: str) -> str:
             ext = ".jpg" if asset_type == "image" else ".mp4"
             filename = f"{url_filename}{ext}"
 
-        asset_dir = session_dir / "assets" / asset_subdir_for_file(filename)
+        asset_dir = artifacts_dir / asset_subdir_for_file(filename)
         asset_dir.mkdir(parents=True, exist_ok=True)
         local_path = asset_dir / filename
 
@@ -239,8 +242,8 @@ def download_asset(url: str, session_dir: Path, asset_type: str) -> str:
         return ""
 
 
-def download_session_assets(artifacts: list[Artifact], session_dir: Path) -> None:
-    """Download every remote artifact missing a local path into ``session_dir``.
+def download_session_assets(artifacts: list[Artifact], artifacts_dir: Path) -> None:
+    """Download every remote artifact missing a local path into ``artifacts_dir``.
 
     Mutates each artifact in place — sets ``path`` on success, leaves it
     empty on failure so the next save can retry.
@@ -248,7 +251,7 @@ def download_session_assets(artifacts: list[Artifact], session_dir: Path) -> Non
     for artifact in artifacts:
         if not artifact.url or artifact.path:
             continue
-        local_path = download_asset(artifact.url, session_dir, artifact.artifact_type)
+        local_path = download_asset(artifact.url, artifacts_dir, artifact.artifact_type)
         if local_path:
             artifact.path = local_path
 
@@ -412,6 +415,9 @@ class OkonomiAgent:
         # interrupts queue here until the next save.
         self._persisted_note_count = 0
         self._pending_stream_events: list[Event] = []
+        # Background job id (term-N / tool-N) → the tool call that started
+        # it, so files it writes are stamped with their producing call.
+        self._job_tool_call_ids: dict[str, str] = {}
         # Let context compression surface its user-facing warning through the
         # same event pipe instead of a raw print (built before the emitter).
         self.context_manager.emitter = self.emitter
@@ -473,7 +479,7 @@ class OkonomiAgent:
         sweeping the session dir first so the finished job's outputs are
         registered as artifacts before the completion event fires."""
         try:
-            self._sync_session_assets(self._get_dependencies())
+            self._sync_session_assets(self._get_dependencies(), tool_call_id=self._job_tool_call_ids.pop(bg_id, ""))
         except Exception:  # noqa: BLE001
             pass
         self.jobs.finished(
@@ -504,11 +510,17 @@ class OkonomiAgent:
 
         All tools are standalone: registered directly on the agent, one
         call per model round-trip. ``bash`` is the execution surface —
-        subprocesses get a scrubbed env and $OKONOMI_SESSION_DIR.
+        subprocesses get a scrubbed env, $OKONOMI_SESSION_DIR (the
+        session's artifacts dir) and $OKONOMI_SCRATCH_DIR.
         """
 
-        def _session_dir() -> str:
-            d = self.session.session_dir
+        def _artifacts_dir() -> str:
+            d = self.session.artifacts_dir
+            d.mkdir(parents=True, exist_ok=True)
+            return str(d)
+
+        def _scratch_dir() -> str:
+            d = self.session.scratch_dir
             d.mkdir(parents=True, exist_ok=True)
             return str(d)
 
@@ -516,9 +528,10 @@ class OkonomiAgent:
         self.terminal = TerminalTools()
         self.terminal._on_bg_register = self._register_bg_log
         self.terminal._on_bg_finish = self._mark_bg_log_done
-        self.terminal._session_dir_fn = _session_dir
+        self.terminal._session_dir_fn = _artifacts_dir
+        self.terminal._scratch_dir_fn = _scratch_dir
         self.web = WebTools()
-        self.sessions = SessionsTools()
+        self.sessions = SessionsTools(lambda: self.session)
         self.agents = AgentTools()
         self.files = FileTools()
         self.viewer = ViewerTools(lambda: self.session)
@@ -622,12 +635,16 @@ class OkonomiAgent:
                                 kill.set()
                                 return {"error": "interrupted by the user"}
                             if detach_now.is_set() or time.monotonic() > deadline:
-                                return agent_self._detach_tool_call(fut, tn, chunks)
+                                return agent_self._detach_tool_call(fut, tn, chunks, ctx.tool_call_id or "")
                     if tn == "bash":
+                        if isinstance(result, dict) and result.get("task_id"):
+                            agent_self._job_tool_call_ids[result["task_id"]] = ctx.tool_call_id or ""
                         # bash writes media straight into the session
                         # dir; sweep so outputs register as artifacts.
                         try:
-                            agent_self._sync_session_assets(agent_self._get_dependencies())
+                            agent_self._sync_session_assets(
+                                agent_self._get_dependencies(), tool_call_id=ctx.tool_call_id or ""
+                            )
                         except Exception:  # noqa: BLE001
                             pass
                     return result
@@ -732,11 +749,14 @@ class OkonomiAgent:
         if stack is not None and key is not None and key[0] is asyncio.get_running_loop():
             await stack.aclose()
 
-    def _detach_tool_call(self, fut: Future | asyncio.Future, tool_name: str, chunks: list[str]) -> dict:
+    def _detach_tool_call(
+        self, fut: Future | asyncio.Future, tool_name: str, chunks: list[str], tool_call_id: str = ""
+    ) -> dict:
         """Register a slow tool call as a ``tool-N`` job and return the
         placeholder the model sees instead of its result. The result is
         reported through ``_job_finished`` when the call completes."""
         job_id = f"tool-{next(_detach_counter)}"
+        self._job_tool_call_ids[job_id] = tool_call_id
         box: dict[str, Any] = {}
 
         def _reader() -> str:
@@ -784,7 +804,7 @@ class OkonomiAgent:
         """Delegate to the shared JobRegistry (see ``okonomi.agent.jobs``)."""
         self.jobs.mark_done(task_id=task_id, status=status)
 
-    def _sync_session_assets(self, deps: "AgentDependencies") -> int:
+    def _sync_session_assets(self, deps: "AgentDependencies", tool_call_id: str = "") -> int:
         """Register media files in the session dir that aren't tracked yet.
 
         bash commands write images/video/audio/etc. straight to the session
@@ -797,10 +817,10 @@ class OkonomiAgent:
         downloads and prior sweeps are skipped). Returns the number added.
         """
         try:
-            session_dir = deps.session.session_dir
+            artifacts_dir = deps.session.artifacts_dir
         except Exception:
             return 0
-        if not session_dir.exists():
+        if not artifacts_dir.exists():
             return 0
 
         tracked: set[str] = set()
@@ -813,7 +833,7 @@ class OkonomiAgent:
                 tracked.add(a.path)
 
         added = 0
-        for p in sorted(session_dir.rglob("*")):
+        for p in sorted(artifacts_dir.rglob("*")):
             try:
                 if not p.is_file():
                     continue
@@ -841,6 +861,7 @@ class OkonomiAgent:
                     tool_name="bash",
                     description=description,
                     timestamp=datetime.now().isoformat(),
+                    tool_call_id=tool_call_id,
                 )
             )
             added += 1
@@ -859,9 +880,9 @@ class OkonomiAgent:
 
         def _run() -> None:
             try:
-                session_dir = self.session.session_dir
-                session_dir.mkdir(parents=True, exist_ok=True)
-                local_path = download_asset(artifact.url, session_dir, artifact.artifact_type)
+                artifacts_dir = self.session.artifacts_dir
+                artifacts_dir.mkdir(parents=True, exist_ok=True)
+                local_path = download_asset(artifact.url, artifacts_dir, artifact.artifact_type)
                 artifact.path = local_path
             except Exception:
                 pass
@@ -1108,7 +1129,9 @@ class OkonomiAgent:
         self._was_interrupted = True
         self._turn_cancelled.set()
         self._interrupted_partial = self._current_stream.text if self._current_stream is not None else ""
-        self._pending_stream_events.append(Interrupt("timeout" if timed_out else "cancelled"))
+        self._pending_stream_events.append(
+            Interrupt("timeout" if timed_out else "cancelled", partial=self._interrupted_partial)
+        )
         self._commit_turn(agent_run, strip_unanswered_tool_calls(agent_run.all_messages()))
         if timed_out:
             self.emitter.emit(
@@ -1167,7 +1190,7 @@ class OkonomiAgent:
         session = self.session
 
         if download_assets:
-            download_session_assets(session.state.artifacts, session.session_dir)
+            download_session_assets(session.state.artifacts, session.artifacts_dir)
 
         # Stamp the run-owned fields onto the live session; identity
         # fields (title / created_at) are write-once at the

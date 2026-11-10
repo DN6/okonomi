@@ -2,26 +2,19 @@
 remove, and configured servers surface as prefixed tools on the agent."""
 
 import json
-import textwrap
+import sys
 
-import pytest
+from _helpers import write_mcp_server
 from pydantic_ai import Agent
 from pydantic_ai.models.test import TestModel
 
 from okonomi import mcp
 
 
-@pytest.fixture
-def config_path(tmp_path, monkeypatch):
-    path = tmp_path / "mcp.json"
-    monkeypatch.setattr(mcp, "OKONOMI_MCP_CONFIG", path)
-    return path
-
-
-def test_add_remove_round_trip(config_path):
+def test_add_remove_round_trip(store, tmp_path):
     assert mcp.add_server("fs", "npx", ["-y", "server-fs", "."], {"TOKEN": "x"})["success"]
     assert mcp.add_server("docs", "https://example.com/mcp", [], {"Authorization": "Bearer y"})["success"]
-    data = json.loads(config_path.read_text())
+    data = json.loads((tmp_path / "mcp.json").read_text())
     assert data == {
         "mcpServers": {
             "fs": {"command": "npx", "args": ["-y", "server-fs", "."], "env": {"TOKEN": "x"}},
@@ -32,25 +25,8 @@ def test_add_remove_round_trip(config_path):
     assert list(mcp.load_servers()) == ["docs"]
 
 
-def test_stdio_server_tools_are_prefixed_and_callable(config_path, tmp_path, monkeypatch):
-    server = tmp_path / "srv.py"
-    server.write_text(
-        textwrap.dedent(
-            """
-            from mcp.server.fastmcp import FastMCP
-            m = FastMCP("demo")
-
-            @m.tool()
-            def shout(text: str) -> str:
-                return text.upper()
-
-            m.run()
-            """
-        )
-    )
-    monkeypatch.setenv("SRV_PATH", str(server))
-    import sys
-
+def test_stdio_server_tools_are_prefixed_and_callable(store, tmp_path, monkeypatch):
+    monkeypatch.setenv("SRV_PATH", str(write_mcp_server(tmp_path / "srv.py")))
     assert mcp.add_server("demo", sys.executable, ["${SRV_PATH}"], {})["success"]
 
     seen: list[str] = []
@@ -62,5 +38,5 @@ def test_stdio_server_tools_are_prefixed_and_callable(config_path, tmp_path, mon
     agent = Agent(TestModel(), toolsets=mcp.build_toolsets(process_tool_call=hook))
     result = agent.run_sync("hi")
     tool_names = [p.tool_name for m in result.all_messages() for p in m.parts if p.part_kind == "tool-call"]
-    assert tool_names == ["demo_shout"], f"expected the prefixed MCP tool, got {tool_names}"
-    assert seen == ["shout"], "process_tool_call hook must see the unprefixed name"
+    assert tool_names == ["demo_shout", "demo_slow"], f"expected the prefixed MCP tools, got {tool_names}"
+    assert seen == ["shout", "slow"], "process_tool_call hook must see the unprefixed names"

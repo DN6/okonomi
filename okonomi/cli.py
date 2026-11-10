@@ -77,6 +77,9 @@ Examples:
     parser.add_argument("--task", "-t", help="Task description for the agent (one-off task)")
     parser.add_argument("--resume", "-r", action="store_true", help="Resume from latest session")
     parser.add_argument("--session", "-s", type=str, help="Load a session by ID, ID prefix, title, or content words")
+    parser.add_argument(
+        "--export", metavar="DIR", help="Write preference data (sets, pairs, grades, metrics) for every session to DIR and exit"
+    )
     parser.add_argument("--version", "-v", action="version", version="okonomi 0.1.0")
 
     return parser.parse_args()
@@ -159,6 +162,15 @@ def main() -> None:
         print(f"{RED}{BOLD}Error:{RST} {e}", file=sys.stderr)
         sys.exit(1)
     args = parse_arguments()
+
+    if args.export:
+        from pathlib import Path
+
+        from .export import export_preferences
+
+        metrics = export_preferences(Path(args.export))
+        print(f"{GREEN}Exported to {args.export}{RST}: {metrics}")
+        return
 
     if not args.task:
         asyncio.run(run_agent_async(args, ""))

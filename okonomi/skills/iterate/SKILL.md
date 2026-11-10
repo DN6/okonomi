@@ -48,8 +48,9 @@ The five steps and the pitfalls below are each their own section. Pull the one y
 Pick the single change most likely to close the biggest gap: prompt wording, a parameter, the seed, the model, a reference image, or post-processing.
 
 - Hold everything else fixed — keep the seed when changing the prompt — so the difference is attributable.
-- To explore, generate 2–4 variants along one axis (e.g. three grain strengths) and show them side by side.
+- To explore, generate 2–4 variants along one axis (e.g. three grain strengths) and show them side by side, labelled `1`…`4` in the reply and in the file names (`<name>_v2_3.png`).
 - Version outputs in `$OKONOMI_SESSION_DIR` as `<name>_v1`, `<name>_v2`, … and never overwrite, so any earlier round can be compared or returned to.
+- When the user picks a variant, build the next round from that file (edit it, pass it as the reference, or version it) rather than only rewriting the prompt — the pick is recorded through what the next tool call reads.
 - Keep a short log of what changed per version in your reply; the user is choosing between versions, not prompts.
 
 ### Ask

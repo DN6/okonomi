@@ -102,4 +102,18 @@ okonomi --resume
 
 # Load a specific session by ID
 okonomi --session <id>
+
+# Write preference data (candidate sets, chosen/rejected pairs, tiers, metrics) for every session
+okonomi --export ./preferences
+```
+
+Everything lives in one store: `$OKONOMI_HOME/okonomi.db` holds sessions, the event
+stream, artifacts, favorites and the search index over the mind wiki; `mind/` holds the
+wiki pages, versioned in git by `remember`. Each `sessions/<id>/` has three parts:
+
+```
+sessions/<id>/
+├── traces.jsonl    one line per model call, written by the harness
+├── artifacts/      outputs — $OKONOMI_SESSION_DIR; swept into the DB and shown in the viewer
+└── scratch/        scripts, intermediate state, installs — $OKONOMI_SCRATCH_DIR; never tracked
 ```

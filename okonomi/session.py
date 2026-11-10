@@ -1,13 +1,12 @@
 """Session storage. SQLite is the single source of truth for everything:
 metadata, the event stream (conversation messages + system events), and
-artifacts. ``assets/`` (generated media) is the only per-session file
-tree on disk; a session can be dumped to JSONL with
-``scripts/export_session.py``.
+artifacts. The session directory (``artifacts/``, ``scratch/`` and
+``traces.jsonl``) is the only per-session file tree on disk.
 
 ``Session`` is one sessions-table row that knows how to persist itself:
 metadata + accounting (an embedded ``TokenTracker``) plus the attached
 conversation body (``state``). ``save`` appends new events; resume reads
-the active conversation rows back. ``session_dir`` (``assets/``) is
+the active conversation rows back. ``session_dir`` is
 ``config.OKONOMI_SESSIONS_DIR/<session_id>``, a pure function of
 the id, never renamed.
 
@@ -134,6 +133,9 @@ class Artifact:
     model_id: str = ""
     description: str = ""
     timestamp: str = ""
+    # The tool call that produced the file — the join from an artifact to
+    # the event (and trace line) that made it. Empty for legacy rows.
+    tool_call_id: str = ""
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
@@ -185,9 +187,22 @@ class Session:
 
     @property
     def session_dir(self) -> Path:
-        """This session's folder (``assets/``) —
-        a pure function of the id, never renamed."""
+        """This session's folder — a pure function of the id, never renamed.
+        Holds ``artifacts/`` (outputs), ``scratch/`` (intermediates) and
+        the harness's own ``traces.jsonl``."""
         return OKONOMI_SESSIONS_DIR / self.session_id
+
+    @property
+    def artifacts_dir(self) -> Path:
+        """Every output: what ``$OKONOMI_SESSION_DIR`` points at, what the
+        sweep registers, what the viewer shows."""
+        return self.session_dir / "artifacts"
+
+    @property
+    def scratch_dir(self) -> Path:
+        """Scripts, intermediate state and installs: ``$OKONOMI_SCRATCH_DIR``,
+        never swept or shown."""
+        return self.session_dir / "scratch"
 
     # ── lookup ───────────────────────────────────────────────────────────
 
@@ -266,14 +281,14 @@ class Session:
             self.created_at = datetime.now().isoformat()
         self.updated_at = datetime.now().isoformat()
 
-        self.session_dir.mkdir(parents=True, exist_ok=True)
-        (self.session_dir / "assets").mkdir(exist_ok=True)
+        self.artifacts_dir.mkdir(parents=True, exist_ok=True)
+        self.scratch_dir.mkdir(exist_ok=True)
 
         conn = db.connection()
         with db.transaction(conn):
             db.upsert_session(conn, self.metadata_dict())
             self._sync_conversation(conn)
-            db.replace_artifacts(conn, self.session_id, [a.to_dict() for a in self.state.artifacts])
+            db.upsert_artifacts(conn, self.session_id, [a.to_dict() for a in self.state.artifacts])
 
     def _sync_conversation(self, conn) -> None:
         """Append the new tail of ``state.message_history`` as event rows.
@@ -370,6 +385,8 @@ def _event_row(event: Event) -> dict[str, Any]:
     as searchable content."""
     payload = event_to_payload(event)
     content = payload.get("text") or payload.get("title") or payload.get("reason") or ""
+    if event.type == EventType.ASSET_ACTION:
+        content = f"{payload['action']}: {' '.join(payload['refs'])}"
     return {
         "type": EventType(event.type),
         "payload": json.dumps(payload, ensure_ascii=False),
@@ -462,7 +479,7 @@ def search(query: str, *, limit: int = 20) -> list[dict[str, Any]]:
                 "favorite": norm_ref(h.get("path") or h.get("url") or "") in favorites,
             }
         )
-    for h in db.search_mind_fts(OKONOMI_MIND_DIR, query, limit=limit):
+    for h in db.search_mind_fts(db.connection(), OKONOMI_MIND_DIR, query, limit=limit):
         hits.append(
             {
                 "source": "mind",
@@ -499,7 +516,7 @@ def browse(*, limit: int = 20) -> list[dict[str, Any]]:
                 "score": 0.0,
             }
         )
-    for h in db.list_mind_pages(OKONOMI_MIND_DIR):
+    for h in db.list_mind_pages(db.connection(), OKONOMI_MIND_DIR):
         rest.append({"source": "mind", "session_id": "", "session_title": h["title"], **h})
     rest.sort(key=lambda h: h["timestamp"], reverse=True)
     return [*favorite_hits(limit=limit), *rest][:limit]

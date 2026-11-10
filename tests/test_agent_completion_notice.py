@@ -8,54 +8,19 @@ import asyncio
 import threading
 from types import SimpleNamespace
 
+from _helpers import WAIT_SECONDS, child_agent, fake_agent
+
 import okonomi.agent as agent_pkg
 from okonomi import cli
-from okonomi.agent.agent import OkonomiAgent
 from okonomi.agent.jobs import JobRegistry
 from okonomi.events import EventEmitter, JobFinished
 from okonomi.tools.agents import AgentTools
 from okonomi.tui.session import TuiSession
 
 
-WAIT_SECONDS = 5.0
-
-
-def _fake_parent() -> SimpleNamespace:
-    """The slice of OkonomiAgent that ``AgentTools.launch`` touches."""
-    emitter = EventEmitter()
-    parent = SimpleNamespace(
-        model_id="test-model",
-        timeout=0,
-        compress_at_tokens=0,
-        session=SimpleNamespace(session_id="push-test"),
-        state=SimpleNamespace(artifacts=[]),
-        emitter=emitter,
-        jobs=JobRegistry(emitter),
-        _sync_session_assets=lambda deps: 0,
-        _get_dependencies=lambda: None,
-    )
-    parent._register_bg_log = lambda **kw: OkonomiAgent._register_bg_log(parent, **kw)
-    parent._mark_bg_log_done = lambda **kw: OkonomiAgent._mark_bg_log_done(parent, **kw)
-    parent._job_finished = lambda **kw: OkonomiAgent._job_finished(parent, **kw)
-    return parent
-
-
-def _child_agent(run_async):
-    class _Child:
-        def __init__(self, **kwargs):
-            self.model_id = kwargs["model_id"]
-            self.state = SimpleNamespace(artifacts=[])
-            self.last_turn_error = None
-            self.emitter = EventEmitter()
-            self.jobs = JobRegistry(self.emitter)
-
-    _Child.run_async = run_async
-    return _Child
-
-
 def _launch_and_wait(monkeypatch, run_async) -> JobFinished:
-    monkeypatch.setattr(agent_pkg, "OkonomiAgent", _child_agent(run_async))
-    parent = _fake_parent()
+    monkeypatch.setattr(agent_pkg, "OkonomiAgent", child_agent(run_async))
+    parent = fake_agent()
     finished: list[JobFinished] = []
     done = threading.Event()
 

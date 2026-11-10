@@ -1,6 +1,8 @@
 """Unified search: one query reaches sessions, conversations, assets and
-the mind wiki, and no source is crowded out by another's raw BM25."""
+the mind wiki; no source is crowded out by another's raw BM25; and the
+mind index follows the files on disk."""
 
+import os
 from types import SimpleNamespace
 
 import pytest
@@ -9,21 +11,17 @@ from okonomi import db
 from okonomi import session as session_store
 from okonomi.events import EventEmitter, EventType
 from okonomi.tools.sessions import SessionsTools
+from okonomi.tui import assets
+from okonomi.tui.pickers import _live_query
 
 
 SID = "2026-10-20_firetest"
 
 
 @pytest.fixture
-def store(tmp_path, monkeypatch):
-    conn = db.open_db(tmp_path / "test.db")
-    monkeypatch.setattr(db, "_connection", conn)
-    mind = tmp_path / "mind"
-    mind.mkdir()
-    monkeypatch.setattr(session_store, "OKONOMI_MIND_DIR", mind)
-    db.upsert_session(conn, {"session_id": SID, "title": "Fire deities moodboard"})
-    yield conn, mind
-    conn.close()
+def conn(store):
+    db.upsert_session(store, {"session_id": SID, "title": "Fire deities moodboard"})
+    return store
 
 
 def _talk(conn, n: int) -> None:
@@ -39,8 +37,8 @@ def _talk(conn, n: int) -> None:
     db.append_events(conn, SID, rows)
 
 
-def test_mind_page_surfaces_despite_many_conversation_hits(store):
-    conn, mind = store
+def test_mind_page_surfaces_despite_many_conversation_hits(conn):
+    mind = session_store.OKONOMI_MIND_DIR
     _talk(conn, 20)
     (mind / "theechamundi-fire-comparative.md").write_text(
         "---\ntitle: Theechamundi & the World of Fire Ritual\n---\n\nA comparison of fire deities in other cultures.\n"
@@ -56,10 +54,9 @@ def test_mind_page_surfaces_despite_many_conversation_hits(store):
     assert mind_hits[0]["path"].endswith("theechamundi-fire-comparative.md"), mind_hits[0]
 
 
-def test_every_hit_has_the_same_keys(store):
-    conn, mind = store
+def test_every_hit_has_the_same_keys(conn):
     _talk(conn, 2)
-    (mind / "page.md").write_text("fire deities\n")
+    (session_store.OKONOMI_MIND_DIR / "page.md").write_text("fire deities\n")
 
     hits = session_store.search("fire", limit=20)
 
@@ -69,43 +66,52 @@ def test_every_hit_has_the_same_keys(store):
             assert key in h, f"{h['source']} hit is missing {key!r}"
 
 
-def _artifact(conn, path: str, prompt: str) -> None:
-    db.replace_artifacts(conn, SID, [{"artifact_type": "image", "path": path, "prompt": prompt}])
+def test_mind_index_follows_the_files(conn):
+    mind = session_store.OKONOMI_MIND_DIR
+    page = mind / "agni.md"
+    page.write_text("---\ntitle: Agni\ntags: [fire]\n---\n\nVedic fire deity.\n")
+
+    (hit,) = db.search_mind_fts(conn, mind, "vedic")
+    assert hit["title"] == "Agni" and ">>>Vedic<<< fire deity." in hit["snippet"], hit
+
+    page.write_text("---\ntitle: Agni\ntags: [fire]\n---\n\nRides a ram.\n")
+    os.utime(page, (page.stat().st_atime, page.stat().st_mtime + 5))
+    assert db.search_mind_fts(conn, mind, "vedic") == [], "a hand edit drops the stale text"
+    assert [h["title"] for h in db.search_mind_fts(conn, mind, "ram")] == ["Agni"]
+
+    page.unlink()
+    assert db.list_mind_pages(conn, mind) == [], "a deleted page leaves the index"
 
 
-def test_favorite_identity_matches_across_picker_and_search(store, tmp_path, monkeypatch):
-    conn, _ = store
-    from okonomi.tui import assets
-
-    monkeypatch.setattr(assets, "FAVORITES_DIR", tmp_path / "favorites")
-    img = tmp_path / "assets" / "agni.png"
+def test_favorite_identity_matches_across_picker_and_search(conn, tmp_path):
+    img = tmp_path / "out" / "agni.png"
     img.parent.mkdir()
     img.write_bytes(b"png")
-    _artifact(conn, str(img), "agni riding a ram, fire deity")
-    agent = SimpleNamespace(state=SimpleNamespace(artifacts=[]), session=SimpleNamespace(session_id=SID))
+    db.upsert_artifacts(conn, SID, [{"artifact_type": "image", "path": str(img), "prompt": "agni riding a ram, fire deity"}])
+    agent = SimpleNamespace(
+        state=SimpleNamespace(artifacts=[]),
+        session=SimpleNamespace(session_id=SID, append_stream_events=lambda events: None),
+    )
 
-    assets._favorite_paths([str(tmp_path / "assets" / ".." / "assets" / "agni.png")], agent, EventEmitter())
+    assets._favorite_paths([str(tmp_path / "out" / ".." / "out" / "agni.png")], agent, EventEmitter())
 
     hit = next(h for h in session_store.search("agni") if h["source"] == "artifact")
     assert hit["favorite"] is True, hit
     (fav,) = session_store.favorite_hits()
-    assert fav["session_id"] == SID and "agni" in fav["snippet"], "an external favorite should join back to its artifact"
+    assert fav["session_id"] == SID and "agni" in fav["snippet"], "a favorite by path must join back to its artifact"
 
 
-def test_half_typed_word_survives_the_stemmer(store):
-    conn, _ = store
+def test_half_typed_word_survives_the_stemmer(conn):
     db.append_events(
         conn, SID, [{"type": EventType.USER_MESSAGE, "payload": "{}", "content": "theyyam rococo portraits", "timestamp": ""}]
     )
-    from okonomi.tui.pickers import _live_query
 
     hits = session_store.search_events(_live_query("rococo theyy"))
 
     assert len(hits) == 1, "porter stems the raw prefix `theyy*` to `theyi*`; it must be expanded against the index instead"
 
 
-def test_short_prefix_not_limited_by_expansion_cap(store, monkeypatch):
-    conn, _ = store
+def test_short_prefix_not_limited_by_expansion_cap(conn, monkeypatch):
     monkeypatch.setattr(db, "_PREFIX_EXPANSIONS", 1)
     db.append_events(
         conn,

@@ -98,9 +98,11 @@ class TerminalTools:
         # Hook called when a background job finishes. Receives
         # (task_id, status) where status is "ok" or "error".
         self._on_bg_finish: Any | None = None
-        # Zero-arg callable returning the current session dir (str),
-        # exported to children as $OKONOMI_SESSION_DIR. Set by the agent.
+        # Zero-arg callables returning the current session's artifacts and
+        # scratch dirs (str), exported to children as $OKONOMI_SESSION_DIR
+        # and $OKONOMI_SCRATCH_DIR. Set by the agent.
         self._session_dir_fn: Any | None = None
+        self._scratch_dir_fn: Any | None = None
 
     def _kill_foreground(self) -> None:
         """Kill the foreground command, if one is running (Ctrl+C)."""
@@ -110,9 +112,11 @@ class TerminalTools:
         env = scrub_env(os.environ)
         env.update(read_env_file())
         env["OKONOMI_HOME"] = str(OKONOMI_HOME)
-        if self._session_dir_fn is not None:
+        for var, fn in (("OKONOMI_SESSION_DIR", self._session_dir_fn), ("OKONOMI_SCRATCH_DIR", self._scratch_dir_fn)):
+            if fn is None:
+                continue
             try:
-                env["OKONOMI_SESSION_DIR"] = self._session_dir_fn()
+                env[var] = fn()
             except Exception:
                 pass
         if "/usr/local/bin" not in env.get("PATH", ""):

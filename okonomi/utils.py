@@ -86,7 +86,7 @@ _SYNTHETIC_PROMPT_PREFIXES = ("[Resumed", "[system]", "[The user interrupted", "
 
 # Title generation — kept out of the agent loop. A title is a one-sentence
 # summary of the conversation so far, produced by a small/cheap model in a
-# fire-and-forget background thread (or in batch via scripts/backfill_titles.py).
+# fire-and-forget background thread.
 # Cheap per-provider title model; falls back to the provider's main model
 # where no cheap option is known, so the id is always valid for the endpoint.
 TITLE_MODELS = {

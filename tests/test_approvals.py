@@ -5,18 +5,15 @@ feedback), and with no one to answer the command is refused."""
 from __future__ import annotations
 
 import json
-import threading
-from concurrent.futures import ThreadPoolExecutor
-from types import SimpleNamespace
 
 import pytest
+from _helpers import fake_agent
 from pydantic_ai import Agent
 from pydantic_ai.messages import ModelRequest, ModelResponse, TextPart, ToolCallPart, ToolReturnPart
 from pydantic_ai.models.function import AgentInfo, FunctionModel
 
 from okonomi.agent.agent import OkonomiAgent
-from okonomi.agent.jobs import JobRegistry
-from okonomi.events import ApprovalRequest, EventEmitter
+from okonomi.events import ApprovalRequest
 from okonomi.tools import _command_guard as guard
 
 
@@ -79,24 +76,6 @@ class _Terminal:
         return {"output": "ran", "exit_code": 0}
 
 
-def _fake_agent_self(can_prompt: bool) -> SimpleNamespace:
-    emitter = EventEmitter()
-    fake = SimpleNamespace(
-        _tool_pool=ThreadPoolExecutor(),
-        emitter=emitter,
-        jobs=JobRegistry(emitter),
-        _sync_session_assets=lambda deps: 0,
-        _get_dependencies=lambda: None,
-        _turn_cancelled=threading.Event(),
-        _detach_now=threading.Event(),
-        can_prompt=can_prompt,
-        _session_approvals=set(),
-    )
-    fake._unapproved_patterns = lambda c: OkonomiAgent._unapproved_patterns(fake, c)
-    fake._ask_approval = lambda c, p: OkonomiAgent._ask_approval(fake, c, p)
-    return fake
-
-
 def _run_bash(fake, terminal: _Terminal, answer=None) -> tuple[dict | str, list[ApprovalRequest]]:
     requests: list[ApprovalRequest] = []
 
@@ -123,7 +102,7 @@ def _run_bash(fake, terminal: _Terminal, answer=None) -> tuple[dict | str, list[
 
 
 def test_approve_once_runs_and_asks_again():
-    fake, terminal = _fake_agent_self(can_prompt=True), _Terminal()
+    fake, terminal = fake_agent(can_prompt=True), _Terminal()
     result, requests = _run_bash(fake, terminal, answer=True)
     assert result["output"] == "ran" and len(requests) == 1, f"once-approval did not run: {result!r}"
     assert requests[0].reason == "git reset --hard (destroys uncommitted changes)"
@@ -132,14 +111,14 @@ def test_approve_once_runs_and_asks_again():
 
 
 def test_approve_session_stops_asking():
-    fake, terminal = _fake_agent_self(can_prompt=True), _Terminal()
+    fake, terminal = fake_agent(can_prompt=True), _Terminal()
     _run_bash(fake, terminal, answer="__session__")
     result, requests = _run_bash(fake, terminal, answer=False)
     assert result["output"] == "ran" and not requests, f"session approval not reused: {result!r} {requests!r}"
 
 
 def test_approve_always_persists(approvals_file):
-    fake, terminal = _fake_agent_self(can_prompt=True), _Terminal()
+    fake, terminal = fake_agent(can_prompt=True), _Terminal()
     _run_bash(fake, terminal, answer="__always__")
     allow = json.loads(approvals_file.read_text())["allow"]
     assert allow == guard.dangerous_matches(DANGEROUS), f"always-approval not persisted: {allow!r}"
@@ -147,13 +126,13 @@ def test_approve_always_persists(approvals_file):
 
 @pytest.mark.parametrize("answer, expected", [(False, "denied"), ("use git stash instead", "use git stash instead")])
 def test_deny_and_feedback_do_not_run(answer, expected):
-    fake, terminal = _fake_agent_self(can_prompt=True), _Terminal()
+    fake, terminal = fake_agent(can_prompt=True), _Terminal()
     result, _ = _run_bash(fake, terminal, answer=answer)
     assert expected in result["error"] and not terminal.calls, f"command ran after {answer!r}: {result!r}"
 
 
 def test_no_ui_refuses_without_prompting():
-    fake, terminal = _fake_agent_self(can_prompt=False), _Terminal()
+    fake, terminal = fake_agent(can_prompt=False), _Terminal()
     result, requests = _run_bash(fake, terminal)
     assert not requests and "needs approval" in result["output"], f"headless run must fail closed: {result!r}"
     assert not terminal.calls

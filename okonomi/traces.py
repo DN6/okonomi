@@ -208,6 +208,10 @@ class TracingModel(WrapperModel):
         record = {
             "session_id": session.session_id,
             "parent_session_id": session.parent_session_id,
+            # Both are stored on the matching assistant event row, so a
+            # trace line joins to its position in the session's event DAG.
+            "provider_response_id": response.provider_response_id,
+            "run_id": response.run_id,
             "timestamp": datetime.now().isoformat(),
             "harness_version": HARNESS_VERSION,
             "model": response.model_name or self.model_name,

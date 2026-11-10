@@ -7,14 +7,12 @@ import threading
 from types import SimpleNamespace
 
 import pytest
+from _helpers import WAIT_SECONDS, child_agent, fake_agent
 
 import okonomi.agent as agent_pkg
-from okonomi.agent.jobs import JobRegistry
-from okonomi.events import EventEmitter
 from okonomi.tools.agents import AgentTools
 
 
-WAIT_SECONDS = 5.0
 PARENT_MODEL = "big-model"
 
 
@@ -25,28 +23,11 @@ def launched(monkeypatch):
     built: list[str] = []
     done = threading.Event()
 
-    class _Child:
-        def __init__(self, **kwargs):
-            built.append(kwargs["model_id"])
-            self.state = SimpleNamespace(artifacts=[])
-            self.last_turn_error = None
-            self.emitter = EventEmitter()
-            self.jobs = JobRegistry(self.emitter)
+    async def run_async(self, message, reset=False):
+        return "done"
 
-        async def run_async(self, message, reset=False):
-            return "done"
-
-    monkeypatch.setattr(agent_pkg, "OkonomiAgent", _Child)
-    emitter = EventEmitter()
-    parent = SimpleNamespace(
-        model_id=PARENT_MODEL,
-        timeout=0,
-        compress_at_tokens=0,
-        session=SimpleNamespace(session_id="model-test"),
-        state=SimpleNamespace(artifacts=[]),
-        emitter=emitter,
-        _job_finished=lambda **kw: done.set(),
-    )
+    monkeypatch.setattr(agent_pkg, "OkonomiAgent", child_agent(run_async, built))
+    parent = fake_agent(model_id=PARENT_MODEL, _job_finished=lambda **kw: done.set())
     tools = AgentTools()
     tools._bind(parent)
     return SimpleNamespace(tools=tools, built=built, done=done)
