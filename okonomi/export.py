@@ -9,10 +9,12 @@ reply after the set is kept verbatim as the reason.
 
 Outputs, one JSON object per line:
 
-  sets.jsonl    every candidate set with per-candidate signals and the
-                sets its producing call derived from
+  sets.jsonl    every candidate set with per-candidate signals, the sets
+                its producing call derived from, and the user-supplied
+                references it read
   pairs.jsonl   chosen × rejected pairs within a set (DPO-shaped)
-  graded.jsonl  every artifact with a tier: love / okay / nope
+  graded.jsonl  every artifact with a tier: reference (supplied by the
+                user, before any generation) / love / okay / nope
   metrics.json  pursued rate and rounds-to-keep across the export
 """
 
@@ -63,7 +65,8 @@ def _reaction(events: list[dict], parents: dict[int, int | None], after: int) ->
     return ""
 
 
-def session_sets(conn, session_id: str, favorites: set[str]) -> list[dict[str, Any]]:
+def session_sets(conn, session_id: str, favorites: set[str]) -> tuple[list[dict[str, Any]], list[str]]:
+    """The session's candidate sets, and the refs of images the user supplied."""
     events = db.fetch_events(conn, session_id, active_only=False)
     parents = {r["event_id"]: r["parent_id"] for r in events}
     tool_call_rows = [r for r in events if r["type"] == EventType.TOOL_CALL.value]
@@ -87,12 +90,18 @@ def session_sets(conn, session_id: str, favorites: set[str]) -> list[dict[str, A
             actions.append((row["event_id"], payload["action"], set(payload["refs"])))
 
     grouped: dict[int, list[dict[str, Any]]] = {}
+    references: list[str] = []
     seen_refs: set[str] = set()
     for artifact in db.fetch_artifacts(conn, session_id):
         ref = artifact["path"] or artifact["url"]
         if not ref or ref in seen_refs:
             continue
         seen_refs.add(ref)
+        # Images the user supplied: picks made before any generation, so
+        # they anchor taste rather than compete in a candidate set.
+        if artifact["tool_name"] == "user":
+            references.append(ref)
+            continue
         producer = _producing_event(artifact, call_events, tool_call_rows)
         if producer is None:
             continue
@@ -142,10 +151,11 @@ def session_sets(conn, session_id: str, favorites: set[str]) -> list[dict[str, A
             "trace_ref": trace_refs.get(producer, {}),
             "reaction": _reaction(events, parents, producer),
             "derived_from": derived_from,
+            "references": [r for r in references if Path(r).name in call_args.get(producer, "")],
             "candidates": candidates,
             "chosen": [c["ref"] for c in candidates if c["chosen"]],
         })
-    return sets
+    return sets, references
 
 
 def _rounds_to_keep(sets: list[dict[str, Any]]) -> list[int]:
@@ -170,11 +180,13 @@ def export_preferences(out_dir: Path, *, session_ids: list[str] | None = None) -
     session_ids = session_ids or [s["session_id"] for s in db.list_sessions(conn)]
     out_dir.mkdir(parents=True, exist_ok=True)
     all_sets: list[dict[str, Any]] = []
+    graded = []
     for session_id in session_ids:
-        all_sets.extend(session_sets(conn, session_id, favorites))
+        sets, references = session_sets(conn, session_id, favorites)
+        all_sets.extend(sets)
+        graded.extend({"session_id": session_id, "ref": r, "tier": "reference", "signals": []} for r in references)
 
     pairs = []
-    graded = []
     for s in all_sets:
         rejected = [c for c in s["candidates"] if not c["chosen"]]
         for c in s["candidates"]:
@@ -199,7 +211,7 @@ def export_preferences(out_dir: Path, *, session_ids: list[str] | None = None) -
         "pairs": len(pairs),
         "pursued_rate": (sum(1 for s in multi if s["chosen"]) / len(multi)) if multi else None,
         "rounds_to_keep": (sum(rounds) / len(rounds)) if rounds else None,
-        "tiers": {t: sum(1 for g in graded if g["tier"] == t) for t in ("love", "okay", "nope")},
+        "tiers": {t: sum(1 for g in graded if g["tier"] == t) for t in ("reference", "love", "okay", "nope")},
     }
     _write_jsonl(out_dir / "sets.jsonl", all_sets)
     _write_jsonl(out_dir / "pairs.jsonl", pairs)

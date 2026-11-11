@@ -96,6 +96,7 @@ class TuiSession:
             on_jobs=self._open_jobs,
             is_busy=lambda: self._agent_running,
         )
+        self._app.transcript.log_dir_fn = lambda: self.agent.session.logs_dir
 
     # --- Agent worker ---
 

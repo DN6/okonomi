@@ -78,7 +78,9 @@ Examples:
     parser.add_argument("--resume", "-r", action="store_true", help="Resume from latest session")
     parser.add_argument("--session", "-s", type=str, help="Load a session by ID, ID prefix, title, or content words")
     parser.add_argument(
-        "--export", metavar="DIR", help="Write preference data (sets, pairs, grades, metrics) for every session to DIR and exit"
+        "--export",
+        metavar="DIR",
+        help="Write preference data (sets, pairs, grades, metrics) for every session to DIR and exit",
     )
     parser.add_argument("--version", "-v", action="version", version="okonomi 0.1.0")
 
@@ -96,7 +98,7 @@ async def _run_single_task(agent: OkonomiAgent, user_message: str) -> None:
 
     from .tui.transcript import ReplTranscript
 
-    transcript = ReplTranscript(tool_detail="compact")
+    transcript = ReplTranscript(tool_detail="compact", log_dir_fn=lambda: agent.session.logs_dir)
     agent.emitter.subscribe(transcript.on_event)
     loop = asyncio.get_running_loop()
 

@@ -204,6 +204,19 @@ class Session:
         never swept or shown."""
         return self.session_dir / "scratch"
 
+    @property
+    def logs_dir(self) -> Path:
+        """One markdown file per tool call (full call + output), the target
+        of the transcript's compact lines and of ``/logs <tool call id>``."""
+        return self.scratch_dir / "logs"
+
+    @property
+    def references_dir(self) -> Path:
+        """Images the user handed in, copied here so they outlive URLs and
+        root the lineage of what is generated from them:
+        ``$OKONOMI_SESSION_DIR/references``."""
+        return self.artifacts_dir / "references"
+
     # ── lookup ───────────────────────────────────────────────────────────
 
     @classmethod
