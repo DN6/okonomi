@@ -395,7 +395,7 @@ def _jobs(arg: str, agent: "OkonomiAgent", emitter: EventEmitter) -> None:
     emitter.emit(SystemNote("\n".join(lines)))
 
 
-@_command("/logs", "Show captured stdout/stderr for a background job (`/logs <id>`)")
+@_command("/logs", "Show a background job's output or a tool call's full log (`/logs <job or tool-call id>`)")
 def _logs(arg: str, agent: "OkonomiAgent", emitter: EventEmitter) -> None:
     jobs = agent.jobs.entries
     if not arg:
@@ -404,7 +404,12 @@ def _logs(arg: str, agent: "OkonomiAgent", emitter: EventEmitter) -> None:
         return
     entry = jobs.get(arg)
     if entry is None:
-        emitter.emit(SystemNote(f"No job named {arg!r}. Run /jobs to list.", level="warn"))
+        # Not a job: the per-call log the compact transcript line links to.
+        log = agent.session.logs_dir / f"{arg}.md"
+        if log.is_file():
+            emitter.emit(SystemNote(log.read_text(encoding="utf-8")))
+            return
+        emitter.emit(SystemNote(f"No job or tool call named {arg!r}. Run /jobs to list jobs.", level="warn"))
         return
     try:
         output = entry["_reader"]()

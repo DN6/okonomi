@@ -23,7 +23,9 @@ import math
 import os
 import re
 import time
+from collections.abc import Callable
 from functools import lru_cache
+from pathlib import Path
 
 from rich.console import Console
 from rich.syntax import Syntax
@@ -57,6 +59,16 @@ _OUTPUT_LINE_CAP = 160
 # Tool name → (gerund while running, past tense when done) for the action
 # header. Unmapped tools fall back to the raw name. Extend as needed.
 _TOOL_VERBS = {
+    "bash": ("Running shell command", "Ran shell command"),
+    "web_search": ("Searching the web", "Searched the web"),
+    "web_fetch": ("Fetching page", "Fetched page"),
+    "read_file": ("Reading file", "Read file"),
+    "write_file": ("Writing file", "Wrote file"),
+    "edit_file": ("Editing file", "Edited file"),
+    "search": ("Searching files", "Searched files"),
+    "recall": ("Recalling past work", "Recalled past work"),
+    "remember": ("Writing to the mind wiki", "Wrote to the mind wiki"),
+    "launch_agent": ("Launching agent", "Launched agent"),
     "load_skill": ("Loading skill", "Loaded skill"),
 }
 
@@ -96,13 +108,18 @@ class ReplTranscript:
     """EventEmitter subscriber that renders to stdout for the streaming REPL.
 
     ``tool_detail`` controls tool-call verbosity (toggled at runtime via
-    ``/verbose``): ``"compact"`` prints a summary line + output clamped to
-    ``_OUTPUT_CLAMP`` lines; ``"full"`` prints full details and the
+    ``/verbose``): ``"compact"`` prints one summary line per call, linked
+    to a log file holding the full call and output (``log_dir_fn`` says
+    where; without it the output is printed inline, clamped to
+    ``_OUTPUT_CLAMP`` lines); ``"full"`` prints full details and the
     complete output.
     """
 
-    def __init__(self, *, tool_detail: str = "compact") -> None:
+    def __init__(self, *, tool_detail: str = "compact", log_dir_fn: Callable[[], Path] | None = None) -> None:
         self.tool_detail = tool_detail
+        # Scrollback can't expand in place, so a compact line links (OSC 8)
+        # to a per-call log file; ``/logs <tool_call_id>`` reads the same file.
+        self.log_dir_fn = log_dir_fn
         # No explicit file= so rich resolves sys.stdout lazily on each write —
         # picking up prompt_toolkit's patch_stdout proxy, so streamed prints
         # land above the live prompt instead of corrupting it.
@@ -201,11 +218,34 @@ class ReplTranscript:
         detail = _head_detail(ev)
         if detail:
             head += f"  {detail}"
+        log = self._write_log(ev) if self.tool_detail != "full" else None
+        if log is not None:
+            self.console.print(Text(f"⏺ {head}", style=f"{_ACCENT} link file://{log}"))
+            return
         self.console.print(Text(f"⏺ {head}", style=_ACCENT))
         if self.tool_detail == "full" and ev.details:
             self.console.print(text_with_path_links(ev.details), style=_DIM)
         if ev.output:
             self._print_output(ev.output)
+
+    def _write_log(self, ev: ToolCallDisplay) -> Path | None:
+        """The full call and its output as a markdown file the compact line
+        links to. ``None`` when there is nowhere to write or nothing to show."""
+        if self.log_dir_fn is None or not (ev.details or ev.output):
+            return None
+        try:
+            log_dir = self.log_dir_fn()
+            log_dir.mkdir(parents=True, exist_ok=True)
+            path = log_dir / f"{ev.tool_call_id or ev.id}.md"
+            body = f"# {_verb(ev.tool_name, running=False)}\n\n"
+            if ev.details:
+                body += f"## Call\n\n```\n{ev.details}\n```\n\n"
+            if ev.output:
+                body += f"## Output\n\n```\n{ev.output}\n```\n"
+            path.write_text(body, encoding="utf-8")
+            return path
+        except OSError:
+            return None
 
     def _print_output(self, output: str, style: str = _DIM) -> None:
         # Tree-branch render: first line under a ⎿, the rest aligned beneath.

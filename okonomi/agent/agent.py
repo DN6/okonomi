@@ -11,7 +11,9 @@ modules.
 """
 
 import asyncio
+import base64
 import contextlib
+import hashlib
 import inspect
 import itertools
 import json
@@ -345,6 +347,65 @@ def _parse_user_message(text: str, emitter=None):
             )
 
     return [text, *parts] if parts else text
+
+
+def store_references(session: Session, refs: list[str]) -> list[Artifact]:
+    """Keep the images the user handed in. A reference is a pick made
+    before anything was generated, so it is copied into
+    ``session.references_dir`` and tracked with ``tool_name="user"``: it
+    then survives URL expiry, shows in the viewer, and roots the lineage
+    of whatever is generated from it. Paths already inside this
+    session's artifacts dir are the user pointing at an output, not
+    supplying one, and are left alone. Returns the artifacts added."""
+    artifacts_root = session.artifacts_dir.resolve()
+    references_dir = session.references_dir.resolve()
+    known = {a.url for a in session.state.artifacts if a.url} | {a.path for a in session.state.artifacts if a.path}
+    # The same image handed over twice, by any path or URL, is kept once.
+    kept = {hashlib.sha1(p.read_bytes()).hexdigest() for p in references_dir.glob("*") if p.is_file()}
+    added: list[Artifact] = []
+    for ref in refs:
+        if ref in known:
+            continue
+        if ref.startswith("data:image/"):
+            media_type, payload = ref[5:].split(";base64,", 1)
+            data = base64.b64decode(payload)
+            name = f"pasted-{hashlib.sha1(data).hexdigest()[:8]}.{media_type.split('/', 1)[1]}"
+            url = ""
+        elif ref.startswith(("http://", "https://")):
+            with httpx.Client(timeout=30.0) as client:
+                response = client.get(ref, follow_redirects=True)
+                response.raise_for_status()
+            data = response.content
+            name = Path(urlparse(ref).path).name or f"{hashlib.sha1(ref.encode()).hexdigest()[:8]}.jpg"
+            url = ref
+        else:
+            src = Path(unquote(ref[7:]) if ref.startswith("file://") else ref).expanduser().resolve()
+            if str(src) in known or src.is_relative_to(artifacts_root):
+                continue
+            data = src.read_bytes()
+            name = src.name
+            url = ""
+        digest = hashlib.sha1(data).hexdigest()
+        if digest in kept:
+            continue
+        dest = references_dir / name
+        if dest.exists():
+            dest = dest.with_name(f"{digest[:8]}-{name}")
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        dest.write_bytes(data)
+        kept.add(digest)
+        artifact = Artifact(
+            artifact_type="image",
+            path=str(dest),
+            url=url,
+            tool_name="user",
+            description=f"reference supplied by the user: {ref[:200]}",
+            timestamp=datetime.now().isoformat(),
+        )
+        session.state.artifacts.append(artifact)
+        known.update({ref, str(dest), url})
+        added.append(artifact)
+    return added
 
 
 class OkonomiAgent:
@@ -962,10 +1023,27 @@ class OkonomiAgent:
         if self._agent_run is None:
             return False
         prompt = _parse_user_message(text, emitter=self.emitter)
+        self._record_references(text)
         enqueue_id = self._agent_run.enqueue(*prompt) if isinstance(prompt, list) else self._agent_run.enqueue(prompt)
         if enqueue_id is not None:
             self._enqueued[enqueue_id] = text
         return True
+
+    def _record_references(self, text: str) -> None:
+        """Copy any images the user mentioned into the session's
+        ``artifacts/references/``, off the event loop since a URL means
+        a download. Failures only warn: the model already has the pixels."""
+        refs = list(_iter_image_refs(text))
+        if not refs:
+            return
+
+        def _store() -> None:
+            try:
+                store_references(self.session, refs)
+            except Exception as e:  # noqa: BLE001
+                self.emitter.emit(SystemNote(f"Couldn't keep a reference image: {e}", level="warn"))
+
+        self._tool_pool.submit(_store)
 
     def detach_running_tools(self) -> None:
         """Move the running turn's in-flight tool calls to the background
@@ -1072,6 +1150,7 @@ class OkonomiAgent:
             )
 
         prompt = _parse_user_message(user_message, emitter=self.emitter)
+        self._record_references(user_message)
         timeout = asyncio.timeout(self.timeout) if self.timeout > 0 else contextlib.nullcontext()
 
         try:

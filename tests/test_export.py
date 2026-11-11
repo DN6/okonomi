@@ -57,25 +57,30 @@ def conn(store):
 def test_picks_tiers_and_pairs_follow_lineage(conn, tmp_path):
     a, b, c = (str(tmp_path / f"fox_v1_{i}.png") for i in (1, 2, 3))
     b2 = str(tmp_path / "fox_v2_1.png")
+    moodboard = str(tmp_path / "references" / "moodboard.png")
     db.append_events(conn, SID, [
-        _user("three foxes please"),
-        _tool_call("c1", {"command": "gen.py --out fox_v1_{1,2,3}.png"}, response_id="pr1"),  # event 1
+        _user(f"three foxes like {moodboard} please"),
+        _tool_call("c1", {"command": f"gen.py --style {moodboard} --out fox_v1_{{1,2,3}}.png"}, response_id="pr1"),
         _user("the second one, warmer"),
         _tool_call("c2", {"command": f"edit.py --ref {b} --out fox_v2_1.png"}),  # event 3
         _action("favorite", [b2]),
     ])
-    db.upsert_artifacts(conn, SID, [_image(a, "c1"), _image(b, "c1"), _image(c, "c1"), _image(b2, "c2")])
+    db.upsert_artifacts(conn, SID, [
+        {"artifact_type": "image", "path": moodboard, "tool_name": "user", "timestamp": "t"},
+        _image(a, "c1"), _image(b, "c1"), _image(c, "c1"), _image(b2, "c2"),
+    ])
 
     metrics = export_preferences(tmp_path / "out", session_ids=[SID])
 
     first, second = _jsonl(tmp_path / "out" / "sets.jsonl")
     assert first["chosen"] == [b] and first["reaction"] == "the second one, warmer", first
     assert first["trace_ref"] == {"provider_response_id": "pr1", "run_id": "run1"}, first
+    assert first["references"] == [moodboard] and second["references"] == [], "a set records the references it read"
     assert second["derived_from"] == [1] and second["candidates"][0]["tier"] == "love", second
     pairs = _jsonl(tmp_path / "out" / "pairs.jsonl")
     assert [(p["chosen"], p["rejected"]) for p in pairs] == [(b, a), (b, c)], pairs
     tiers = {g["ref"]: g["tier"] for g in _jsonl(tmp_path / "out" / "graded.jsonl")}
-    assert tiers == {a: "nope", b: "okay", c: "nope", b2: "love"}, tiers
+    assert tiers == {moodboard: "reference", a: "nope", b: "okay", c: "nope", b2: "love"}, tiers
     assert metrics["pursued_rate"] == 1.0 and metrics["rounds_to_keep"] == 1.0, metrics
 
 
@@ -90,7 +95,8 @@ def test_untouched_set_is_rejected_and_abandoned_branches_are_kept(conn, tmp_pat
 
     (s,) = _jsonl(tmp_path / "out" / "sets.jsonl")
     assert s["abandoned"] and s["chosen"] == [] and s["reaction"] == "", s
-    assert metrics["pursued_rate"] == 0.0 and metrics["tiers"] == {"love": 0, "okay": 0, "nope": 2}, metrics
+    assert metrics["pursued_rate"] == 0.0, metrics
+    assert metrics["tiers"] == {"reference": 0, "love": 0, "okay": 0, "nope": 2}, metrics
 
 
 def test_favoriting_records_an_asset_action_on_the_session(store, tmp_path):

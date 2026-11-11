@@ -5,7 +5,7 @@ call that wrote them."""
 from pathlib import Path
 
 from okonomi import db
-from okonomi.agent.agent import AgentDependencies
+from okonomi.agent.agent import AgentDependencies, store_references
 
 
 SID = "2026-11-10_artifacts"
@@ -39,3 +39,20 @@ def test_sweep_tracks_outputs_with_their_tool_call(okonomi_agent):
     assert okonomi_agent._sync_session_assets(deps, tool_call_id="c7") == 1, "only media and briefs under artifacts/"
     (brief,) = deps.state.artifacts
     assert (brief.artifact_type, brief.tool_call_id, Path(brief.path).name) == ("research", "c7", "noir_brief.md")
+
+
+def test_user_supplied_images_are_kept_as_references(okonomi_agent, tmp_path):
+    session = okonomi_agent.session
+    session.artifacts_dir.mkdir(parents=True)
+    supplied = tmp_path / "moodboard.png"
+    supplied.write_bytes(b"png-a")
+    generated = session.artifacts_dir / "fox_v1_2.png"
+    generated.write_bytes(b"png-b")
+
+    added = store_references(session, [str(supplied), str(generated), str(supplied)])
+
+    (ref,) = added
+    assert ref.tool_name == "user" and ref.path == str(session.references_dir / "moodboard.png"), ref
+    assert Path(ref.path).read_bytes() == b"png-a"
+    assert session.state.artifacts == [ref], "an output the user pointed at is a pick, not a reference"
+    assert store_references(session, [str(supplied)]) == [], "a reference is kept once"
