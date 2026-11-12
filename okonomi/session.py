@@ -96,16 +96,16 @@ class TokenTracker:
         return line
 
 
-_ASSET_EXTENSIONS = {
+_ARTIFACT_EXTENSIONS = {
     "images": {".png", ".jpg", ".jpeg", ".webp", ".gif"},
     "videos": {".mp4", ".webm", ".mov"},
     "html": {".html", ".htm"},
 }
 
 
-def asset_subdir_for_file(filename: str) -> str:
+def artifact_subdir_for_file(filename: str) -> str:
     ext = Path(filename).suffix.lower()
-    for subdir, extensions in _ASSET_EXTENSIONS.items():
+    for subdir, extensions in _ARTIFACT_EXTENSIONS.items():
         if ext in extensions:
             return subdir
     return "other"
@@ -207,7 +207,7 @@ class Session:
     @property
     def logs_dir(self) -> Path:
         """One markdown file per tool call (full call + output), the target
-        of the transcript's compact lines and of ``/logs <tool call id>``."""
+        of the transcript's compact lines."""
         return self.scratch_dir / "logs"
 
     @property
@@ -398,7 +398,7 @@ def _event_row(event: Event) -> dict[str, Any]:
     as searchable content."""
     payload = event_to_payload(event)
     content = payload.get("text") or payload.get("title") or payload.get("reason") or ""
-    if event.type == EventType.ASSET_ACTION:
+    if event.type == EventType.ARTIFACT_ACTION:
         content = f"{payload['action']}: {' '.join(payload['refs'])}"
     return {
         "type": EventType(event.type),
@@ -511,10 +511,30 @@ def search(query: str, *, limit: int = 20) -> list[dict[str, Any]]:
     return hits[:limit]
 
 
-def browse(*, limit: int = 20) -> list[dict[str, Any]]:
-    """What ``search`` shows before there's a query: every favorite first,
-    then recent sessions and mind wiki pages interleaved newest first —
-    all in the same hit shape."""
+def browse(*, limit: int = 20, session_id: str = "") -> list[dict[str, Any]]:
+    """What ``search`` shows before there's a query: the current session's
+    artifacts newest first, then every favorite, then recent sessions and
+    mind wiki pages interleaved newest first — all in the same hit shape."""
+    own: list[dict[str, Any]] = []
+    if session_id:
+        favorites = favorite_refs()
+        title = db.fetch_session(db.connection(), session_id) or {}
+        for a in reversed(db.fetch_artifacts(db.connection(), session_id)):
+            own.append(
+                {
+                    "source": "artifact",
+                    "session_id": session_id,
+                    "session_title": title.get("title") or "",
+                    "artifact_id": None,
+                    "artifact_type": a.get("artifact_type") or "",
+                    "path": a.get("path") or "",
+                    "url": a.get("url") or "",
+                    "snippet": a.get("prompt") or a.get("description") or "",
+                    "timestamp": a.get("timestamp") or "",
+                    "score": 0.0,
+                    "favorite": norm_ref(a.get("path") or a.get("url") or "") in favorites,
+                }
+            )
     rest: list[dict[str, Any]] = []
     for s in list_sessions(limit=limit):
         if not (s.title or s.task_input):
@@ -532,7 +552,9 @@ def browse(*, limit: int = 20) -> list[dict[str, Any]]:
     for h in db.list_mind_pages(db.connection(), OKONOMI_MIND_DIR):
         rest.append({"source": "mind", "session_id": "", "session_title": h["title"], **h})
     rest.sort(key=lambda h: h["timestamp"], reverse=True)
-    return [*favorite_hits(limit=limit), *rest][:limit]
+    shown = {norm_ref(h["path"] or h["url"]) for h in own}
+    favorites_elsewhere = [h for h in favorite_hits(limit=limit) if norm_ref(h["path"] or h["url"]) not in shown]
+    return [*own, *favorites_elsewhere, *rest][:limit]
 
 
 def read_window(session_id: str, around_event_id: int, *, window: int = 5) -> list[dict[str, Any]]:
@@ -599,7 +621,7 @@ def prune_empty_sessions() -> int:
 
 
 def favorite(*, url: str, artifact_type: str = "") -> int:
-    """Favorite an asset by ``url``, which accepts URLs or bare local paths.
+    """Favorite an artifact by ``url``, which accepts URLs or bare local paths.
     Idempotent; returns the favorite row id."""
     conn = db.connection()
     with db.transaction(conn):
@@ -614,7 +636,7 @@ def unfavorite(favorite_id: int) -> bool:
 
 def norm_ref(ref: str) -> str:
     """One identity for a favorite: URLs as-is, local paths resolved — so the
-    viewer, the asset picker, and search all agree on what is a favorite."""
+    viewer, the artifact picker, and search all agree on what is a favorite."""
     if not ref or ref.startswith(("http://", "https://", "file://", "data:")):
         return ref
     return str(Path(ref).expanduser().resolve())

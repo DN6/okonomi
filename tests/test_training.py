@@ -1,18 +1,80 @@
-"""Preference export: candidate sets, picks by lineage, tiers and pairs are
-derived from the event DAG, artifacts and favorites the store already keeps."""
+"""Training data: model-call traces and the preference export derived
+from the store."""
 
 from __future__ import annotations
 
+import asyncio
 import json
 from types import SimpleNamespace
 
 import pytest
+from pydantic_ai import Agent
+from pydantic_ai.messages import ModelResponse, TextPart, ToolCallPart
+from pydantic_ai.models.function import FunctionModel
 
 from okonomi import db
 from okonomi import session as session_store
-from okonomi.events import AssetAction, EventType, event_to_payload
+from okonomi.events import ArtifactAction, EventType, event_to_payload
 from okonomi.export import export_preferences
-from okonomi.tui import assets
+from okonomi.traces import TRACES_FILENAME, TracingModel
+from okonomi.tui import artifacts
+
+
+def _read_traces(session) -> list[dict]:
+    lines = (session.session_dir / TRACES_FILENAME).read_text().splitlines()
+    return [json.loads(line) for line in lines]
+
+
+def test_tool_round_trips_and_streamed_calls_are_recorded(tmp_path):
+    session = SimpleNamespace(session_id="s1", parent_session_id=None, session_dir=tmp_path / "s1")
+    session.session_dir.mkdir()
+
+    def respond(messages, info):
+        if len(messages) == 1:
+            return ModelResponse(parts=[ToolCallPart("add", {"a": 1, "b": 2}, tool_call_id="c1")], provider_response_id="pr1")
+        return ModelResponse(parts=[TextPart("3")])
+
+    agent = Agent(TracingModel(FunctionModel(respond), lambda: session), system_prompt="sys")
+
+    @agent.tool_plain
+    def add(a: int, b: int) -> int:
+        return a + b
+
+    agent.run_sync("1+2?")
+
+    first, second = _read_traces(session)
+    assert first["session_id"] == "s1", first
+    assert first["provider_response_id"] == "pr1" and "run_id" in first, "trace lines must join to their event row"
+    assert first["messages"] == [
+        {"role": "system", "content": "sys"},
+        {"role": "user", "content": "1+2?"},
+    ], first["messages"]
+    assert [t["function"]["name"] for t in first["tools"]] == ["add"], first["tools"]
+    assert first["completion"]["tool_calls"] == [
+        {"id": "c1", "type": "function", "function": {"name": "add", "arguments": '{"a":1,"b":2}'}}
+    ], first["completion"]
+    assert second["messages"][-1] == {"role": "tool", "tool_call_id": "c1", "content": "3"}, second["messages"]
+    assert second["completion"] == {"role": "assistant", "content": "3"}, second["completion"]
+
+    child = SimpleNamespace(session_id="s2", parent_session_id="s1", session_dir=tmp_path / "s2")
+    child.session_dir.mkdir()
+
+    async def stream(messages, info):
+        yield "hel"
+        yield "lo"
+
+    agent = Agent(TracingModel(FunctionModel(stream_function=stream), lambda: child))
+
+    async def run():
+        async with agent.run_stream("hi") as result:
+            await result.get_output()
+
+    asyncio.run(run())
+
+    (trace,) = _read_traces(child)
+    assert trace["parent_session_id"] == "s1", trace
+    assert trace["messages"] == [{"role": "user", "content": "hi"}], trace["messages"]
+    assert trace["completion"] == {"role": "assistant", "content": "hello"}, trace["completion"]
 
 
 SID = "2026-11-10_export"
@@ -33,8 +95,8 @@ def _user(text: str) -> dict:
 
 def _action(action: str, refs: list[str]) -> dict:
     return {
-        "type": EventType.ASSET_ACTION,
-        "payload": json.dumps(event_to_payload(AssetAction(action=action, refs=refs))),
+        "type": EventType.ARTIFACT_ACTION,
+        "payload": json.dumps(event_to_payload(ArtifactAction(action=action, refs=refs))),
         "content": "",
         "timestamp": "t",
     }
@@ -99,14 +161,14 @@ def test_untouched_set_is_rejected_and_abandoned_branches_are_kept(conn, tmp_pat
     assert metrics["tiers"] == {"reference": 0, "love": 0, "okay": 0, "nope": 2}, metrics
 
 
-def test_favoriting_records_an_asset_action_on_the_session(store, tmp_path):
+def test_favoriting_records_an_artifact_action_on_the_session(store, tmp_path):
     recorded = []
     session = SimpleNamespace(session_id="s1", append_stream_events=recorded.extend)
     pic = tmp_path / "pic.png"
     pic.write_bytes(b"x")
 
-    assets.set_favorite(str(pic), artifact_type="image", favorite=True, session=session)
-    assets.set_favorite(str(pic), artifact_type="image", favorite=False, session=session)
+    artifacts.set_favorite(str(pic), artifact_type="image", favorite=True, session=session)
+    artifacts.set_favorite(str(pic), artifact_type="image", favorite=False, session=session)
 
     ref = session_store.norm_ref(str(pic))
     assert [(e.action, e.refs) for e in recorded] == [("favorite", [ref]), ("unfavorite", [ref])], recorded

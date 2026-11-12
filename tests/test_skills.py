@@ -1,6 +1,4 @@
-"""`/skills install` — fetching a skill directory from GitHub into the user
-skills dir. The GitHub contents API is mocked via httpx's MockTransport.
-"""
+"""Skills: installing from GitHub and section-structure checks on write."""
 
 import json
 
@@ -8,7 +6,7 @@ import httpx
 import pytest
 
 from okonomi.tools import skills
-from okonomi.tools.skills import _parse_github_spec, install_skill_from_github
+from okonomi.tools.skills import SkillTools, _check_skill_structure, _parse_github_spec, install_skill_from_github
 
 
 SKILL_MD = "---\nname: demo\ndescription: d\n---\nintro\n\n## Steps\ndo it\n"
@@ -63,15 +61,13 @@ def github(store, monkeypatch):
     monkeypatch.setattr(skills.httpx, "Client", _mock_client)
 
 
-def test_parse_shorthand_and_tree_url():
+def test_install_parses_the_spec_and_copies_allowed_subdirs_only(github):
     assert _parse_github_spec("o/r/skills/demo") == ("o", "r", None, "skills/demo")
     assert _parse_github_spec("https://github.com/o/r/tree/main/skills/demo/") == ("o", "r", "main", "skills/demo")
     assert _parse_github_spec("o/r") == ("o", "r", None, "")
     assert _parse_github_spec("o") is None, "owner alone is not a repo"
     assert _parse_github_spec("https://example.com/x/y") is None, "non-GitHub URLs are rejected"
 
-
-def test_install_copies_skill_and_allowed_subdirs_only(github):
     result = install_skill_from_github("o/r/skills/demo")
     assert result["success"], result
     assert result["name"] == "demo"
@@ -81,3 +77,18 @@ def test_install_copies_skill_and_allowed_subdirs_only(github):
     assert (dest / "references" / "api.md").read_text() == "api ref"
     assert not (dest / "node_modules").exists(), "dirs outside ALLOWED_SUBDIRS must be skipped"
     assert not list(skills.USER_SKILLS_DIR.glob(".tmp.*")), "staging dir must be renamed away"
+
+
+def _mk(body: str) -> str:
+    return f"---\nname: demo\ndescription: d\n---\n{body}"
+
+
+def test_skill_structure_is_checked_on_write(store):
+    assert _check_skill_structure(_mk("Short preamble.\n\n## Setup\ndo x\n\n## Usage\ndo y\n")) == (None, [])
+
+    err, warnings = _check_skill_structure(_mk("x" * (skills.MAX_INTRO_CHARS + 1)))
+    assert err is None and len(warnings) == 1 and "no '## '" in warnings[0], (err, warnings)
+
+    result = SkillTools().create_skill("dupe", _mk("## Overview\na\n\n## Overview\nb\n"))
+    assert result["success"] is False and "Duplicate" in result["error"], result
+    assert not (skills.USER_SKILLS_DIR / "dupe").exists()

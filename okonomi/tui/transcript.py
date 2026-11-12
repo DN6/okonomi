@@ -81,6 +81,12 @@ def _verb(tool_name: str, *, running: bool) -> str:
     return tool_name.lower()
 
 
+def tool_log_name(call_id: str) -> str:
+    """File stem for a tool call's log. Some providers hand out ids like
+    ``bash:11``; a colon breaks the ``file://`` link and macOS file names."""
+    return re.sub(r"[^\w.-]+", "_", call_id)
+
+
 def _head_detail(ev) -> str:
     """A short one-line header descriptor — never the full args/code body
     (that lives in the ⎿ output / verbose view). Tools get a bounded snippet.
@@ -118,7 +124,7 @@ class ReplTranscript:
     def __init__(self, *, tool_detail: str = "compact", log_dir_fn: Callable[[], Path] | None = None) -> None:
         self.tool_detail = tool_detail
         # Scrollback can't expand in place, so a compact line links (OSC 8)
-        # to a per-call log file; ``/logs <tool_call_id>`` reads the same file.
+        # to a per-call log file.
         self.log_dir_fn = log_dir_fn
         # No explicit file= so rich resolves sys.stdout lazily on each write —
         # picking up prompt_toolkit's patch_stdout proxy, so streamed prints
@@ -220,7 +226,7 @@ class ReplTranscript:
             head += f"  {detail}"
         log = self._write_log(ev) if self.tool_detail != "full" else None
         if log is not None:
-            self.console.print(Text(f"⏺ {head}", style=f"{_ACCENT} link file://{log}"))
+            self.console.print(Text(f"⏺ {head}", style=f"{_ACCENT} link {log.as_uri()}"))
             return
         self.console.print(Text(f"⏺ {head}", style=_ACCENT))
         if self.tool_detail == "full" and ev.details:
@@ -236,7 +242,7 @@ class ReplTranscript:
         try:
             log_dir = self.log_dir_fn()
             log_dir.mkdir(parents=True, exist_ok=True)
-            path = log_dir / f"{ev.tool_call_id or ev.id}.md"
+            path = log_dir / f"{tool_log_name(ev.tool_call_id or ev.id)}.md"
             body = f"# {_verb(ev.tool_name, running=False)}\n\n"
             if ev.details:
                 body += f"## Call\n\n```\n{ev.details}\n```\n\n"

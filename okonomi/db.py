@@ -257,6 +257,7 @@ def _migrate(conn: sqlite3.Connection) -> None:
         "DELETE FROM artifacts WHERE id NOT IN "
         "(SELECT MIN(id) FROM artifacts GROUP BY session_id, path, url)"
     )
+    conn.execute("UPDATE events SET type = 'artifact_action' WHERE type = 'asset_action'")
 
 
 _connection: sqlite3.Connection | None = None
@@ -886,7 +887,7 @@ def remove_favorite(conn: sqlite3.Connection, favorite_id: int) -> bool:
 
 def list_favorites(conn: sqlite3.Connection, *, limit: int | None = None) -> list[dict[str, Any]]:
     """Newest-first favorites joined to the artifact whose path or URL
-    equals the stored ref, so a favorite from the viewer or asset picker
+    equals the stored ref, so a favorite from the viewer or artifact picker
     still knows its prompt and session.
 
     Each row carries: ``id``, ``url`` (URL or local path),

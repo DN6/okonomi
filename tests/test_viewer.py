@@ -54,8 +54,8 @@ def setup(store, tmp_path, monkeypatch):
     tools._server.shutdown()
 
 
-def test_items_cover_artifacts_and_tracked_files(setup):
-    base, session_dir, tracked, _ = setup
+def test_lists_and_serves_the_sessions_artifacts_and_refuses_the_rest(setup):
+    base, session_dir, tracked, secret = setup
     data = httpx.get(f"{base}/api/items").json()
     kinds = {i["name"]: i["kind"] for i in data["items"]}
     assert kinds == {
@@ -71,9 +71,6 @@ def test_items_cover_artifacts_and_tracked_files(setup):
     assert (cat["caption"], cat["model"]) == ("a cat", "flux"), cat
     assert data["title"] == "Cats"
 
-
-def test_serves_allowed_files_and_refuses_others(setup):
-    base, session_dir, tracked, secret = setup
     assert httpx.get(f"{base}/fs{quote(str(session_dir / 'artifacts' / 'page.html'))}").text == "<p>hi</p>"
     assert httpx.get(f"{base}/fs{quote(str(tracked))}").content == b"jpg"
     assert httpx.get(f"{base}/fs{quote(str(secret))}").status_code == 404
@@ -103,3 +100,4 @@ def test_favorite_toggle_roundtrip(setup, tmp_path):
     assert httpx.post(f"{base}/api/favorite", json={"ref": str(secret), "favorite": True}).status_code == 404
     assert httpx.post(f"{base}/api/favorite", json={"ref": "https://example.com/out/abc123", "favorite": True}).status_code == 200
     assert "https://example.com/out/abc123" in favorites()
+

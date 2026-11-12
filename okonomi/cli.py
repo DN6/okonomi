@@ -10,7 +10,7 @@ import asyncio
 import sys
 
 from .agent import OkonomiAgent
-from .agent.jobs import run_until_jobs_report
+from .agent.tasks import run_until_tasks_report
 from .config import load_env_or_raise
 from .events import SystemNote
 from .tools._command_guard import load_approval_rules
@@ -33,13 +33,15 @@ GREEN = "\033[32m"
 
 
 def resolve_session(args: argparse.Namespace) -> str | None:
-    if not (args.resume or args.session):
+    """``--resume`` alone is the most recent session; ``--resume <query>``
+    looks one up by id, id prefix, title, or content words."""
+    if args.resume is None:
         return None
 
     from .session import list_sessions
     from .session import resolve_session as find_session
 
-    if args.resume:
+    if args.resume == "":
         recent = list_sessions(limit=1)
         if recent:
             print(f"{BOLD}{GREEN}Resuming: {recent[0].display_name}{RST}\n")
@@ -47,12 +49,12 @@ def resolve_session(args: argparse.Namespace) -> str | None:
         print(f"{YELLOW}No previous sessions found. Starting new session.{RST}\n")
         return None
 
-    session = find_session(args.session)
+    session = find_session(args.resume)
     if session:
         print(f"{BOLD}{GREEN}Loaded: {session.display_name}{RST}\n")
         return session.session_id
 
-    print(f"{RED}Session {args.session} not found. Starting new session.{RST}\n")
+    print(f"{RED}Session {args.resume} not found. Starting new session.{RST}\n")
     return None
 
 
@@ -69,14 +71,20 @@ def parse_arguments() -> argparse.Namespace:
 Examples:
   okonomi                                    # Interactive mode
   okonomi --task "Design a futuristic logo"  # One-off task
-  okonomi --resume                           # Resume from latest session
-  okonomi --session <id|title|words>         # Load specific session
+  okonomi --resume                           # Resume the latest session
+  okonomi --resume <id|title|words>          # Resume a specific session
         """,
     )
 
     parser.add_argument("--task", "-t", help="Task description for the agent (one-off task)")
-    parser.add_argument("--resume", "-r", action="store_true", help="Resume from latest session")
-    parser.add_argument("--session", "-s", type=str, help="Load a session by ID, ID prefix, title, or content words")
+    parser.add_argument(
+        "--resume",
+        "-r",
+        nargs="?",
+        const="",
+        metavar="SESSION",
+        help="Resume the latest session, or one matched by ID, ID prefix, title, or content words",
+    )
     parser.add_argument(
         "--export",
         metavar="DIR",
@@ -102,7 +110,7 @@ async def _run_single_task(agent: OkonomiAgent, user_message: str) -> None:
     agent.emitter.subscribe(transcript.on_event)
     loop = asyncio.get_running_loop()
 
-    agent_task = asyncio.create_task(run_until_jobs_report(agent, user_message))
+    agent_task = asyncio.create_task(run_until_tasks_report(agent, user_message))
     interrupted = False
 
     def on_sigint():

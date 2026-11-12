@@ -15,4 +15,4 @@ MUTED = "#6c6c80"  # metadata, separators, rules
 SURFACE = "#1a1a2e"  # toolbar / menu background (dark navy)
 SURFACE_HI = "#2a2a45"  # highlighted row background
 TEXT = "#c6c6d0"  # primary toolbar text
-FAINT = "#3a3a4a"  # de-emphasized (background jobs)
+FAINT = "#3a3a4a"  # de-emphasized (background tasks)

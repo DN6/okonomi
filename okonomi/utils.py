@@ -193,39 +193,6 @@ def _maybe_update_session_title_async(session, messages: list) -> None:
     threading.Thread(target=_worker, name="okonomi-generate-title", daemon=True).start()
 
 
-def copy_to_clipboard(text: str) -> bool:
-    """Best-effort clipboard write. Tries ``pbcopy`` (macOS) → ``xclip`` →
-    ``xsel`` (Linux), then falls back to the OSC52 terminal escape (works
-    over SSH / tmux when the terminal allows it). Returns True on success."""
-    import shutil
-    import subprocess
-    import sys
-
-    candidates: list[list[str]] = []
-    if sys.platform == "darwin":
-        candidates.append(["pbcopy"])
-    candidates.extend([["xclip", "-selection", "clipboard"], ["xsel", "--clipboard", "--input"]])
-    for cmd in candidates:
-        if shutil.which(cmd[0]) is None:
-            continue
-        try:
-            subprocess.run(cmd, input=text.encode("utf-8"), check=True)
-            return True
-        except Exception:
-            continue
-
-    # OSC52 escape — the terminal may silently drop it; treat as success.
-    try:
-        import base64
-
-        b64 = base64.b64encode(text.encode("utf-8")).decode("ascii")
-        sys.stdout.write(f"\x1b]52;c;{b64}\x07")
-        sys.stdout.flush()
-        return True
-    except Exception:
-        return False
-
-
 def format_elapsed(seconds: float) -> str:
     """Human elapsed time: ``"45s"`` under a minute, ``"1m 23s"`` above."""
     m, s = divmod(int(seconds), 60)

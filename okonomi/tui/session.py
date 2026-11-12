@@ -15,12 +15,12 @@ from collections import deque
 from concurrent.futures import TimeoutError as FutureTimeout
 
 from ..agent import OkonomiAgent
-from ..agent.jobs import job_notice
-from ..events import ApprovalRequest, Event, EventEmitter, JobFinished, SystemNote, ToolCallDisplay
-from ..session import Artifact, SessionStatus, prune_empty_sessions, search_artifacts
+from ..agent.tasks import task_notice
+from ..events import ApprovalRequest, Event, EventEmitter, SystemNote, TaskFinished, ToolCallDisplay
+from ..session import SessionStatus, prune_empty_sessions
 from ..utils import format_elapsed
 from .app import ReplApp
-from .assets import handle_asset_action
+from .artifacts import open_artifacts
 from .events import Banner, Divider, UserMessage
 from .transcript import replay_history
 
@@ -45,7 +45,7 @@ class TuiSession:
         self._current_task: asyncio.Task | None = None
         self._worker_loop_future = asyncio.run_coroutine_threadsafe(self._worker_loop(), self._loop)
 
-        # The agent surfaces approvals and background-job completions as
+        # The agent surfaces approvals and background-task completions as
         # events; this session subscribes and reacts. The inline approval
         # UI is single-slot (one input box), so concurrent requests —
         # e.g. a background agent and the foreground turn — queue and
@@ -57,7 +57,7 @@ class TuiSession:
 
         # First-turn reset wipes message_history/artifacts/etc. for a
         # fresh start. Skip it if the agent was already loaded (CLI
-        # ``--resume`` / ``--session`` path) — otherwise the first
+        # ``--resume`` path) — otherwise the first
         # prompt blows away the resumed state.
         self._next_reset: bool = not bool(self.agent.state.message_history)
 
@@ -74,7 +74,7 @@ class TuiSession:
         # and they run next, together with anything it never picked up.
         self._steer_texts: list[str] = []
         # After a user stop the agent stays quiet until the user speaks:
-        # job results are held and ride along with their next message.
+        # task results are held and ride along with their next message.
         self._quiet = False
         self._held_notices: list[str] = []
 
@@ -93,7 +93,7 @@ class TuiSession:
             bg_tasks_fn=self._bg_tasks_list,
             on_double_escape=self._open_tree,
             on_history_search=self._open_history,
-            on_jobs=self._open_jobs,
+            on_tasks=self._open_tasks,
             is_busy=lambda: self._agent_running,
         )
         self._app.transcript.log_dir_fn = lambda: self.agent.session.logs_dir
@@ -182,11 +182,11 @@ class TuiSession:
 
         Called from multiple places (per-turn finally, app exit, atexit)
         so it must never raise — a save error must not crash the session.
-        Assets aren't downloaded here: the agent's eager background
+        Artifacts aren't downloaded here: the agent's eager background
         download pool keeps them up to date independently.
         """
         try:
-            self.agent.save_session(status=status, download_assets=False)
+            self.agent.save_session(status=status, download_artifacts=False)
         except Exception:  # noqa: BLE001
             pass
 
@@ -240,31 +240,18 @@ class TuiSession:
                 self._app.exit()
                 return
             if result.action is Action.FIND_PICKER:
-                self._app.show_find_picker(result.payload, result.scope, self._open_hit)
+                self._app.show_find_picker(
+                    result.payload, result.scope, self._open_hit, session_id=self.agent.session.session_id
+                )
                 return
             if result.action is Action.TREE_PICKER:
                 self._open_tree()
-                return
-            if result.action is Action.ASSET_PICKER:
-                artifacts = list(self.agent.state.artifacts)
-                if result.payload:
-                    artifacts = [
-                        Artifact(h["artifact_type"], path=h["path"], url=h["url"], prompt=h["prompt"])
-                        for h in search_artifacts(result.payload, limit=200)
-                    ]
-                self._app.show_asset_picker(
-                    artifacts,
-                    lambda action, paths: handle_asset_action(action, paths, self.agent, self.emitter),
-                )
                 return
             if result.action is Action.VERBOSE:
                 self._app.toggle_verbose()
                 return
             if result.action is Action.BG:
                 self._spawn_bg_task(result.payload)
-                return
-            if result.action is Action.BTW:
-                self._inject_side_question(result.payload)
                 return
 
             # Action.FORWARD — send the command's payload to the agent.
@@ -295,18 +282,18 @@ class TuiSession:
             self._input_queue.put_nowait(text)
         elif self.agent.status.startswith("Running"):
             # Don't make the user wait on a slow tool: it carries on as a
-            # background job and the model reads the message now.
+            # background task and the model reads the message now.
             self.agent.detach_running_tools()
             self.emitter.emit(SystemNote("↳ Running tool moved to the background so the agent can read this now."))
 
     def _deliver_notice(self, notice: str) -> None:
-        """Hand a finished job's result to the agent: into the running turn
+        """Hand a finished task's result to the agent: into the running turn
         if there is one, else as a new turn — unless the user stopped the
         agent, in which case it waits for their next message. Runs on the
         worker loop."""
         if self._quiet:
             self._held_notices.append(notice)
-            self.emitter.emit(SystemNote("A background job finished; the agent gets its result with your next message."))
+            self.emitter.emit(SystemNote("A background task finished; the agent gets its result with your next message."))
             return
         if not (self._agent_running and self.agent.enqueue(notice)):
             self._input_queue.put_nowait(notice)
@@ -317,16 +304,6 @@ class TuiSession:
         ``None`` is the shutdown sentinel — the consumer breaks on it.
         """
         self._loop.call_soon_threadsafe(self._input_queue.put_nowait, msg)
-
-    def _inject_side_question(self, question: str) -> None:
-        """Deliver a side question like any message typed mid-turn (cuts in
-        on a streaming reply, else joins the running turn), tagged so the
-        agent knows it is an aside rather than new instructions."""
-        if self._agent_running:
-            tagged = f"[Side question while you were working]\n\n{question}"
-        else:
-            tagged = question
-        self._loop.call_soon_threadsafe(self._deliver_on_loop, tagged)
 
     def _spawn_bg_task(self, task_input: str) -> None:
         """Run a task in the background with a separate OkonomiAgent.
@@ -340,13 +317,13 @@ class TuiSession:
         self.emitter.emit(SystemNote(f"Background task {task_id} started: {task_input[:80]}"))
 
         def _forward(ev: Event) -> None:
-            # Approvals and job completions from the bg agent surface on
+            # Approvals and task completions from the bg agent surface on
             # the foreground emitter (the events carry their own resolve
             # handles / payloads); everything else stays isolated.
-            if isinstance(ev, (ApprovalRequest, JobFinished)):
+            if isinstance(ev, (ApprovalRequest, TaskFinished)):
                 self.emitter.emit(ev)
 
-        # Register in the shared job registry so /jobs and /logs see /bg
+        # Register in the shared task registry so /tasks sees /bg
         # tasks alongside term-N.
         progress = {"status": "running", "detail": ""}
 
@@ -367,11 +344,11 @@ class TuiSession:
             )
             # Isolated emitter — the bg agent's tool calls and streaming
             # text don't show up in the foreground history; only approvals,
-            # job completions, and the note below surface to the user.
+            # task completions, and the note below surface to the user.
             bg_agent.emitter = EventEmitter()
             bg_agent.emitter.subscribe(_forward)
             bg_agent.can_prompt = True
-            parent.jobs.entries[task_id]["jobs"] = bg_agent.jobs
+            parent.tasks.entries[task_id]["tasks"] = bg_agent.tasks
             try:
                 reply = asyncio.run(bg_agent.run_async(task_input, reset=True))
                 parent.state.artifacts.extend(bg_agent.state.artifacts)
@@ -391,12 +368,12 @@ class TuiSession:
 
     def _open_hit(self, action: str, hit: dict) -> None:
         """Callback from the find picker. Enter keeps you in okonomi: a
-        session or conversation hit resumes that session; an asset or mind
+        session or conversation hit resumes that session; an artifact or mind
         page is added to the message being typed, the same as dropping the
-        file in. Ctrl-O opens an asset or page in its own app instead."""
+        file in. Ctrl-O opens an artifact or page in its own app instead."""
         ref = hit.get("path") or hit.get("url") or ""
         if action == "open" and ref:
-            handle_asset_action("open", [ref], self.agent, self.emitter)
+            open_artifacts([ref], self.agent, self.emitter)
             return
         if hit["source"] in ("session", "event"):
             self._resume_session(hit["session_id"])
@@ -429,13 +406,13 @@ class TuiSession:
             return
         self._app.show_tree_picker(self.agent.session.session_id, self._checkout_branch)
 
-    def _open_jobs(self) -> None:
-        """Open the conversation + background-jobs navigator (↓ on an
+    def _open_tasks(self) -> None:
+        """Open the conversation + background-tasks navigator (↓ on an
         empty prompt), mid-turn included. A no-op until something has been
         launched."""
-        if not self.agent.jobs.entries:
+        if not self.agent.tasks.entries:
             return
-        self._app.show_jobs_picker(self.agent.session.title or self.agent.session.session_id, self.agent.jobs, self._open_tree)
+        self._app.show_tasks_picker(self.agent.session.title or self.agent.session.session_id, self.agent.tasks, self._open_tree)
 
     def _open_history(self) -> None:
         """Open the Ctrl-R conversation search (branch by content)."""
@@ -509,8 +486,8 @@ class TuiSession:
         synchronously on the emitting thread — must never block."""
         if isinstance(ev, ApprovalRequest):
             self._enqueue_approval(ev)
-        elif isinstance(ev, JobFinished):
-            self._on_job_finished(ev)
+        elif isinstance(ev, TaskFinished):
+            self._on_task_finished(ev)
 
     def _enqueue_approval(self, request: ApprovalRequest) -> None:
         """Queue an approval request for the single-slot inline UI; show
@@ -539,9 +516,9 @@ class TuiSession:
 
         self._app.call_from_thread(self._app.show_approval, request.code, request.reason, _resolve)
 
-    def _on_job_finished(self, ev: JobFinished) -> None:
-        """Hand the finished job's result to the agent (see ``_deliver_notice``)."""
-        self._loop.call_soon_threadsafe(self._deliver_notice, job_notice(ev))
+    def _on_task_finished(self, ev: TaskFinished) -> None:
+        """Hand the finished task's result to the agent (see ``_deliver_notice``)."""
+        self._loop.call_soon_threadsafe(self._deliver_notice, task_notice(ev))
 
     # --- Status-bar callables passed to ReplApp ---
 
@@ -565,15 +542,15 @@ class TuiSession:
         return str(usage)
 
     def _bg_tasks_list(self) -> list[tuple[str, str, str]]:
-        """(id, label, elapsed) for running background jobs, read
-        from the shared JobRegistry — covers term-N, launched
+        """(id, label, elapsed) for running background tasks, read
+        from the shared TaskRegistry — covers term-N, launched
         agents, and /bg tasks in one place."""
         now = time.time()
         out: list[tuple[str, str, str]] = []
-        for job_id, job in list(self.agent.jobs.entries.items()):
-            if job.get("status") != "running":
+        for task_id, task in list(self.agent.tasks.entries.items()):
+            if task.get("status") != "running":
                 continue
-            out.append((job_id, job.get("label", ""), f"{now - job['started_at']:.0f}s"))
+            out.append((task_id, task.get("label", ""), f"{now - task['started_at']:.0f}s"))
         return out
 
     # --- Entry points ---
@@ -596,8 +573,8 @@ class TuiSession:
             "natively; /verbose toggles full tool output.",
         ))
 
-        # A preloaded session (CLI --resume / --session) renders its prior
-        # conversation into the scrollback, same as the /session picker —
+        # A preloaded session (CLI --resume) renders its prior
+        # conversation into the scrollback, same as the /resume picker —
         # otherwise the model has context the user can't see.
         if self.agent.state.message_history:
             replay_history(self.agent.state.message_history, self.emitter)
@@ -618,13 +595,13 @@ class TuiSession:
         """Tear down the worker loop and persist a final save.
 
         Cancels any in-flight turn, posts the consumer-stop sentinel,
-        stops the loop, joins the thread, drops in-flight asset
+        stops the loop, joins the thread, drops in-flight artifact
         downloads, and saves session metadata (URLs survive in the DB;
         resume retries anything missing)."""
         if self._agent_running:
             self.cancel_current_turn()
         # Background work dies with the REPL: detached tool calls, term-N
-        # jobs, and sub-agents' commands are all bash subprocesses in their
+        # tasks, and sub-agents' commands are all bash subprocesses in their
         # own process groups, so they'd outlive us otherwise. Killing them
         # also unblocks the tool-pool threads the interpreter joins at exit.
         from ..tools.terminal import kill_all_processes
@@ -647,7 +624,7 @@ class TuiSession:
         self._loop.call_soon_threadsafe(self._loop.stop)
         self._agent_thread.join(timeout=2.0)
         try:
-            self.agent._asset_dl_pool.shutdown(wait=False, cancel_futures=True)
+            self.agent._artifact_dl_pool.shutdown(wait=False, cancel_futures=True)
         except Exception:  # noqa: BLE001
             pass
         self._safe_save_session(status="completed")

@@ -27,7 +27,7 @@ HEAD_RATIO = 0.4
 _bg_counter = itertools.count(1)
 
 # Every bash subprocess alive in this process, across all TerminalTools
-# instances (the foreground agent, detached tool calls, term-N jobs, and
+# instances (the foreground agent, detached tool calls, term-N tasks, and
 # sub-agents' own terminals). Each runs in its own process group via setsid,
 # so without this the REPL exiting would orphan them.
 _live_procs: set[subprocess.Popen] = set()
@@ -90,12 +90,12 @@ class TerminalTools:
         self._interrupt = threading.Event()
         self._has_rg = shutil.which("rg") is not None
         self._on_bg_complete: Any | None = None
-        # Hook called when a background job (term-N) starts. Receives
+        # Hook called when a background task (term-N) starts. Receives
         # (task_id, label, reader) where reader is a zero-arg callable
         # returning the current stdout snapshot. Set by the agent so its
-        # /logs slash command can find term-N output.
+        # /tasks picker can find term-N output.
         self._on_bg_register: Any | None = None
-        # Hook called when a background job finishes. Receives
+        # Hook called when a background task finishes. Receives
         # (task_id, status) where status is "ok" or "error".
         self._on_bg_finish: Any | None = None
         # Zero-arg callables returning the current session's artifacts and
@@ -178,7 +178,7 @@ class TerminalTools:
                 "cwd": self._cwd,
             }
 
-        # Only foreground calls honour Ctrl+C; background (term-N) jobs
+        # Only foreground calls honour Ctrl+C; background (term-N) tasks
         # share this instance and must survive a cancelled turn.
         foreground = _chunks_sink is None
         if foreground:
@@ -265,12 +265,12 @@ class TerminalTools:
         Returns immediately. The thread runs the same code path as a
         synchronous ``bash()`` (capturing output, exit code, cwd update)
         and fires ``self._on_bg_complete`` when done (the agent wires it
-        to emit a ``JobFinished`` event; subscribers react from there).
+        to emit a ``TaskFinished`` event; subscribers react from there).
         """
         task_id = f"term-{next(_bg_counter)}"
         # Live chunks list — populated incrementally by the drain thread
         # inside `bash()`. Snapshotting via "".join(chunks) is what makes
-        # /logs term-N show output while the command is still running.
+        # /tasks shows output while the command is still running.
         chunks: list[str] = []
 
         def _snapshot() -> str:

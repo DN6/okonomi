@@ -2,7 +2,7 @@
 
 This module provides the OkonomiAgent class that uses Pydantic AI for LLM
 interactions, along with its runtime state (``OkonomiState``), dependency
-container (``AgentDependencies``), asset-download helpers and
+container (``AgentDependencies``), artifact-download helpers and
 image-reference parsing. The class is assembled from focused modules:
 the turn loop, event wiring, and session save/load live here; code runs
 through the sandboxed ``bash`` tool (``tools.terminal``); system-prompt
@@ -63,7 +63,7 @@ from ..events import (
     TurnStart,
 )
 from ..mcp import build_toolsets as build_mcp_toolsets
-from ..session import Artifact, Session, SessionStatus, asset_subdir_for_file
+from ..session import Artifact, Session, SessionStatus, artifact_subdir_for_file
 from ..tools import (
     AgentTools,
     FileTools,
@@ -76,16 +76,16 @@ from ..tools import (
 from ..tools._command_guard import approve_always, check_command, dangerous_matches, load_approval_rules
 from ..traces import TracingModel
 from ..utils import redact_secrets
-from .jobs import JobRegistry
 from .prompt import build_system_prompt
 from .provider import build_model
+from .tasks import TaskRegistry
 
 
 # A tool call still running after this many seconds moves to the background
-# as a ``tool-N`` job so the main thread stays free: the model gets a
+# as a ``tool-N`` task so the main thread stays free: the model gets a
 # ``{"pending": "tool-N"}`` placeholder and ends its reply, and the result
-# arrives later as a follow-up message (``JobFinished`` → ``tool_notice``),
-# the same path as every other background job. Short calls stay inline so
+# arrives later as a follow-up message (``TaskFinished`` → ``tool_notice``),
+# the same path as every other background task. Short calls stay inline so
 # the model can chain them.
 TOOL_DETACH_AFTER = 30.0
 _detach_counter = itertools.count(1)
@@ -94,7 +94,7 @@ _detach_counter = itertools.count(1)
 def _tool_result_display(part: ToolReturnPart | RetryPromptPart) -> dict[str, str | None]:
     """``ToolCallDisplay.finish`` kwargs for a tool result. Tools often
     return ``{"error": ...}`` instead of raising, so that shows as an error
-    too; a detached call shows its job id instead of the placeholder dict."""
+    too; a detached call shows its task id instead of the placeholder dict."""
     if isinstance(part, RetryPromptPart):
         return {"error": part.content if isinstance(part.content, str) else str(part.content)}
     content = part.content
@@ -184,10 +184,10 @@ class AgentDependencies:
                 pass
 
 
-# Maps a file extension to the artifact_type used by /assets and search_artifacts.
+# Maps a file extension to the artifact_type used by the viewer and search_artifacts.
 # bash commands write media straight to the session dir (PIL/matplotlib/ffmpeg)
 # without going through add_artifact; a post-run sweep keyed on this table is what
-# turns those files into tracked assets.
+# turns those files into tracked artifacts.
 _MEDIA_EXT_TO_TYPE = {
     ".png": "image",
     ".jpg": "image",
@@ -215,24 +215,24 @@ _MEDIA_EXT_TO_TYPE = {
     ".md": "research",
 }
 
-_KNOWN_ASSET_EXTS = {".jpg", ".jpeg", ".png", ".webp", ".gif", ".mp4", ".webm", ".mov"}
+_KNOWN_ARTIFACT_EXTS = {".jpg", ".jpeg", ".png", ".webp", ".gif", ".mp4", ".webm", ".mov"}
 
 
-def download_asset(url: str, artifacts_dir: Path, asset_type: str) -> str:
+def download_artifact(url: str, artifacts_dir: Path, artifact_type: str) -> str:
     """Download ``url`` into ``<artifacts_dir>/<subdir>/`` and return the
     local path. Returns ``""`` on any failure (network blip, fal expiry) —
     callers retry on the next save."""
     try:
         url_filename = Path(urlparse(url).path).name
-        if Path(url_filename).suffix.lower() in _KNOWN_ASSET_EXTS:
+        if Path(url_filename).suffix.lower() in _KNOWN_ARTIFACT_EXTS:
             filename = url_filename
         else:
-            ext = ".jpg" if asset_type == "image" else ".mp4"
+            ext = ".jpg" if artifact_type == "image" else ".mp4"
             filename = f"{url_filename}{ext}"
 
-        asset_dir = artifacts_dir / asset_subdir_for_file(filename)
-        asset_dir.mkdir(parents=True, exist_ok=True)
-        local_path = asset_dir / filename
+        artifact_dir = artifacts_dir / artifact_subdir_for_file(filename)
+        artifact_dir.mkdir(parents=True, exist_ok=True)
+        local_path = artifact_dir / filename
 
         with httpx.Client(timeout=60.0) as client:
             response = client.get(url, follow_redirects=True)
@@ -244,7 +244,7 @@ def download_asset(url: str, artifacts_dir: Path, asset_type: str) -> str:
         return ""
 
 
-def download_session_assets(artifacts: list[Artifact], artifacts_dir: Path) -> None:
+def download_session_artifacts(artifacts: list[Artifact], artifacts_dir: Path) -> None:
     """Download every remote artifact missing a local path into ``artifacts_dir``.
 
     Mutates each artifact in place — sets ``path`` on success, leaves it
@@ -253,7 +253,7 @@ def download_session_assets(artifacts: list[Artifact], artifacts_dir: Path) -> N
     for artifact in artifacts:
         if not artifact.url or artifact.path:
             continue
-        local_path = download_asset(artifact.url, artifacts_dir, artifact.artifact_type)
+        local_path = download_artifact(artifact.url, artifacts_dir, artifact.artifact_type)
         if local_path:
             artifact.path = local_path
 
@@ -432,16 +432,16 @@ class OkonomiAgent:
         self.session = Session(session_id or "", model=model_id, state=OkonomiState())
         self._setup_tools()
 
-        # Background pool for eager asset downloads. Daemon threads —
+        # Background pool for eager artifact downloads. Daemon threads —
         # don't block process exit. Cap at 4 so a burst of generations
         # doesn't saturate bandwidth.
-        self._asset_dl_pool = ThreadPoolExecutor(max_workers=4, thread_name_prefix="okonomi-dl")
+        self._artifact_dl_pool = ThreadPoolExecutor(max_workers=4, thread_name_prefix="okonomi-dl")
 
         # Set on cancel/timeout so the NEXT turn knows to prepend a
         # "you were interrupted, focus on the new instruction" marker.
         self._was_interrupted: bool = False
         # Set when the running turn is cancelled or times out, so tool calls
-        # still attached to it stop instead of detaching into jobs whose
+        # still attached to it stop instead of detaching into tasks whose
         # completion would start an unasked-for turn. Replaced every turn.
         self._turn_cancelled = threading.Event()
         # Set when the user sends a message mid-tool: running calls move to
@@ -467,18 +467,18 @@ class OkonomiAgent:
         # nothing). Default has zero subscribers — events accumulate in
         # ``emitter.history()`` and nothing is rendered.
         self.emitter = EventEmitter()
-        # Shared background-job registry (term-N, launched
-        # agents, /bg tasks). /jobs, /logs, and the status bar read it.
-        self.jobs = JobRegistry(self.emitter)
+        # Shared background-task registry (term-N, launched
+        # agents, /bg tasks). /tasks and the status bar read it.
+        self.tasks = TaskRegistry(self.emitter)
         self._turn_count = 0
         # Stream-event persistence cursors: system notes are flushed from
         # the emitter's history at save (everything past this index);
         # interrupts queue here until the next save.
         self._persisted_note_count = 0
         self._pending_stream_events: list[Event] = []
-        # Background job id (term-N / tool-N) → the tool call that started
+        # Background task id (term-N / tool-N) → the tool call that started
         # it, so files it writes are stamped with their producing call.
-        self._job_tool_call_ids: dict[str, str] = {}
+        self._task_tool_call_ids: dict[str, str] = {}
         # Let context compression surface its user-facing warning through the
         # same event pipe instead of a raw print (built before the emitter).
         self.context_manager.emitter = self.emitter
@@ -491,7 +491,7 @@ class OkonomiAgent:
         self._agent_run: Any = None
         self._enqueued: dict[str, str] = {}
         # Tools run on this pool so a call that outlives TOOL_DETACH_AFTER can
-        # keep running as a background job after the turn moves on.
+        # keep running as a background task after the turn moves on.
         self._tool_pool = ThreadPoolExecutor(thread_name_prefix="okonomi-tool")
         # Set by a UI that answers ApprovalRequest events. Without one, bash
         # refuses dangerous commands instead of waiting for an answer that
@@ -502,10 +502,10 @@ class OkonomiAgent:
         # with the event loop and toolsets they were opened for.
         self._mcp_stack: contextlib.AsyncExitStack | None = None
         self._mcp_stack_key: tuple[Any, Any] | None = None
-        # Background-job completions surface as JobFinished events on the
-        # emitter (see _job_finished) — subscribers react (e.g. the TUI
+        # Background-task completions surface as TaskFinished events on the
+        # emitter (see _task_finished) — subscribers react (e.g. the TUI
         # injects a follow-up turn); nothing polls or registers callbacks.
-        self.terminal._on_bg_complete = self._job_finished
+        self.terminal._on_bg_complete = self._task_finished
 
         self.agent = self._create_agent()
 
@@ -528,7 +528,7 @@ class OkonomiAgent:
         self._status = value
         self.emitter.emit(StatusChanged(value))
 
-    def _job_finished(
+    def _task_finished(
         self,
         *,
         bg_id: str,
@@ -536,14 +536,14 @@ class OkonomiAgent:
         output: str | None = None,
         produced_artifacts: list | None = None,
     ) -> None:
-        """Delegate to the shared JobRegistry (see ``okonomi.agent.jobs``),
-        sweeping the session dir first so the finished job's outputs are
+        """Delegate to the shared TaskRegistry (see ``okonomi.agent.tasks``),
+        sweeping the session dir first so the finished task's outputs are
         registered as artifacts before the completion event fires."""
         try:
-            self._sync_session_assets(self._get_dependencies(), tool_call_id=self._job_tool_call_ids.pop(bg_id, ""))
+            self._sync_session_artifacts(self._get_dependencies(), tool_call_id=self._task_tool_call_ids.pop(bg_id, ""))
         except Exception:  # noqa: BLE001
             pass
-        self.jobs.finished(
+        self.tasks.finished(
             bg_id=bg_id,
             error=error,
             output=output,
@@ -680,7 +680,7 @@ class OkonomiAgent:
                             if denial is not None:
                                 return denial
                         kwargs["_approved"] = not pending or agent_self.can_prompt
-                        # Live output for /logs tool-N. ``kill`` replaces the
+                        # Live output for /tasks on tool-N. ``kill`` replaces the
                         # shared Ctrl+C flag: it is only set while the call is
                         # still attached, so a detached call survives later stops.
                         kwargs["_chunks_sink"] = chunks
@@ -699,11 +699,11 @@ class OkonomiAgent:
                                 return agent_self._detach_tool_call(fut, tn, chunks, ctx.tool_call_id or "")
                     if tn == "bash":
                         if isinstance(result, dict) and result.get("task_id"):
-                            agent_self._job_tool_call_ids[result["task_id"]] = ctx.tool_call_id or ""
+                            agent_self._task_tool_call_ids[result["task_id"]] = ctx.tool_call_id or ""
                         # bash writes media straight into the session
                         # dir; sweep so outputs register as artifacts.
                         try:
-                            agent_self._sync_session_assets(
+                            agent_self._sync_session_artifacts(
                                 agent_self._get_dependencies(), tool_call_id=ctx.tool_call_id or ""
                             )
                         except Exception:  # noqa: BLE001
@@ -813,11 +813,11 @@ class OkonomiAgent:
     def _detach_tool_call(
         self, fut: Future | asyncio.Future, tool_name: str, chunks: list[str], tool_call_id: str = ""
     ) -> dict:
-        """Register a slow tool call as a ``tool-N`` job and return the
+        """Register a slow tool call as a ``tool-N`` task and return the
         placeholder the model sees instead of its result. The result is
-        reported through ``_job_finished`` when the call completes."""
-        job_id = f"tool-{next(_detach_counter)}"
-        self._job_tool_call_ids[job_id] = tool_call_id
+        reported through ``_task_finished`` when the call completes."""
+        task_id = f"tool-{next(_detach_counter)}"
+        self._task_tool_call_ids[task_id] = tool_call_id
         box: dict[str, Any] = {}
 
         def _reader() -> str:
@@ -828,7 +828,7 @@ class OkonomiAgent:
                 return redact_secrets(joined) or "(no output yet)"
             return _short_repr(box["result"]) if "result" in box else "(running — this tool has no live output)"
 
-        self.jobs.register(task_id=job_id, label=tool_name, reader=_reader, kind="tool")
+        self.tasks.register(task_id=task_id, label=tool_name, reader=_reader, kind="tool")
 
         def _done(f: Future | asyncio.Future) -> None:
             try:
@@ -838,15 +838,15 @@ class OkonomiAgent:
                 result = None
                 error = f"{type(exc).__name__}: {exc}"
             box["result"] = result if error is None else {"error": error}
-            self.jobs.mark_done(task_id=job_id, status="error" if error else "ok")
-            self._job_finished(bg_id=job_id, error=error, output=None if error else _short_repr(result))
+            self.tasks.mark_done(task_id=task_id, status="error" if error else "ok")
+            self._task_finished(bg_id=task_id, error=error, output=None if error else _short_repr(result))
 
         fut.add_done_callback(_done)
         return {
-            "pending": job_id,
+            "pending": task_id,
             "message": (
                 f"{tool_name} is still running after {TOOL_DETACH_AFTER:.0f}s and has moved to the background as "
-                f"{job_id}. Do not poll, wait, or re-run it. Tell the user it is running and end your reply; "
+                f"{task_id}. Do not poll, wait, or re-run it. Tell the user it is running and end your reply; "
                 "its result arrives as a [system] message when it finishes."
             ),
         }
@@ -858,19 +858,19 @@ class OkonomiAgent:
         )
 
     def _register_bg_log(self, *, task_id: str, label: str, reader) -> None:
-        """Delegate to the shared JobRegistry (see ``okonomi.agent.jobs``)."""
-        self.jobs.register(task_id=task_id, label=label, reader=reader)
+        """Delegate to the shared TaskRegistry (see ``okonomi.agent.tasks``)."""
+        self.tasks.register(task_id=task_id, label=label, reader=reader)
 
     def _mark_bg_log_done(self, *, task_id: str, status: str) -> None:
-        """Delegate to the shared JobRegistry (see ``okonomi.agent.jobs``)."""
-        self.jobs.mark_done(task_id=task_id, status=status)
+        """Delegate to the shared TaskRegistry (see ``okonomi.agent.tasks``)."""
+        self.tasks.mark_done(task_id=task_id, status=status)
 
-    def _sync_session_assets(self, deps: "AgentDependencies", tool_call_id: str = "") -> int:
+    def _sync_session_artifacts(self, deps: "AgentDependencies", tool_call_id: str = "") -> int:
         """Register media files in the session dir that aren't tracked yet.
 
         bash commands write images/video/audio/etc. straight to the session
         directory (PIL.save, matplotlib.savefig, ffmpeg, imageio) without ever
-        calling add_artifact, so those outputs never reach /assets, the SQLite
+        calling add_artifact, so those outputs never reach the viewer, the SQLite
         index, or search_artifacts. This sweep walks the session dir and adds an
         artifact for every media file not already represented by a tracked
         path. Idempotent: dedup is keyed on the resolved path, so re-running it
@@ -932,8 +932,8 @@ class OkonomiAgent:
         """Submit a background download for a remote artifact.
 
         Fires from AgentDependencies.add_artifact the moment a tool tracks an
-        asset. By the time save_session runs, most assets are already on
-        disk and ``download_session_assets`` is a fast no-op. Idempotent —
+        artifact. By the time save_session runs, most artifacts are already on
+        disk and ``download_session_artifacts`` is a fast no-op. Idempotent —
         already-downloaded artifacts are skipped.
         """
         if not artifact.url or artifact.path:
@@ -943,13 +943,13 @@ class OkonomiAgent:
             try:
                 artifacts_dir = self.session.artifacts_dir
                 artifacts_dir.mkdir(parents=True, exist_ok=True)
-                local_path = download_asset(artifact.url, artifacts_dir, artifact.artifact_type)
+                local_path = download_artifact(artifact.url, artifacts_dir, artifact.artifact_type)
                 artifact.path = local_path
             except Exception:
                 pass
 
         try:
-            self._asset_dl_pool.submit(_run)
+            self._artifact_dl_pool.submit(_run)
         except RuntimeError:
             _run()
 
@@ -1047,7 +1047,7 @@ class OkonomiAgent:
 
     def detach_running_tools(self) -> None:
         """Move the running turn's in-flight tool calls to the background
-        now (as ``tool-N`` jobs), so a message just enqueued reaches the
+        now (as ``tool-N`` tasks), so a message just enqueued reaches the
         model without waiting on them."""
         self._detach_now.set()
 
@@ -1141,7 +1141,7 @@ class OkonomiAgent:
                 self.state.context = compressed
 
         partial, self._interrupted_partial = self._interrupted_partial, ""
-        # Job notices ("[system] ...") are not the user speaking.
+        # Task notices ("[system] ...") are not the user speaking.
         if prior_interrupted and self.state.context and not user_message.startswith("[system]"):
             said = f" You had started replying: \"{partial.strip()}\"" if partial.strip() else ""
             user_message = (
@@ -1253,13 +1253,13 @@ class OkonomiAgent:
     def save_session(
         self,
         status: SessionStatus = "completed",
-        download_assets: bool = True,
+        download_artifacts: bool = True,
     ) -> None:
         """Persist the live state.
 
         Args:
             status: Status of the session (completed, error, abandoned)
-            download_assets: When True (default), synchronously download
+            download_artifacts: When True (default), synchronously download
                 any tracked outputs that don't yet have a ``local_path``.
                 Set False on shutdown / atexit paths so quitting doesn't
                 wait on slow network downloads — the eager bg pool has
@@ -1268,8 +1268,8 @@ class OkonomiAgent:
         """
         session = self.session
 
-        if download_assets:
-            download_session_assets(session.state.artifacts, session.artifacts_dir)
+        if download_artifacts:
+            download_session_artifacts(session.state.artifacts, session.artifacts_dir)
 
         # Stamp the run-owned fields onto the live session; identity
         # fields (title / created_at) are write-once at the

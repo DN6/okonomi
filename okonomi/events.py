@@ -40,7 +40,7 @@ class EventType(str, Enum):
     SYSTEM_NOTE = "system_note"
     TITLE = "title"
     INTERRUPT = "interrupt"
-    ASSET_ACTION = "asset_action"
+    ARTIFACT_ACTION = "artifact_action"
 
 
 CONVERSATION_TYPES = (
@@ -255,12 +255,12 @@ class Interrupt(Event):
 
 
 @dataclass
-class AssetAction(Event):
-    """The user acted on assets outside the conversation: favorited,
-    opened or copied them from the viewer or the asset picker. Persisted
+class ArtifactAction(Event):
+    """The user acted on artifacts outside the conversation: favorited,
+    opened or copied them from the viewer or the artifact picker. Persisted
     on the session stream so the act has a position in the conversation."""
 
-    type: ClassVar[str] = "asset_action"
+    type: ClassVar[str] = "artifact_action"
 
     action: str = ""  # favorite | unfavorite | open | copy
     refs: list[str] = field(default_factory=list)
@@ -301,31 +301,31 @@ class StatusChanged(Event):
 
 
 @dataclass
-class JobStarted(Event):
-    """A background job began (term-N shell
+class TaskStarted(Event):
+    """A background task began (term-N shell
     command, task-N sub-agent)."""
 
-    type: ClassVar[str] = "job_started"
+    type: ClassVar[str] = "task_started"
 
-    job_id: str = ""
+    task_id: str = ""
     kind: str = ""
     label: str = ""
 
 
 @dataclass
-class JobFinished(Event):
-    """A background job completed. Carries what the job produced so a
+class TaskFinished(Event):
+    """A background task completed. Carries what the task produced so a
     subscriber can act (e.g. inject a follow-up turn) without scanning
-    session state; full logs stay pull-based via the job registry."""
+    session state; full logs stay pull-based via the task registry."""
 
-    type: ClassVar[str] = "job_finished"
+    type: ClassVar[str] = "task_finished"
 
-    job_id: str = ""
+    task_id: str = ""
     kind: str = ""
     status: str = "ok"  # ok | error
     error: str | None = None
     output: str | None = None
-    # Lean refs of artifacts this job produced: {artifact_type, path, url}
+    # Lean refs of artifacts this task produced: {artifact_type, path, url}
     artifact_refs: list[dict[str, str]] = field(default_factory=list)
 
 

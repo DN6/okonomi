@@ -11,7 +11,7 @@ from pydantic_ai.models.test import TestModel
 from okonomi import mcp
 
 
-def test_add_remove_round_trip(store, tmp_path):
+def test_servers_round_trip_through_the_config_and_surface_as_prefixed_tools(store, tmp_path, monkeypatch):
     assert mcp.add_server("fs", "npx", ["-y", "server-fs", "."], {"TOKEN": "x"})["success"]
     assert mcp.add_server("docs", "https://example.com/mcp", [], {"Authorization": "Bearer y"})["success"]
     data = json.loads((tmp_path / "mcp.json").read_text())
@@ -21,14 +21,11 @@ def test_add_remove_round_trip(store, tmp_path):
             "docs": {"url": "https://example.com/mcp", "headers": {"Authorization": "Bearer y"}},
         }
     }, "config must use the standard mcpServers shape"
-    assert mcp.remove_server("fs")["success"]
-    assert list(mcp.load_servers()) == ["docs"]
+    assert mcp.remove_server("fs")["success"] and mcp.remove_server("docs")["success"]
+    assert list(mcp.load_servers()) == []
 
-
-def test_stdio_server_tools_are_prefixed_and_callable(store, tmp_path, monkeypatch):
     monkeypatch.setenv("SRV_PATH", str(write_mcp_server(tmp_path / "srv.py")))
     assert mcp.add_server("demo", sys.executable, ["${SRV_PATH}"], {})["success"]
-
     seen: list[str] = []
 
     async def hook(ctx, call_tool, name, args):
