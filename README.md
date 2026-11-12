@@ -37,28 +37,6 @@ okonomi --export ./preferences
 ```
 
 <details>
-<summary><b>What it explores</b></summary>
-
-The things I mostly use it to poke at:
-
-- **TUI design** — a prompt-toolkit REPL with slash commands and full-screen
-  pickers, and how command handlers hand control to modal UI.
-- **Context and long-term memory** — compressing the live context window over a
-  long session, plus durable cross-session recall (BM25 over past conversations,
-  titles, and media prompts) and DAG-style session branching.
-- **Creative research strategies** — structured exploration via the `research`
-  skill, web search/fetch, and fanning research out across subagents.
-- **Media creation workflows** — a sandboxed shell as the execution surface and
-  the session directory as the persistent workspace for generating and editing
-  media, with outputs auto-tracked as session artifacts.
-- **Training data** — every session records model calls, candidate sets and the
-  picks the user made, exported as preference pairs for a taste model.
-
-Expect these to be rebuilt, replaced, or removed as the experiments continue.
-
-</details>
-
-<details>
 <summary><b>Setup</b></summary>
 
 The model provider is auto-detected from whichever API key you set. Create a `.env`
