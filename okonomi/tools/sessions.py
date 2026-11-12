@@ -70,7 +70,7 @@ class SessionsTools:
            conversation window around one event (follow up on a hit).
         3. ``session_id`` alone → **read**: session metadata + artifacts +
            the capped head/tail of the conversation.
-        4. no arguments → **browse**: the user's favorite assets (across
+        4. no arguments → **browse**: the user's favorite artifacts (across
            all sessions), then recent sessions, newest first.
 
         Args:

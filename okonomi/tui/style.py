@@ -51,13 +51,13 @@ REPL_STYLE = Style.from_dict(
         "bottom-toolbar.label": f"noreverse {_TEXT} bold",
         "bottom-toolbar.meta": f"noreverse {_MUTED}",
         "bottom-toolbar.sep": f"noreverse {_MUTED}",
-        "bottom-toolbar.bg": f"noreverse {_FAINT}",  # background jobs — darkest
+        "bottom-toolbar.bg": f"noreverse {_FAINT}",  # background tasks — darkest
         # Slash-command completion menu.
         "completion-menu": f"bg:{_SURFACE} {_TEXT}",
         "completion-menu.completion.current": f"bg:{_SURFACE_HI} {_ACCENT} bold",
         "completion-menu.meta.completion": f"bg:{_SURFACE} {_MUTED}",
         "completion-menu.meta.completion.current": f"bg:{_SURFACE_HI} {_ACCENT}",
-        # Picker rows (session / asset modals).
+        # Picker rows (find / tree / tasks modals).
         "picker-highlight": f"bg:{_SURFACE_HI} {_ACCENT} bold",
         # Session-tree role tags: who wrote the row.
         "tree.user": f"{_ACCENT} bold",

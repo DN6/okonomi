@@ -21,7 +21,7 @@ The things I mostly use it to poke at:
   skill, web search/fetch, and fanning research out across subagents.
 - **Media creation workflows** — a sandboxed shell as the execution surface and
   the session directory as the persistent workspace for generating and editing
-  media, with outputs auto-tracked as session assets.
+  media, with outputs auto-tracked as session artifacts.
 
 Expect these to be rebuilt, replaced, or removed as the experiments continue.
 
@@ -100,12 +100,33 @@ okonomi --task "Design a futuristic logo"
 # Resume the most recent session
 okonomi --resume
 
-# Load a specific session by ID
-okonomi --session <id>
+# Resume a specific session by id, title, or content words
+okonomi --resume <id|title|words>
 
 # Write preference data (candidate sets, chosen/rejected pairs, tiers, metrics) for every session
 okonomi --export ./preferences
 ```
+
+## Slash commands
+
+| Command | Does |
+|---|---|
+| `/find [query]` | Search sessions, conversations, artifacts and the mind wiki. With nothing typed it lists this session's artifacts, favorites, recent sessions and mind pages. Enter adds a file to your message, Ctrl-O opens it. |
+| `/resume [query]` | Pick a past session to resume |
+| `/tree` | Browse the session tree, jump back, edit and resubmit to branch |
+| `/viewer` | Open the media viewer for this session in the browser |
+| `/mind [note]` | Add to the mind wiki, or file what this conversation established |
+| `/bg <task>` | Run a task in the background |
+| `/tasks` | List background tasks; Enter shows a task's output |
+| `/skills [install <spec>]` | List skills, or install one from GitHub. Run a skill with `/<name>` |
+| `/mcp [add\|remove …]` | List, add or remove MCP servers |
+| `/title`, `/save`, `/clear`, `/reload`, `/timeout`, `/verbose`, `/help`, `/exit` | Session housekeeping |
+
+`/find` takes GitHub-style qualifiers: `type:artifact|session|event|mind`, `kind:image|video|audio|3d|html|text`,
+`is:favorite`, `session:<id prefix or title word>`. Finished tool calls print as one line each; click the line to
+open the full call and output, which is written under the session's `scratch/logs/`.
+
+## Store
 
 Everything lives in one store: `$OKONOMI_HOME/okonomi.db` holds sessions, the event
 stream, artifacts, favorites and the search index over the mind wiki; `mind/` holds the
@@ -115,5 +136,16 @@ wiki pages, versioned in git by `remember`. Each `sessions/<id>/` has three part
 sessions/<id>/
 ├── traces.jsonl    one line per model call, written by the harness
 ├── artifacts/      outputs — $OKONOMI_SESSION_DIR; swept into the DB and shown in the viewer
+│   └── references/ images you supplied, kept apart from generated candidates
 └── scratch/        scripts, intermediate state, installs — $OKONOMI_SCRATCH_DIR; never tracked
+    └── logs/       one markdown file per tool call, linked from the transcript
 ```
+
+## Tests
+
+```shell
+OKONOMI_HOME=$(mktemp -d) uv run pytest
+```
+
+One module per subsystem: `test_agent`, `test_tui`, `test_store`, `test_terminal`, `test_training`,
+`test_skills`, `test_viewer`, `test_mcp`.

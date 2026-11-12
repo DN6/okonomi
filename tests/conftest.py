@@ -5,7 +5,7 @@ from okonomi import session as session_mod
 from okonomi.agent.agent import OkonomiAgent
 from okonomi.tools import files as files_mod
 from okonomi.tools import skills as skills_mod
-from okonomi.tui import assets as assets_mod
+from okonomi.tui import artifacts as artifacts_mod
 from okonomi.tui import commands as commands_mod
 
 
@@ -25,7 +25,7 @@ def store(tmp_path, monkeypatch):
     monkeypatch.setattr(files_mod, "OKONOMI_MIND_DIR", mind)
     monkeypatch.setattr(skills_mod, "USER_SKILLS_DIR", tmp_path / "skills")
     monkeypatch.setattr(commands_mod, "USER_SKILLS_DIR", tmp_path / "skills")
-    monkeypatch.setattr(assets_mod, "FAVORITES_DIR", tmp_path / "favorites")
+    monkeypatch.setattr(artifacts_mod, "FAVORITES_DIR", tmp_path / "favorites")
     monkeypatch.setattr(mcp, "OKONOMI_MCP_CONFIG", tmp_path / "mcp.json")
     yield conn
     conn.close()

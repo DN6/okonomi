@@ -1,14 +1,12 @@
-"""On-demand full-screen pickers for the REPL (find, asset, tree, history, jobs).
+"""On-demand full-screen pickers for the REPL (find, tree, history, tasks).
 
 Each is a transient ``prompt_toolkit`` ``Application`` run on the alternate
 screen and awaited; selecting exits with the chosen value, Esc / Ctrl-C exit
 with ``None``. The alt-screen leaves the REPL scrollback untouched, so native
 scroll + copy are unaffected once the picker closes.
 
-The find picker (also ``/session``, as a scoped view) focuses a
-live search buffer backed by ``session.search``. The asset picker has
-single-letter action verbs (a/x/o/c/f/v) that would collide with a focused text
-buffer, so it omits live search for now and navigates with the arrow keys.
+The find picker (also ``/resume``, as a scoped view) focuses a
+live search buffer backed by ``session.search``.
 """
 
 from __future__ import annotations
@@ -38,7 +36,7 @@ def _ref(a) -> str:
 
 
 _SCOPE_TITLES = {
-    "": "Find — sessions, conversations, assets, mind wiki",
+    "": "Find — sessions, conversations, artifacts, mind wiki",
     "session": "Resume session",
 }
 
@@ -47,6 +45,41 @@ def _live_query(q: str) -> str:
     """Treat the word being typed as a prefix, so results keep up with
     the keyboard instead of waiting for a whole word."""
     return q + "*" if q[-1:].isalnum() else q
+
+
+_QUALIFIERS = ("type", "kind", "is", "session")
+
+
+def parse_query(q: str) -> tuple[str, dict[str, str]]:
+    """Split GitHub-style qualifiers (``type:artifact kind:image is:favorite
+    session:fox``) out of a query; the rest is the free-text search."""
+    words, filters = [], {}
+    for token in q.split():
+        key, sep, value = token.partition(":")
+        if sep and key in _QUALIFIERS and value:
+            filters[key] = value.lower()
+        else:
+            words.append(token)
+    if "kind" in filters or filters.get("is") == "favorite":
+        filters.setdefault("type", "artifact")
+    return " ".join(words), filters
+
+
+def apply_filters(hits: list[dict], filters: dict[str, str]) -> list[dict]:
+    def keep(h: dict) -> bool:
+        if "type" in filters and h["source"] != filters["type"]:
+            return False
+        if "kind" in filters and (h.get("artifact_type") or "") != filters["kind"]:
+            return False
+        if filters.get("is") == "favorite" and not h.get("favorite"):
+            return False
+        if "session" in filters:
+            wanted = filters["session"]
+            if not (h["session_id"].startswith(wanted) or wanted in (h["session_title"] or "").lower()):
+                return False
+        return True
+
+    return [h for h in hits if keep(h)]
 
 
 def _scoped(hits: list[dict], scope: str) -> list[dict]:
@@ -61,20 +94,24 @@ def _scoped(hits: list[dict], scope: str) -> list[dict]:
     return hits
 
 
-async def pick_find(initial: str = "", scope: str = "") -> tuple[str, dict] | None:
+async def pick_find(initial: str = "", scope: str = "", session_id: str = "") -> tuple[str, dict] | None:
     """Full-screen search over everything ``session.search`` covers —
-    sessions, conversation content, generated assets, mind wiki pages —
-    re-queried on every keystroke. ``scope`` narrows it to one kind
-    (``/session``) without changing how matching works.
-    Enter → ("enter", hit), Ctrl-O → ("open", hit), Esc → None."""
-    state = {"idx": 0, "hits": []}
+    sessions, conversation content, generated artifacts, mind wiki pages —
+    re-queried on every keystroke. With nothing typed it lists the current
+    session's artifacts, favorites, recent sessions and mind pages. ``scope``
+    narrows it to one kind (``/resume``) without changing how matching works.
+    Qualifiers ``type:`` ``kind:`` ``is:favorite`` ``session:`` filter
+    either view. Enter → ("enter", hit), Ctrl-O → ("open", hit), Esc → None."""
+    state: dict = {"idx": 0, "hits": [], "filters": {}}
     search = Buffer()
 
     def _refilter(_=None) -> None:
-        q = search.text.strip()
+        q, filters = parse_query(search.text.strip())
+        state["filters"] = filters
+        limit = 200 if filters else 60
         try:
-            hits = content_search(_live_query(q), limit=60) if q else browse(limit=60)
-            state["hits"] = _scoped(hits, scope)
+            hits = content_search(_live_query(q), limit=limit) if q else browse(limit=limit, session_id=session_id)
+            state["hits"] = _scoped(apply_filters(hits, filters), scope)
         except Exception:
             state["hits"] = []
         state["idx"] = 0
@@ -128,119 +165,20 @@ async def pick_find(initial: str = "", scope: str = "") -> tuple[str, dict] | No
     hint = {
         "session": "Enter resumes",
     }.get(scope, "Enter resumes a session / adds a file to your message, Ctrl-O opens it")
+    def _title():
+        active = " ".join(f"{k}:{v}" for k, v in state["filters"].items())
+        return [("class:prompt", f"{_SCOPE_TITLES[scope]}{' [' + active + ']' if active else ''} — {hint}, Esc")]
+
     search_win = Window(BufferControl(buffer=search), height=1)
     body = HSplit(
         [
-            Window(FormattedTextControl(lambda: [("class:prompt", f"{_SCOPE_TITLES[scope]} — {hint}, Esc")]), height=1),
+            Window(FormattedTextControl(_title), height=1),
             search_win,
             Window(FormattedTextControl(_render)),
         ]
     )
     app: Application = Application(
         layout=Layout(body, focused_element=search_win),
-        key_bindings=kb,
-        full_screen=True,
-        mouse_support=False,
-        style=REPL_STYLE,
-        output=create_output(stdout=sys.__stdout__),  # real terminal, bypass patch_stdout
-    )
-    return await app.run_async()
-
-
-async def pick_assets(artifacts, on_open) -> tuple[str, list[str]] | None:
-    """Full-screen multi-select asset picker → (action, paths) or None.
-
-    Space toggles, a=all, x=clear, o=open, c=copy, f=favorite, v=viewer, Esc=cancel.
-    ``o`` calls ``on_open(paths)`` and keeps the picker up, so assets can be
-    viewed and then copied or favorited without reopening it.
-    """
-    items = [a for a in artifacts if _ref(a)]
-    selected: set[str] = set()
-    state = {"idx": 0}
-
-    def _cur() -> str:
-        return _ref(items[state["idx"]]) if items else ""
-
-    def _render():
-        if not items:
-            return [("class:dim", "  (no assets in this session)")]
-        out = []
-        for n, a in enumerate(items):
-            ref = _ref(a)
-            box = "[x]" if ref in selected else "[ ]"
-            kind = (getattr(a, "artifact_type", "") or "file")[:6]
-            line = f"{box} {kind:<6} {ref[-70:]}"
-            prompt = getattr(a, "prompt", "") or ""
-            if prompt:
-                line += f"  — {prompt[:50]}"
-            cur = n == state["idx"]
-            out.append(("class:picker-highlight" if cur else "", f"{'›' if cur else ' '} {line}\n"))
-        return out
-
-    def _footer():
-        return [("class:dim", f"  {len(selected)} selected · Space toggle · a all · x clear · o open · c copy · f favorite · v viewer · Esc")]
-
-    def _dispatch(action: str):
-        paths = sorted(selected) if selected else ([_cur()] if _cur() else [])
-        return (action, [p for p in paths if p])
-
-    kb = KeyBindings()
-
-    @kb.add("up", eager=True)
-    def _(e):
-        if items:
-            state["idx"] = (state["idx"] - 1) % len(items)
-
-    @kb.add("down", eager=True)
-    def _(e):
-        if items:
-            state["idx"] = (state["idx"] + 1) % len(items)
-
-    @kb.add("space", eager=True)
-    def _(e):
-        ref = _cur()
-        if ref:
-            selected.discard(ref) if ref in selected else selected.add(ref)
-
-    @kb.add("a")
-    def _(e):
-        selected.update(r for r in (_ref(a) for a in items) if r)
-
-    @kb.add("x")
-    def _(e):
-        selected.clear()
-
-    @kb.add("o")
-    def _(e):
-        on_open(_dispatch("open")[1])
-
-    @kb.add("c")
-    def _(e):
-        e.app.exit(result=_dispatch("copy"))
-
-    @kb.add("f")
-    def _(e):
-        e.app.exit(result=_dispatch("favorite"))
-
-    @kb.add("v")
-    def _(e):
-        e.app.exit(result=("view", []))
-
-    @kb.add("escape")
-    @kb.add("c-c")
-    def _(e):
-        e.app.exit(result=None)
-
-    list_win = Window(FormattedTextControl(_render, focusable=True))
-    body = HSplit(
-        [
-            Window(FormattedTextControl(lambda: [("class:prompt", "Assets — ↑↓ to move, Space to select")]), height=1),
-            list_win,
-            Window(FormattedTextControl(_footer), height=1),
-        ]
-    )
-    app: Application = Application(
-        layout=Layout(body, focused_element=list_win),
         key_bindings=kb,
         full_screen=True,
         mouse_support=False,
@@ -495,30 +433,30 @@ async def pick_tree(session_id: str) -> tuple[int | None, str, bool] | None:
     return await app.run_async()
 
 
-def _job_rows(jobs, depth: int = 1) -> list[dict]:
-    """Flatten a JobRegistry into indented rows, nesting the jobs a launched
-    agent registered on its own registry (``entry["jobs"]``) under it."""
+def _task_rows(tasks, depth: int = 1) -> list[dict]:
+    """Flatten a TaskRegistry into indented rows, nesting the tasks a launched
+    agent registered on its own registry (``entry["tasks"]``) under it."""
     rows: list[dict] = []
-    for job_id, entry in list(jobs.entries.items()):
-        rows.append({"id": job_id, "entry": entry, "depth": depth})
-        if entry.get("jobs") is not None:
-            rows += _job_rows(entry["jobs"], depth + 1)
+    for task_id, entry in list(tasks.entries.items()):
+        rows.append({"id": task_id, "entry": entry, "depth": depth})
+        if entry.get("tasks") is not None:
+            rows += _task_rows(entry["tasks"], depth + 1)
     return rows
 
 
-async def pick_jobs(title: str, jobs) -> str | None:
+async def pick_tasks(title: str, tasks) -> str | None:
     """Full-screen navigator over the current conversation and every
-    background job it launched (term-N, tool-N, /bg tasks, agents and their
-    own jobs) → ``"tree"`` to open the session tree, or None on close.
+    background task it launched (term-N, tool-N, /bg tasks, agents and their
+    own tasks) → ``"tree"`` to open the session tree, or None on close.
 
-    Enter on a job toggles its status/output (the same snapshot ``/logs``
+    Enter on a task toggles its status/output (the same snapshot the task's reader
     shows) below the list; Enter on the conversation row opens ``/tree``.
-    Redraws every second so running jobs stay current.
+    Redraws every second so running tasks stay current.
     """
     state = {"idx": 0, "open": None}
 
     def _rows() -> list[dict]:
-        return [{"id": None, "entry": None, "depth": 0}] + _job_rows(jobs)
+        return [{"id": None, "entry": None, "depth": 0}] + _task_rows(tasks)
 
     def _render():
         import time
@@ -582,7 +520,7 @@ async def pick_jobs(title: str, jobs) -> str | None:
 
     body = HSplit(
         [
-            Window(FormattedTextControl(lambda: [("class:prompt", "Conversation & background jobs — ● running, ✓ done, ✗ failed")]), height=1),
+            Window(FormattedTextControl(lambda: [("class:prompt", "Conversation & background tasks — ● running, ✓ done, ✗ failed")]), height=1),
             Window(FormattedTextControl(_render), dont_extend_height=True),
             Window(height=1),
             Window(FormattedTextControl(_detail)),

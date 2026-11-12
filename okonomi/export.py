@@ -85,7 +85,7 @@ def session_sets(conn, session_id: str, favorites: set[str]) -> tuple[list[dict[
     user_rows = [r for r in events if r["type"] == EventType.USER_MESSAGE.value]
     actions: list[tuple[int, str, set[str]]] = []
     for row in events:
-        if row["type"] == EventType.ASSET_ACTION.value:
+        if row["type"] == EventType.ARTIFACT_ACTION.value:
             payload = json.loads(row["payload"])
             actions.append((row["event_id"], payload["action"], set(payload["refs"])))
 

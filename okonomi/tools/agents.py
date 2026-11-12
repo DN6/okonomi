@@ -91,14 +91,14 @@ class AgentTools:
 
         parent = self._parent_agent
 
-        # Register in the parent agent's shared bg-log registry so /jobs
-        # and /logs see launched agents alongside term-N shell jobs.
+        # Register in the parent agent's shared bg-log registry so /tasks
+        # sees launched agents alongside term-N shell tasks.
         # The reader snapshots the BackgroundTask record (status, error,
         # artifact count) — full transcript capture would require routing
         # the bg agent's emitter through here, which the launch site
         # currently doesn't have set up. Status summary is enough to
         # answer "is it still running, did it crash, how much did it
-        # produce" — the bulk of /logs queries.
+        # produce" — the bulk of /tasks lookups.
         def _reader(bg=bg_task) -> str:
             parts = [
                 f"task: {bg.description}",
@@ -121,7 +121,7 @@ class AgentTools:
 
         def _run():
             from okonomi.agent import OkonomiAgent
-            from okonomi.agent.jobs import run_until_jobs_report
+            from okonomi.agent.tasks import run_until_tasks_report
 
             final_status = "ok"
             reply = None
@@ -133,13 +133,13 @@ class AgentTools:
                     compress_at_tokens=parent.compress_at_tokens,
                     session_id=parent.session.session_id,
                 )
-                parent.jobs.entries[task_id]["jobs"] = agent.jobs
+                parent.tasks.entries[task_id]["tasks"] = agent.tasks
 
                 loop = asyncio.new_event_loop()
                 asyncio.set_event_loop(loop)
 
                 try:
-                    reply = loop.run_until_complete(run_until_jobs_report(agent, task))
+                    reply = loop.run_until_complete(run_until_tasks_report(agent, task))
                     bg_task.output = reply or ""
                     produced = list(agent.state.artifacts)
                     parent.state.artifacts.extend(produced)
@@ -174,7 +174,7 @@ class AgentTools:
                         parent._mark_bg_log_done(task_id=task_id, status=final_status)
                     except Exception:
                         pass
-                parent._job_finished(
+                parent._task_finished(
                     bg_id=task_id,
                     error=bg_task.error or None,
                     output=reply,

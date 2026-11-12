@@ -37,10 +37,8 @@ class Action(str, Enum):
     EXIT = "exit"
     VERBOSE = "verbose"
     FIND_PICKER = "find_picker"
-    ASSET_PICKER = "asset_picker"
     TREE_PICKER = "tree_picker"
     BG = "bg"
-    BTW = "btw"
     FORWARD = "forward"  # send payload to the agent as the next user message
 
 
@@ -125,8 +123,7 @@ def handle(command: str, agent: "OkonomiAgent", emitter: EventEmitter) -> "Comma
             None,
         )
         if real is not None:
-            # Sugar for `/skill <name>`: reach it by slug and inject the full
-            # body the same way, with any trailing text as extra instruction.
+            # Inject the full skill body, with any trailing text as extra instruction.
             result = agent.skills._load_full(real)
             if "content" not in result:
                 emitter.emit(SystemNote(result.get("error", "Skill not found"), level="error"))
@@ -197,38 +194,12 @@ def _skills(arg: str, agent: "OkonomiAgent", emitter: EventEmitter) -> None:
     emitter.emit(SystemNote("\n".join(lines)))
 
 
-@_command("/assets", "List this session's assets, or `/assets <query>` to search assets from every session")
-def _assets(arg: str, agent: "OkonomiAgent", emitter: EventEmitter) -> "CommandResult | None":
-    if arg:
-        if not session_store.search_artifacts(arg, limit=1):
-            emitter.emit(SystemNote(f"No assets match {arg!r}."))
-            return None
-        return CommandResult(Action.ASSET_PICKER, arg)
-    try:
-        agent._sync_session_assets(agent._get_dependencies())
-    except Exception:
-        pass
-    artifacts = [a for a in agent.state.artifacts if a.artifact_type in ("image", "video", "audio", "3d", "html")]
-    if not artifacts:
-        emitter.emit(SystemNote("No assets generated yet."))
-        return None
-    return CommandResult(Action.ASSET_PICKER)
-
-
 @_command("/bg", "Run a task in the background (`/bg <task>`)")
 def _bg(arg: str, agent: "OkonomiAgent", emitter: EventEmitter) -> "CommandResult | None":
     if not arg:
         emitter.emit(SystemNote("Usage: /bg <task>", level="warn"))
         return None
     return CommandResult(Action.BG, arg)
-
-
-@_command("/btw", "Interrupt the current turn with a side question (`/btw <question>`)")
-def _btw(arg: str, agent: "OkonomiAgent", emitter: EventEmitter) -> "CommandResult | None":
-    if not arg:
-        emitter.emit(SystemNote("Usage: /btw <question>", level="warn"))
-        return None
-    return CommandResult(Action.BTW, arg)
 
 
 @_command("/clear", "Clear conversation history")
@@ -239,12 +210,12 @@ def _clear(arg: str, agent: "OkonomiAgent", emitter: EventEmitter) -> None:
     emitter.emit(SystemNote(f"Conversation cleared ({rewound} events rewound)."))
 
 
-@_command("/session", "Search and resume a past session (`/session [query]`)")
-def _session(arg: str, agent: "OkonomiAgent", emitter: EventEmitter) -> "CommandResult":
+@_command("/resume", "Pick a past session to resume (`/resume [query]`)")
+def _resume(arg: str, agent: "OkonomiAgent", emitter: EventEmitter) -> "CommandResult":
     return CommandResult(Action.FIND_PICKER, arg, scope="session")
 
 
-@_command("/find", "Search sessions, conversations, assets, and the mind wiki (`/find [query]`)")
+@_command("/find", "Search sessions, conversations, artifacts, and the mind wiki (`/find [query]`)")
 def _find(arg: str, agent: "OkonomiAgent", emitter: EventEmitter) -> "CommandResult":
     return CommandResult(Action.FIND_PICKER, arg)
 
@@ -255,18 +226,6 @@ def _tree(arg: str, agent: "OkonomiAgent", emitter: EventEmitter) -> "CommandRes
         emitter.emit(SystemNote("No history yet."))
         return None
     return CommandResult(Action.TREE_PICKER)
-
-
-@_command("/last", "Resume the most recent session")
-def _last(arg: str, agent: "OkonomiAgent", emitter: EventEmitter) -> None:
-    sessions = session_store.list_sessions(limit=1)
-    if not sessions:
-        emitter.emit(SystemNote("No previous sessions.", level="warn"))
-        return
-    if agent.load_session(sessions[0].session_id):
-        emitter.emit(SystemNote(f"Resumed: {sessions[0].display_name}"))
-    else:
-        emitter.emit(SystemNote("Failed to load last session.", level="error"))
 
 
 @_command("/title", "Set/show session title")
@@ -354,31 +313,26 @@ def _save(arg: str, agent: "OkonomiAgent", emitter: EventEmitter) -> None:
     emitter.emit(SystemNote("Session saved."))
 
 
-@_command("/skill", "Load a skill by name (`/skill <name>`)")
-def _skill(arg: str, agent: "OkonomiAgent", emitter: EventEmitter) -> "CommandResult | None":
-    if not arg:
-        emitter.emit(SystemNote("Usage: /skill <name>", level="warn"))
-        return None
-    # Load the *full* skill body — the user's explicit /skill forces the whole
-    # skill into context (vs the model's own progressive TOC-only load_skill).
-    result = agent.skills._load_full(arg)
-    if "content" in result:
-        return CommandResult(Action.FORWARD, f"Follow this skill:\n\n{result['content']}")
-    emitter.emit(SystemNote(result.get("error", "Skill not found"), level="error"))
-    return None
+@_command("/viewer", "Open the media viewer for this session in the browser")
+def _viewer(arg: str, agent: "OkonomiAgent", emitter: EventEmitter) -> None:
+    result = agent.viewer.open_viewer()
+    if "url" in result:
+        emitter.emit(SystemNote(f"Viewer: {result['url']}"))
+        return
+    emitter.emit(SystemNote(result.get("error", "Could not open the viewer."), level="error"))
 
 
-@_command("/jobs", "List active and recent background jobs (term-N, agents)")
-def _jobs(arg: str, agent: "OkonomiAgent", emitter: EventEmitter) -> None:
+@_command("/tasks", "List active and recent background tasks (term-N, agents)")
+def _tasks(arg: str, agent: "OkonomiAgent", emitter: EventEmitter) -> None:
     import time as _time
 
-    jobs = agent.jobs.entries
-    if not jobs:
-        emitter.emit(SystemNote("No background jobs."))
+    tasks = agent.tasks.entries
+    if not tasks:
+        emitter.emit(SystemNote("No background tasks."))
         return
     now = _time.time()
-    running = [(jid, j) for jid, j in jobs.items() if j.get("status") == "running"]
-    finished = [(jid, j) for jid, j in jobs.items() if j.get("status") != "running"]
+    running = [(jid, j) for jid, j in tasks.items() if j.get("status") == "running"]
+    finished = [(jid, j) for jid, j in tasks.items() if j.get("status") != "running"]
     lines: list[str] = []
     if running:
         lines.append(f"Running ({len(running)}):")
@@ -391,36 +345,7 @@ def _jobs(arg: str, agent: "OkonomiAgent", emitter: EventEmitter) -> None:
             dur = (j.get("ended_at") or now) - j["started_at"]
             glyph = "✓" if j.get("status") == "ok" else "✗"
             lines.append(f"  {glyph} {jid:<14} {j['kind']:<8} {j.get('label','')} ({dur:.0f}s)")
-    lines += ["", "Use `/logs <id>` to view captured output."]
     emitter.emit(SystemNote("\n".join(lines)))
-
-
-@_command("/logs", "Show a background job's output or a tool call's full log (`/logs <job or tool-call id>`)")
-def _logs(arg: str, agent: "OkonomiAgent", emitter: EventEmitter) -> None:
-    jobs = agent.jobs.entries
-    if not arg:
-        ids = ", ".join(sorted(jobs.keys())) or "(none)"
-        emitter.emit(SystemNote(f"Usage: /logs <id>. Known jobs: {ids}"))
-        return
-    entry = jobs.get(arg)
-    if entry is None:
-        # Not a job: the per-call log the compact transcript line links to.
-        log = agent.session.logs_dir / f"{arg}.md"
-        if log.is_file():
-            emitter.emit(SystemNote(log.read_text(encoding="utf-8")))
-            return
-        emitter.emit(SystemNote(f"No job or tool call named {arg!r}. Run /jobs to list jobs.", level="warn"))
-        return
-    try:
-        output = entry["_reader"]()
-    except Exception as e:  # noqa: BLE001
-        output = f"(reader error: {e})"
-    # Keep the snapshot bounded so the chat doesn't get flooded.
-    MAX = 10_000
-    if len(output) > MAX:
-        output = f"…[truncated {len(output) - MAX} chars]…\n" + output[-MAX:]
-    header = f"{arg} [{entry.get('status','?')}] {entry.get('label','')}"
-    emitter.emit(SystemNote(f"{header}\n{output}"))
 
 
 @_command("/timeout", "Show or set per-turn timeout in seconds (`/timeout <seconds>`, 0 = off)")

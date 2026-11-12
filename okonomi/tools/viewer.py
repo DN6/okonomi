@@ -3,7 +3,7 @@
 ``open_viewer`` starts a localhost HTTP server (once per process) and opens
 it in the browser. The page polls ``/api/items`` and renders every file by
 kind: image, video, audio, 3D, HTML, text/code. The session dir is the source
-of truth, as it is for the asset sweep; tracked artifacts add prompt/model
+of truth, as it is for the artifact sweep; tracked artifacts add prompt/model
 captions and cover remote results that haven't downloaded yet.
 
 Files are served at ``/fs/<absolute path>`` so an HTML page in the session
@@ -22,7 +22,7 @@ from urllib.parse import quote, unquote, urlparse
 from typing_extensions import TypedDict
 
 from okonomi.session import favorite_hits, favorite_refs, norm_ref
-from okonomi.tui.assets import set_favorite
+from okonomi.tui.artifacts import set_favorite
 
 
 _TEXT_EXTS = {

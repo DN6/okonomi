@@ -14,8 +14,8 @@ approval answer is not, so it leaves no residue.
 
 Exposes the same surface ``TuiSession`` calls on the app: ``run_async``,
 ``exit``, ``call_from_thread``, ``show_approval``, ``show_find_picker``,
-``show_asset_picker``, ``show_tree_picker``, ``show_history_picker``,
-``show_jobs_picker``, ``prefill_input``, ``toggle_verbose``.
+``show_tree_picker``, ``show_history_picker``,
+``show_tasks_picker``, ``prefill_input``, ``toggle_verbose``.
 """
 
 from __future__ import annotations
@@ -106,7 +106,7 @@ class ReplApp:
         bg_tasks_fn: Callable[[], list],
         on_double_escape: Callable[[], None],
         on_history_search: Callable[[], None],
-        on_jobs: Callable[[], None],
+        on_tasks: Callable[[], None],
         is_busy: Callable[[], bool],
     ) -> None:
         self.emitter = emitter
@@ -116,7 +116,7 @@ class ReplApp:
         self.on_interrupt_cb = on_interrupt
         self.on_double_escape = on_double_escape
         self.on_history_search = on_history_search
-        self.on_jobs = on_jobs
+        self.on_tasks = on_tasks
         self.is_busy = is_busy
         self.spinner_label_fn = spinner_label_fn
         self.usage_fn = usage_fn
@@ -257,9 +257,9 @@ class ReplApp:
             bg = []
         if bg:
             parts = []
-            for job_id, label, elapsed in bg[:3]:
+            for task_id, label, elapsed in bg[:3]:
                 label = label if len(label) <= 18 else label[:17] + "…"
-                parts.append(f"{job_id} {label} {elapsed}".replace("  ", " "))
+                parts.append(f"{task_id} {label} {elapsed}".replace("  ", " "))
             text = "bg: " + " · ".join(parts)
             if len(bg) > 3:
                 text += f" +{len(bg) - 3}"
@@ -352,7 +352,7 @@ class ReplApp:
             ),
         )
         def _(event):
-            self.on_jobs()
+            self.on_tasks()
 
         return kb
 
@@ -376,7 +376,7 @@ class ReplApp:
                         break
                     if self._pending_modal is None:
                         break  # app ended with no modal pending → stop
-                    # A modal can queue the next one (jobs → tree).
+                    # A modal can queue the next one (tasks → tree).
                     while self._pending_modal is not None:
                         await self._run_modal()
             finally:
@@ -488,13 +488,9 @@ class ReplApp:
         if loop is not None:
             loop.call_soon_threadsafe(lambda: fn(*args))
 
-    def show_find_picker(self, initial: str, scope: str, on_select) -> None:
-        self._pending_modal = ("find", on_select, initial, scope)
+    def show_find_picker(self, initial: str, scope: str, on_select, session_id: str = "") -> None:
+        self._pending_modal = ("find", on_select, initial, scope, session_id)
         self._stop_app()  # break out so the outer loop runs the modal
-
-    def show_asset_picker(self, artifacts, on_action) -> None:
-        self._pending_modal = ("asset", on_action, list(artifacts))
-        self._stop_app()
 
     def show_tree_picker(self, session_id: str, on_select) -> None:
         self._pending_modal = ("tree", on_select, session_id)
@@ -504,8 +500,8 @@ class ReplApp:
         self._pending_modal = ("history", on_select, session_id)
         self._stop_app()
 
-    def show_jobs_picker(self, title: str, jobs, on_tree) -> None:
-        self._pending_modal = ("jobs", on_tree, title, jobs)
+    def show_tasks_picker(self, title: str, tasks, on_tree) -> None:
+        self._pending_modal = ("tasks", on_tree, title, tasks)
         self._stop_app()
 
     def prefill_input(self, text: str) -> None:
@@ -523,15 +519,9 @@ class ReplApp:
             if modal[0] == "find":
                 from .pickers import pick_find
 
-                result = await pick_find(modal[2], modal[3])
+                result = await pick_find(modal[2], modal[3], modal[4])
                 if result is not None:
                     modal[1](*result)  # on_select(action, hit)
-            elif modal[0] == "asset":
-                from .pickers import pick_assets
-
-                result = await pick_assets(modal[2], lambda paths: modal[1]("open", paths))
-                if result is not None:
-                    modal[1](result[0], result[1])  # on_action(action, paths)
             elif modal[0] == "tree":
                 from .pickers import pick_tree
 
@@ -544,10 +534,10 @@ class ReplApp:
                 result = await pick_history(modal[2])
                 if result is not None:
                     modal[1](*result)  # on_select(target_event_id, prefill, summarize)
-            elif modal[0] == "jobs":
-                from .pickers import pick_jobs
+            elif modal[0] == "tasks":
+                from .pickers import pick_tasks
 
-                if await pick_jobs(modal[2], modal[3]) == "tree":
+                if await pick_tasks(modal[2], modal[3]) == "tree":
                     modal[1]()
         except Exception as e:  # noqa: BLE001
             self.emitter.emit(SystemNote(f"Picker error: {e}", level="warn"))

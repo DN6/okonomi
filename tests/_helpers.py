@@ -1,5 +1,5 @@
 """Shared test doubles: the slice of ``OkonomiAgent`` that tool wrappers,
-``AgentTools.launch`` and the job registry touch, a stub sub-agent class,
+``AgentTools.launch`` and the task registry touch, a stub sub-agent class,
 and small pydantic-ai model builders."""
 
 from __future__ import annotations
@@ -15,13 +15,13 @@ from pydantic_ai.messages import ModelRequest, ModelResponse, TextPart, UserProm
 from pydantic_ai.models.function import AgentInfo, DeltaToolCall, FunctionModel
 
 from okonomi.agent.agent import OkonomiAgent
-from okonomi.agent.jobs import JobRegistry
+from okonomi.agent.tasks import TaskRegistry
 from okonomi.events import EventEmitter
 
 
 WAIT_SECONDS = 5.0
 
-MCP_DEMO_SERVER = textwrap.dedent(
+_MCP_DEMO_SERVER = textwrap.dedent(
     """
     from mcp.server.fastmcp import FastMCP
     m = FastMCP("demo")
@@ -43,13 +43,13 @@ MCP_DEMO_SERVER = textwrap.dedent(
 
 def write_mcp_server(path: Path) -> Path:
     """A stdio MCP server with a ``shout`` tool and a ``slow`` tool."""
-    path.write_text(MCP_DEMO_SERVER)
+    path.write_text(_MCP_DEMO_SERVER)
     return path
 
 
 def fake_agent(**overrides) -> SimpleNamespace:
     """The attributes of ``OkonomiAgent`` that ``_register_tool``,
-    ``_detach_tool_call``, ``_job_finished`` and ``AgentTools.launch`` read,
+    ``_detach_tool_call``, ``_task_finished`` and ``AgentTools.launch`` read,
     without a provider or model. Real methods are bound onto it so the
     code under test runs unchanged; ``overrides`` replace any of them."""
     emitter = EventEmitter()
@@ -60,17 +60,17 @@ def fake_agent(**overrides) -> SimpleNamespace:
         session=SimpleNamespace(session_id="fake-session"),
         state=SimpleNamespace(artifacts=[]),
         emitter=emitter,
-        jobs=JobRegistry(emitter),
+        tasks=TaskRegistry(emitter),
         _tool_pool=ThreadPoolExecutor(),
-        _sync_session_assets=lambda deps, tool_call_id="": 0,
+        _sync_session_artifacts=lambda deps, tool_call_id="": 0,
         _get_dependencies=lambda: None,
         _turn_cancelled=threading.Event(),
         _detach_now=threading.Event(),
-        _job_tool_call_ids={},
+        _task_tool_call_ids={},
         _session_approvals=set(),
         can_prompt=False,
     )
-    bound = ("_detach_tool_call", "_job_finished", "_register_bg_log", "_mark_bg_log_done", "_unapproved_patterns", "_ask_approval")
+    bound = ("_detach_tool_call", "_task_finished", "_register_bg_log", "_mark_bg_log_done", "_unapproved_patterns", "_ask_approval")
     for name in bound:
         setattr(fake, name, partial(getattr(OkonomiAgent, name), fake))
     fake.__dict__.update(overrides)
@@ -90,7 +90,7 @@ def child_agent(run_async, built: list[str] | None = None):
             self.state = SimpleNamespace(artifacts=[])
             self.last_turn_error = None
             self.emitter = EventEmitter()
-            self.jobs = JobRegistry(self.emitter)
+            self.tasks = TaskRegistry(self.emitter)
 
         async def run_async(self, message, reset=False):
             return await run_async(self, message, reset=reset)

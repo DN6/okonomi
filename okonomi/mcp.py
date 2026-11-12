@@ -29,7 +29,7 @@ from okonomi.config import OKONOMI_MCP_CONFIG
 
 VALID_NAME_RE = re.compile(r"^[a-z0-9][a-z0-9_-]*$")
 # Per-request timeout. FastMCP's 5-minute default would kill a call that was
-# moved to the background; match the cap on background bash jobs instead.
+# moved to the background; match the cap on background bash tasks instead.
 MCP_CALL_TIMEOUT_S = 3600
 
 
