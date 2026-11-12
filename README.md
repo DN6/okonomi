@@ -17,27 +17,7 @@ always run in an OS sandbox (Seatbelt on macOS, bubblewrap on Linux) that limits
 working directory, temp dirs and `$OKONOMI_HOME`; okonomi refuses to start without one. On Linux,
 install bubblewrap (`sudo apt install bubblewrap` or `sudo dnf install bubblewrap`).
 
-## Usage
-
-```shell
-# Interactive session
-okonomi
-
-# One-off task
-okonomi --task "Design a futuristic logo"
-
-# Resume the most recent session
-okonomi --resume
-
-# Resume a specific session by id, title, or content words
-okonomi --resume <id|title|words>
-
-# Write preference data (candidate sets, chosen/rejected pairs, tiers, metrics) for every session
-okonomi --export ./preferences
-```
-
-<details>
-<summary><b>Setup</b></summary>
+## Setup
 
 The model provider is auto-detected from whichever API key you set. Create a `.env`
 file in the project root, or export the variables in your shell — set **one** of:
@@ -87,7 +67,24 @@ When a `bash` command matches a dangerous pattern, the prompt offers: Enter (run
 Sessions, generated files, saved research and skills all live under `$OKONOMI_HOME`
 (`~/.okonomi` by default). Nothing is written outside it unless you ask for it.
 
-</details>
+## Usage
+
+```shell
+# Interactive session
+okonomi
+
+# One-off task
+okonomi --task "Design a futuristic logo"
+
+# Resume the most recent session
+okonomi --resume
+
+# Resume a specific session by id, title, or content words
+okonomi --resume <id|title|words>
+
+# Write preference data (candidate sets, chosen/rejected pairs, tiers, metrics) for every session
+okonomi --export ./preferences
+```
 
 <details>
 <summary><b>Slash commands</b></summary>
