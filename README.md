@@ -86,24 +86,4 @@ okonomi --resume <id|title|words>
 okonomi --export ./preferences
 ```
 
-<details>
-<summary><b>Slash commands</b></summary>
-
-| Command | Does |
-|---|---|
-| `/find [query]` | Search sessions, conversations, artifacts and the mind wiki. With nothing typed it lists this session's artifacts, favorites, recent sessions and mind pages. Enter adds a file to your message, Ctrl-O opens it. |
-| `/resume [query]` | Pick a past session to resume |
-| `/tree` | Browse the session tree, jump back, edit and resubmit to branch |
-| `/viewer` | Open the media viewer for this session in the browser |
-| `/mind [note]` | Add to the mind wiki, or file what this conversation established |
-| `/bg <task>` | Run a task in the background |
-| `/tasks` | List background tasks; Enter shows a task's output |
-| `/skills [install <spec>]` | List skills, or install one from GitHub. Run a skill with `/<name>` |
-| `/mcp [add\|remove …]` | List, add or remove MCP servers |
-| `/title`, `/save`, `/clear`, `/reload`, `/timeout`, `/verbose`, `/help`, `/exit` | Session housekeeping |
-
-`/find` takes GitHub-style qualifiers: `type:artifact|session|event|mind`, `kind:image|video|audio|3d|html|text`,
-`is:favorite`, `session:<id prefix or title word>`. Finished tool calls print as one line each; click the line to
-open the full call and output, which is written under the session's `scratch/logs/`.
-
-</details>
+Type `/help` inside a session for the slash commands.
