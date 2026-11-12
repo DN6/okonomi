@@ -8,7 +8,17 @@ Okonomi is a personal learning project for exploring the design choices that go
 into building an agent harness for creative media work. It is **not** stable: it
 changes often and breaks compatibility without notice. Don't depend on it.
 
-## What it explores
+```shell
+uv tool install git+https://github.com/dn6/okonomi.git
+```
+
+Requires Python 3.10+ and [uv](https://docs.astral.sh/uv/), on macOS or Linux. Shell commands
+always run in an OS sandbox (Seatbelt on macOS, bubblewrap on Linux) that limits writes to the
+working directory, temp dirs and `$OKONOMI_HOME`; okonomi refuses to start without one. On Linux,
+install bubblewrap (`sudo apt install bubblewrap` or `sudo dnf install bubblewrap`).
+
+<details>
+<summary><b>What it explores</b></summary>
 
 The things I mostly use it to poke at:
 
@@ -22,23 +32,15 @@ The things I mostly use it to poke at:
 - **Media creation workflows** — a sandboxed shell as the execution surface and
   the session directory as the persistent workspace for generating and editing
   media, with outputs auto-tracked as session artifacts.
+- **Training data** — every session records model calls, candidate sets and the
+  picks the user made, exported as preference pairs for a taste model.
 
 Expect these to be rebuilt, replaced, or removed as the experiments continue.
 
-## Installation
+</details>
 
-Requires Python 3.11+ and [uv](https://docs.astral.sh/uv/) (or pip), on macOS or Linux.
-Shell commands always run in an OS sandbox (Seatbelt on macOS, bubblewrap on Linux) that limits
-writes to the working directory, temp dirs and `$OKONOMI_HOME`; okonomi refuses to start without one.
-On Linux, install bubblewrap (`sudo apt install bubblewrap` or `sudo dnf install bubblewrap`).
-
-```shell
-git clone https://github.com/dn6/okonomi.git
-cd okonomi
-uv pip install -e .
-```
-
-## Setup
+<details>
+<summary><b>Setup</b></summary>
 
 The model provider is auto-detected from whichever API key you set. Create a `.env`
 file in the project root, or export the variables in your shell — set **one** of:
@@ -88,7 +90,10 @@ When a `bash` command matches a dangerous pattern, the prompt offers: Enter (run
 Sessions, generated files, saved research and skills all live under `$OKONOMI_HOME`
 (`~/.okonomi` by default). Nothing is written outside it unless you ask for it.
 
-## Running
+</details>
+
+<details>
+<summary><b>Running</b></summary>
 
 ```shell
 # Interactive session
@@ -107,7 +112,10 @@ okonomi --resume <id|title|words>
 okonomi --export ./preferences
 ```
 
-## Slash commands
+</details>
+
+<details>
+<summary><b>Slash commands</b></summary>
 
 | Command | Does |
 |---|---|
@@ -126,7 +134,10 @@ okonomi --export ./preferences
 `is:favorite`, `session:<id prefix or title word>`. Finished tool calls print as one line each; click the line to
 open the full call and output, which is written under the session's `scratch/logs/`.
 
-## Store
+</details>
+
+<details>
+<summary><b>Store</b></summary>
 
 Everything lives in one store: `$OKONOMI_HOME/okonomi.db` holds sessions, the event
 stream, artifacts, favorites and the search index over the mind wiki; `mind/` holds the
@@ -141,11 +152,17 @@ sessions/<id>/
     └── logs/       one markdown file per tool call, linked from the transcript
 ```
 
-## Tests
+</details>
+
+<details>
+<summary><b>Development</b></summary>
 
 ```shell
+git clone https://github.com/dn6/okonomi.git && cd okonomi && uv pip install -e .
 OKONOMI_HOME=$(mktemp -d) uv run pytest
 ```
 
-One module per subsystem: `test_agent`, `test_tui`, `test_store`, `test_terminal`, `test_training`,
+One test module per subsystem: `test_agent`, `test_tui`, `test_store`, `test_terminal`, `test_training`,
 `test_skills`, `test_viewer`, `test_mcp`.
+
+</details>
