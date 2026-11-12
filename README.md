@@ -110,34 +110,3 @@ Sessions, generated files, saved research and skills all live under `$OKONOMI_HO
 open the full call and output, which is written under the session's `scratch/logs/`.
 
 </details>
-
-<details>
-<summary><b>Store</b></summary>
-
-Everything lives in one store: `$OKONOMI_HOME/okonomi.db` holds sessions, the event
-stream, artifacts, favorites and the search index over the mind wiki; `mind/` holds the
-wiki pages, versioned in git by `remember`. Each `sessions/<id>/` has three parts:
-
-```
-sessions/<id>/
-├── traces.jsonl    one line per model call, written by the harness
-├── artifacts/      outputs — $OKONOMI_SESSION_DIR; swept into the DB and shown in the viewer
-│   └── references/ images you supplied, kept apart from generated candidates
-└── scratch/        scripts, intermediate state, installs — $OKONOMI_SCRATCH_DIR; never tracked
-    └── logs/       one markdown file per tool call, linked from the transcript
-```
-
-</details>
-
-<details>
-<summary><b>Development</b></summary>
-
-```shell
-git clone https://github.com/dn6/okonomi.git && cd okonomi && uv pip install -e .
-OKONOMI_HOME=$(mktemp -d) uv run pytest
-```
-
-One test module per subsystem: `test_agent`, `test_tui`, `test_store`, `test_terminal`, `test_training`,
-`test_skills`, `test_viewer`, `test_mcp`.
-
-</details>
