@@ -1,4 +1,4 @@
-"""MCP server registry: ~/.okonomi/mcp.json round-trips through /mcp add /
+"""MCP server registry: ~/.okonomi/settings.json round-trips through /mcp add /
 remove, and configured servers surface as prefixed tools on the agent."""
 
 import json
@@ -14,7 +14,7 @@ from okonomi import mcp
 def test_servers_round_trip_through_the_config_and_surface_as_prefixed_tools(store, tmp_path, monkeypatch):
     assert mcp.add_server("fs", "npx", ["-y", "server-fs", "."], {"TOKEN": "x"})["success"]
     assert mcp.add_server("docs", "https://example.com/mcp", [], {"Authorization": "Bearer y"})["success"]
-    data = json.loads((tmp_path / "mcp.json").read_text())
+    data = json.loads((tmp_path / "settings.json").read_text())
     assert data == {
         "mcpServers": {
             "fs": {"command": "npx", "args": ["-y", "server-fs", "."], "env": {"TOKEN": "x"}},

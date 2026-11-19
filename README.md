@@ -29,14 +29,33 @@ OPENAI_API_KEY=...       # provider: openai     — default openai/gpt-5.6-terra
 HF_TOKEN=...             # provider: huggingface — default moonshotai/Kimi-K3
 ```
 
-If more than one key is set, pick the provider explicitly (valid strings:
-`anthropic`, `openai`, `huggingface`, `openrouter`):
+Options live in `$OKONOMI_HOME/settings.json`; every key is optional:
 
-```bash
-OKONOMI_PROVIDER=openrouter   # which provider to use when several keys are present
-OKONOMI_MODEL=...             # override the default model id for the chosen provider
-OKONOMI_SUBAGENT_MODELS=a,b   # model ids the agent may pick for sub-agents (default: its own model only)
+```json
+{
+  "provider": "openrouter",
+  "model": "anthropic/claude-sonnet-5",
+  "subagentModels": ["a", "b"],
+  "approvals": {
+    "mode": "manual",
+    "allow": ["git reset --hard (destroys uncommitted changes)"],
+    "deny": ["\\bgit\\s+push\\b"]
+  },
+  "mcpServers": {
+    "fs": {"command": "npx", "args": ["-y", "@modelcontextprotocol/server-filesystem", "."]}
+  }
+}
 ```
+
+- `provider`: which provider to use when several keys are present (`anthropic`, `openai`, `huggingface`, `openrouter`).
+- `model`: overrides the default model id for the chosen provider.
+- `subagentModels`: model ids the agent may pick for sub-agents (default: its own model only).
+- `approvals.mode`: `manual` (the default) prompts before dangerous `bash` commands, `off` runs them without asking. Hardline patterns and deny rules are blocked either way.
+- `approvals.allow`: dangerous patterns approved with `a` at the prompt. `approvals.deny`: regexes that block a command unconditionally.
+- `mcpServers`: MCP servers in the shape shared by Claude Desktop, Cursor and Codex; `/mcp add` and `/mcp remove` edit it.
+
+An environment variable overrides the matching key: `OKONOMI_PROVIDER`, `OKONOMI_MODEL`,
+`OKONOMI_SUBAGENT_MODELS` (comma-separated) and `OKONOMI_APPROVALS`.
 
 > Media generation (image/video) routes through OpenRouter-specific model ids, so
 > those tools only work on the `openrouter` provider.
@@ -44,25 +63,16 @@ OKONOMI_SUBAGENT_MODELS=a,b   # model ids the agent may pick for sub-agents (def
 Everything else is optional:
 
 ```bash
-# Storage root for sessions, research, skills and favorites (default: ~/.okonomi)
+# Storage root for settings, sessions, research, skills and favorites (default: ~/.okonomi)
 OKONOMI_HOME=/path/to/okonomi/home
-
-# Prompt before dangerous `bash` commands (manual, the default) or run them without asking (off).
-# Hardline patterns and deny rules are blocked either way.
-OKONOMI_APPROVALS=manual
 
 # Dotenv file of credentials injected into `bash` commands (re-read per command, values redacted from output)
 OKONOMI_ENV_FILE=~/.okonomi/tool.env
 ```
 
 When a `bash` command matches a dangerous pattern, the prompt offers: Enter (run once),
-`s` (approve the pattern for this session), `a` (always, saved to `$OKONOMI_HOME/approvals.json`),
+`s` (approve the pattern for this session), `a` (always, saved to `approvals.allow` in `settings.json`),
 `n` (deny), or typed feedback for the model. Without an interactive UI the command is refused.
-`approvals.json` also takes deny rules, regexes that block a command unconditionally:
-
-```json
-{"allow": ["git reset --hard (destroys uncommitted changes)"], "deny": ["\\bgit\\s+push\\b"]}
-```
 
 Sessions, generated files, saved research and skills all live under `$OKONOMI_HOME`
 (`~/.okonomi` by default). Nothing is written outside it unless you ask for it.

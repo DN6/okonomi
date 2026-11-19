@@ -15,7 +15,7 @@ from dataclasses import dataclass
 from enum import Enum
 from typing import TYPE_CHECKING, Callable
 
-from .. import db, mcp
+from .. import config, db, mcp
 from .. import session as session_store
 from ..events import EventEmitter, SystemNote
 from ..tools.skills import (
@@ -284,9 +284,9 @@ def _mcp(arg: str, agent: "OkonomiAgent", emitter: EventEmitter) -> None:
     else:
         servers = mcp.load_servers()
         if not servers:
-            emitter.emit(SystemNote(f"No MCP servers configured ({mcp.OKONOMI_MCP_CONFIG}).\n{_MCP_USAGE}"))
+            emitter.emit(SystemNote(f"No MCP servers configured ({config.OKONOMI_SETTINGS_FILE}).\n{_MCP_USAGE}"))
             return None
-        lines = [f"MCP servers ({mcp.OKONOMI_MCP_CONFIG}):"]
+        lines = [f"MCP servers ({config.OKONOMI_SETTINGS_FILE}):"]
         for name, server in servers.items():
             lines.append(f"  {name:<16} {mcp.describe(server)}")
         emitter.emit(SystemNote("\n".join(lines)))

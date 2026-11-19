@@ -1,7 +1,8 @@
 """MCP server registry.
 
-Servers live in ``~/.okonomi/mcp.json`` using the ``mcpServers`` shape shared
-by Claude Desktop, Cursor and Codex, so a config can be pasted between tools:
+Servers live under ``mcpServers`` in ``~/.okonomi/settings.json``, in the shape
+shared by Claude Desktop, Cursor and Codex, so entries can be pasted between
+tools:
 
     {"mcpServers": {
         "fs": {"command": "npx", "args": ["-y", "@modelcontextprotocol/server-filesystem", "."]},
@@ -15,7 +16,6 @@ model as ``<name>_<tool>``.
 
 from __future__ import annotations
 
-import json
 import os
 import re
 from typing import Any
@@ -24,7 +24,7 @@ from fastmcp.client.transports import StdioTransport
 from pydantic_ai.mcp import MCPToolset, ProcessToolCallback
 from pydantic_ai.toolsets import AbstractToolset
 
-from okonomi.config import OKONOMI_MCP_CONFIG
+from okonomi import config
 
 
 VALID_NAME_RE = re.compile(r"^[a-z0-9][a-z0-9_-]*$")
@@ -34,18 +34,13 @@ MCP_CALL_TIMEOUT_S = 3600
 
 
 def load_servers() -> dict[str, dict]:
-    if not OKONOMI_MCP_CONFIG.exists():
-        return {}
-    data = json.loads(OKONOMI_MCP_CONFIG.read_text())
-    servers = data.get("mcpServers") if isinstance(data, dict) else None
-    if not isinstance(servers, dict):
-        raise ValueError(f"{OKONOMI_MCP_CONFIG} must be a JSON object with an 'mcpServers' object.")
-    return servers
+    return config.load_settings().get("mcpServers", {})
 
 
 def _save_servers(servers: dict[str, dict]) -> None:
-    OKONOMI_MCP_CONFIG.parent.mkdir(parents=True, exist_ok=True)
-    OKONOMI_MCP_CONFIG.write_text(json.dumps({"mcpServers": servers}, indent=2) + "\n")
+    data = config.load_settings()
+    data["mcpServers"] = servers
+    config.save_settings(data)
 
 
 def add_server(name: str, target: str, args: list[str], env: dict[str, str]) -> dict:
@@ -125,6 +120,6 @@ def build_toolsets(process_tool_call: ProcessToolCallback | None = None) -> list
                 read_timeout=MCP_CALL_TIMEOUT_S,
             )
         else:
-            raise ValueError(f"MCP server '{name}' in {OKONOMI_MCP_CONFIG} needs a 'command' or a 'url'.")
+            raise ValueError(f"MCP server '{name}' in {config.OKONOMI_SETTINGS_FILE} needs a 'command' or a 'url'.")
         toolsets.append(toolset.prefixed(name))
     return toolsets

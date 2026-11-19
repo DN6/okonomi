@@ -8,12 +8,11 @@ hermes-agent's tools/approval.py.
 
 from __future__ import annotations
 
-import json
 import os
 import re
 import unicodedata
 
-from okonomi.config import OKONOMI_APPROVALS_FILE, approval_mode
+from okonomi import config
 
 
 _ANSI_RE = re.compile(r"\x1b\[[0-?]*[ -/]*[@-~]|\x1b\][^\x07]*(?:\x07|\x1b\\)")
@@ -168,16 +167,14 @@ _SUDO_STDIN_RE = re.compile(
 
 def load_approval_rules() -> dict:
     """``{"allow": set[str], "deny": list[re.Pattern]}`` from
-    ``$OKONOMI_HOME/approvals.json``. ``allow`` holds dangerous-pattern
+    ``approvals`` in the settings file. ``allow`` holds dangerous-pattern
     descriptions the user approved "always"; ``deny`` holds regexes that
     block a command unconditionally. Re-read on every check so edits apply
     without a restart."""
-    if not OKONOMI_APPROVALS_FILE.exists():
-        return {"allow": set(), "deny": []}
-    data = json.loads(OKONOMI_APPROVALS_FILE.read_text())
-    if not isinstance(data, dict) or not all(isinstance(data.get(k, []), list) for k in ("allow", "deny")):
+    data = config.load_settings().get("approvals", {})
+    if not all(isinstance(data.get(k, []), list) for k in ("allow", "deny")):
         raise ValueError(
-            f"{OKONOMI_APPROVALS_FILE} must be an object like "
+            f"'approvals' in {config.OKONOMI_SETTINGS_FILE} must be an object like "
             '{"allow": ["recursive delete"], "deny": ["\\\\bgit\\\\s+push\\\\b"]}, got: ' + repr(data)
         )
     deny = []
@@ -185,17 +182,17 @@ def load_approval_rules() -> dict:
         try:
             deny.append(re.compile(pattern, _RE_FLAGS))
         except (re.error, TypeError) as e:
-            raise ValueError(f"Invalid deny regex {pattern!r} in {OKONOMI_APPROVALS_FILE}: {e}") from e
+            raise ValueError(f"Invalid deny regex {pattern!r} in {config.OKONOMI_SETTINGS_FILE}: {e}") from e
     return {"allow": set(data.get("allow", [])), "deny": deny}
 
 
 def approve_always(keys: list[str]) -> None:
     """Add dangerous-pattern descriptions to the persistent allowlist."""
-    data = json.loads(OKONOMI_APPROVALS_FILE.read_text()) if OKONOMI_APPROVALS_FILE.exists() else {}
-    data["allow"] = sorted(set(data.get("allow", [])) | set(keys))
-    data.setdefault("deny", [])
-    OKONOMI_APPROVALS_FILE.parent.mkdir(parents=True, exist_ok=True)
-    OKONOMI_APPROVALS_FILE.write_text(json.dumps(data, indent=2) + "\n")
+    data = config.load_settings()
+    approvals = data.setdefault("approvals", {})
+    approvals["allow"] = sorted(set(approvals.get("allow", [])) | set(keys))
+    approvals.setdefault("deny", [])
+    config.save_settings(data)
 
 
 def dangerous_matches(command: str) -> list[str]:
@@ -238,11 +235,11 @@ def check_command(command: str, approved: bool = False) -> tuple[bool, str | Non
         if pattern_re.search(normalized):
             return (
                 False,
-                f"BLOCKED (deny rule {pattern_re.pattern!r} in {OKONOMI_APPROVALS_FILE}). "
+                f"BLOCKED (deny rule {pattern_re.pattern!r} in {config.OKONOMI_SETTINGS_FILE}). "
                 "The user has forbidden this command. Do not retry or rephrase it.",
             )
 
-    if approved or approval_mode() == "off":
+    if approved or config.approval_mode() == "off":
         return (True, None)
 
     pending = [key for key in dangerous_matches(command) if key not in rules["allow"]]

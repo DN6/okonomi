@@ -30,9 +30,10 @@ from okonomi import cli, mcp
 from okonomi.agent import agent as agent_mod
 from okonomi.agent.agent import OkonomiAgent
 from okonomi.agent.tasks import TaskRegistry
-from okonomi.events import AssistantStream, EventEmitter, SystemNote, TaskFinished, ToolCallDisplay
+from okonomi.events import AskUserRequest, AssistantStream, EventEmitter, SystemNote, TaskFinished, ToolCallDisplay
 from okonomi.tools import terminal as terminal_mod
 from okonomi.tools.agents import AgentTools
+from okonomi.tools.ask import AskTools
 from okonomi.tui.session import TuiSession
 from okonomi.tui.transcript import replay_history
 
@@ -443,3 +444,38 @@ def test_sub_agent_model_defaults_to_parent_and_must_be_listed(monkeypatch):
     assert reply.startswith("Error: model 'made-up-model' is not available."), reply
     assert "small-model" in reply, f"error must list the valid models: {reply!r}"
     assert len(tools._tasks) == 2 and len(built) == 2, "a refused launch must neither register nor build a sub-agent"
+
+
+def test_ask_user_waits_for_the_answer_and_fails_closed_headless(monkeypatch):
+    monkeypatch.setattr(agent_mod, "TOOL_DETACH_AFTER", 0.2)
+
+    def _model(messages, info: AgentInfo):
+        if len(messages) == 1:
+            return ModelResponse(parts=[ToolCallPart("ask_user", {"question": "Which palette?", "options": ["warm", "cool"]}, tool_call_id="q")])
+        return ModelResponse(parts=[TextPart("done")])
+
+    def _ask(fake, answer):
+        asked: list[AskUserRequest] = []
+
+        def _on_event(ev):
+            if isinstance(ev, AskUserRequest):
+                asked.append(ev)
+                threading.Timer(0.5, ev.respond, [answer]).start()
+
+        fake.emitter.subscribe(_on_event)
+        agent = Agent(FunctionModel(_model))
+        OkonomiAgent._register_tool(fake, agent, AskTools(fake._ask_user))
+        return _tool_return(agent.run_sync("go").all_messages()).content, asked
+
+    result, asked = _ask(fake_agent(can_prompt=True), "2")
+    assert [(a.question, a.options) for a in asked] == [("Which palette?", ["warm", "cool"])], asked
+    assert result == {"answer": "cool", "option": 2}, "a number picks that option; the wait must outlive the detach deadline"
+
+    result, _ = _ask(fake_agent(can_prompt=True), "something muted")
+    assert result == {"answer": "something muted", "option": None}, result
+
+    result, _ = _ask(fake_agent(can_prompt=True), False)
+    assert "dismissed" in result["error"], result
+
+    result, asked = _ask(fake_agent(can_prompt=False), "2")
+    assert not asked and "No one can answer" in result["error"], f"headless run must not block: {result!r}"

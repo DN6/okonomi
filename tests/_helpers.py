@@ -70,7 +70,7 @@ def fake_agent(**overrides) -> SimpleNamespace:
         _session_approvals=set(),
         can_prompt=False,
     )
-    bound = ("_detach_tool_call", "_task_finished", "_register_bg_log", "_mark_bg_log_done", "_unapproved_patterns", "_ask_approval")
+    bound = ("_detach_tool_call", "_task_finished", "_register_bg_log", "_mark_bg_log_done", "_unapproved_patterns", "_ask_approval", "_ask_user")
     for name in bound:
         setattr(fake, name, partial(getattr(OkonomiAgent, name), fake))
     fake.__dict__.update(overrides)

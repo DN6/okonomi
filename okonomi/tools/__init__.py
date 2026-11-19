@@ -6,6 +6,7 @@ paths.
 """
 
 from .agents import AgentTools
+from .ask import AskTools
 from .files import FileTools
 from .sessions import SessionsTools
 from .skills import SkillTools
@@ -16,6 +17,7 @@ from .web import WebTools
 
 __all__ = [
     "AgentTools",
+    "AskTools",
     "FileTools",
     "SessionsTools",
     "SkillTools",

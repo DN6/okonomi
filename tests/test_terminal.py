@@ -17,6 +17,7 @@ from pydantic_ai import Agent
 from pydantic_ai.messages import ModelRequest, ModelResponse, TextPart, ToolCallPart, ToolReturnPart
 from pydantic_ai.models.function import AgentInfo, FunctionModel
 
+from okonomi import config
 from okonomi.agent.agent import OkonomiAgent
 from okonomi.events import ApprovalRequest
 from okonomi.tools import _command_guard as guard
@@ -85,37 +86,71 @@ DANGEROUS = "git reset --hard"
 
 
 @pytest.fixture(autouse=True)
-def approvals_file(tmp_path, monkeypatch):
-    path = tmp_path / "approvals.json"
-    monkeypatch.setattr(guard, "OKONOMI_APPROVALS_FILE", path)
+def settings_file(tmp_path, monkeypatch):
+    path = tmp_path / "settings.json"
+    monkeypatch.setattr(config, "OKONOMI_SETTINGS_FILE", path)
     monkeypatch.delenv("OKONOMI_APPROVALS", raising=False)
     return path
 
 
-def test_guard_rules(approvals_file, monkeypatch):
+def test_guard_rules(settings_file, monkeypatch):
     allowed, reason = guard.check_command(DANGEROUS)
     assert not allowed and "needs approval" in reason, f"unapproved dangerous command ran: {reason!r}"
     assert guard.check_command(DANGEROUS, approved=True) == (True, None)
 
     guard.approve_always(guard.dangerous_matches(DANGEROUS))
-    assert guard.check_command(DANGEROUS) == (True, None), f"allowlist not honoured: {approvals_file.read_text()}"
+    assert guard.check_command(DANGEROUS) == (True, None), f"allowlist not honoured: {settings_file.read_text()}"
 
     monkeypatch.setenv("OKONOMI_APPROVALS", "off")
-    approvals_file.write_text(json.dumps({"deny": [r"\bgit\s+push\b"]}))
+    settings_file.write_text(json.dumps({"approvals": {"deny": [r"\bgit\s+push\b"]}}))
     assert guard.check_command(DANGEROUS) == (True, None), "OKONOMI_APPROVALS=off must disable approval prompts"
     allowed, reason = guard.check_command("git push origin main", approved=True)
     assert not allowed and "deny rule" in reason, f"deny rule bypassed: {reason!r}"
 
 
-def test_bad_config_raises(approvals_file, monkeypatch):
-    approvals_file.write_text(json.dumps({"deny": ["("]}))
+def test_bad_config_raises(settings_file, monkeypatch):
+    settings_file.write_text(json.dumps({"approvals": {"deny": ["("]}}))
     with pytest.raises(ValueError, match=r"Invalid deny regex '\('"):
         guard.load_approval_rules()
 
-    approvals_file.write_text("{}")
+    settings_file.write_text(json.dumps({"mcpServers": []}))
+    with pytest.raises(ValueError, match="'mcpServers' in .* must be a JSON dict"):
+        config.load_settings()
+
+    settings_file.write_text("{}")
     monkeypatch.setenv("OKONOMI_APPROVALS", "smart")
     with pytest.raises(EnvironmentError, match="OKONOMI_APPROVALS"):
         guard.check_command(DANGEROUS)
+
+
+def test_settings_file_supplies_options_and_env_overrides_them(settings_file, monkeypatch):
+    for var in ("OKONOMI_PROVIDER", "OKONOMI_MODEL", "OKONOMI_SUBAGENT_MODELS", "OPENROUTER_API_KEY"):
+        monkeypatch.delenv(var, raising=False)
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "test")
+    monkeypatch.setenv("OPENAI_API_KEY", "test")
+    settings_file.write_text(
+        json.dumps(
+            {
+                "provider": "openai",
+                "model": "file-model",
+                "subagentModels": ["a", "b"],
+                "approvals": {"mode": "off"},
+            }
+        )
+    )
+    assert config.select_provider() == "openai", "provider must come from settings.json"
+    assert config.resolve_model_id("openai") == "file-model", "model must come from settings.json"
+    assert config.subagent_models() == ["a", "b"], "subagentModels must come from settings.json"
+    assert config.approval_mode() == "off", "approvals.mode must come from settings.json"
+
+    monkeypatch.setenv("OKONOMI_PROVIDER", "anthropic")
+    monkeypatch.setenv("OKONOMI_MODEL", "env-model")
+    monkeypatch.setenv("OKONOMI_SUBAGENT_MODELS", "c")
+    monkeypatch.setenv("OKONOMI_APPROVALS", "manual")
+    assert config.select_provider() == "anthropic", "OKONOMI_PROVIDER must override settings.json"
+    assert config.resolve_model_id("anthropic") == "env-model", "OKONOMI_MODEL must override settings.json"
+    assert config.subagent_models() == ["c"], "OKONOMI_SUBAGENT_MODELS must override settings.json"
+    assert config.approval_mode() == "manual", "OKONOMI_APPROVALS must override settings.json"
 
 
 class _Terminal:
@@ -156,7 +191,7 @@ def _run_bash(fake, terminal: _Terminal, answer=None) -> tuple[dict | str, list[
     raise AssertionError("no tool return")
 
 
-def test_approval_answers_once_session_and_always(approvals_file):
+def test_approval_answers_once_session_and_always(settings_file):
     fake, terminal = fake_agent(can_prompt=True), _Terminal()
     result, requests = _run_bash(fake, terminal, answer=True)
     assert result["output"] == "ran" and len(requests) == 1, f"once-approval did not run: {result!r}"
@@ -171,7 +206,7 @@ def test_approval_answers_once_session_and_always(approvals_file):
 
     fake, terminal = fake_agent(can_prompt=True), _Terminal()
     _run_bash(fake, terminal, answer="__always__")
-    allow = json.loads(approvals_file.read_text())["allow"]
+    allow = json.loads(settings_file.read_text())["approvals"]["allow"]
     assert allow == guard.dangerous_matches(DANGEROUS), f"always-approval not persisted: {allow!r}"
 
 

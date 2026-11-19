@@ -273,7 +273,7 @@ class ApprovalRequest(Event):
 
     - ``True`` — run it once
     - ``"__session__"`` — run it and approve ``reason``'s patterns for this session
-    - ``"__always__"`` — run it and add the patterns to ``approvals.json``
+    - ``"__always__"`` — run it and add the patterns to ``settings.json``
     - ``False`` — deny
     - any other ``str`` — feedback sent back to the model instead of running
 
@@ -286,6 +286,20 @@ class ApprovalRequest(Event):
 
     code: str = ""
     reason: str = ""
+    respond: Callable[[bool | str], None] | None = field(default=None, repr=False, compare=False)
+
+
+@dataclass
+class AskUserRequest(Event):
+    """The agent asked the user something and has suspended until someone
+    answers via ``respond``: a ``str`` is the answer (free text, or the
+    chosen option's text); ``False`` means the user dismissed the question.
+    ``respond`` is the same one-shot handle as ``ApprovalRequest.respond``."""
+
+    type: ClassVar[str] = "ask_user_request"
+
+    question: str = ""
+    options: list[str] = field(default_factory=list)
     respond: Callable[[bool | str], None] | None = field(default=None, repr=False, compare=False)
 
 

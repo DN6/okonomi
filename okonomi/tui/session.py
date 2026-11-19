@@ -16,7 +16,7 @@ from concurrent.futures import TimeoutError as FutureTimeout
 
 from ..agent import OkonomiAgent
 from ..agent.tasks import task_notice
-from ..events import ApprovalRequest, Event, EventEmitter, SystemNote, TaskFinished, ToolCallDisplay
+from ..events import ApprovalRequest, AskUserRequest, Event, EventEmitter, SystemNote, TaskFinished, ToolCallDisplay
 from ..session import SessionStatus, prune_empty_sessions
 from ..utils import format_elapsed
 from .app import ReplApp
@@ -50,7 +50,7 @@ class TuiSession:
         # UI is single-slot (one input box), so concurrent requests —
         # e.g. a background agent and the foreground turn — queue and
         # show one at a time.
-        self._approval_queue: deque[ApprovalRequest] = deque()
+        self._approval_queue: deque[ApprovalRequest | AskUserRequest] = deque()
         self._approval_active = False
         self._approval_lock = threading.Lock()
         self.emitter.subscribe(self._on_agent_event)
@@ -484,12 +484,12 @@ class TuiSession:
     def _on_agent_event(self, ev: Event) -> None:
         """React to agent events that need more than rendering. Runs
         synchronously on the emitting thread — must never block."""
-        if isinstance(ev, ApprovalRequest):
+        if isinstance(ev, (ApprovalRequest, AskUserRequest)):
             self._enqueue_approval(ev)
         elif isinstance(ev, TaskFinished):
             self._on_task_finished(ev)
 
-    def _enqueue_approval(self, request: ApprovalRequest) -> None:
+    def _enqueue_approval(self, request: ApprovalRequest | AskUserRequest) -> None:
         """Queue an approval request for the single-slot inline UI; show
         it immediately if nothing else is on screen. The event carries its
         own resolve handle, so requests from background agents (forwarded
@@ -501,7 +501,7 @@ class TuiSession:
             self._approval_active = True
         self._show_approval(request)
 
-    def _show_approval(self, request: ApprovalRequest) -> None:
+    def _show_approval(self, request: ApprovalRequest | AskUserRequest) -> None:
         def _resolve(decision: bool | str) -> None:
             try:
                 if request.respond is not None:
@@ -514,7 +514,10 @@ class TuiSession:
                 if nxt is not None:
                     self._show_approval(nxt)
 
-        self._app.call_from_thread(self._app.show_approval, request.code, request.reason, _resolve)
+        if isinstance(request, AskUserRequest):
+            self._app.call_from_thread(self._app.show_question, request.question, request.options, _resolve)
+        else:
+            self._app.call_from_thread(self._app.show_approval, request.code, request.reason, _resolve)
 
     def _on_task_finished(self, ev: TaskFinished) -> None:
         """Hand the finished task's result to the agent (see ``_deliver_notice``)."""

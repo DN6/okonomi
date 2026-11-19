@@ -52,6 +52,7 @@ from ..config import resolve_model_id, select_provider
 from ..context import _CHARS_PER_TOKEN, ContextManager, count_tokens, strip_unanswered_tool_calls
 from ..events import (
     ApprovalRequest,
+    AskUserRequest,
     AssistantStream,
     Event,
     EventEmitter,
@@ -66,6 +67,7 @@ from ..mcp import build_toolsets as build_mcp_toolsets
 from ..session import Artifact, Session, SessionStatus, artifact_subdir_for_file
 from ..tools import (
     AgentTools,
+    AskTools,
     FileTools,
     SessionsTools,
     SkillTools,
@@ -596,6 +598,7 @@ class OkonomiAgent:
         self.agents = AgentTools()
         self.files = FileTools()
         self.viewer = ViewerTools(lambda: self.session)
+        self.ask = AskTools(self._ask_user)
         self.skills = SkillTools(
             available_tools={"terminal", "web", "sessions", "skills", "files"},
         )
@@ -618,6 +621,7 @@ class OkonomiAgent:
         self._register_tool(agent, self.sessions)
         self._register_tool(agent, self.files)
         self._register_tool(agent, self.viewer)
+        self._register_tool(agent, self.ask)
         self.agents._bind(self)
         self._register_tool(agent, self.agents, rename={"launch": "launch_agent"})
 
@@ -669,6 +673,10 @@ class OkonomiAgent:
                     cancelled = agent_self._turn_cancelled
                     detach_now = agent_self._detach_now
                     kill = threading.Event()
+                    if tn == "ask_user":
+                        # Waits on the user, so it never goes through the
+                        # pool: the detach deadline below must not apply.
+                        return m(*args, **kwargs)
                     if tn == "bash":
                         # Asked here rather than inside bash: time spent
                         # waiting on the user must not count toward the
@@ -766,6 +774,33 @@ class OkonomiAgent:
         if decision is False:
             return {"error": f"The user denied this command ({', '.join(patterns)}). Do not retry or rephrase it; ask the user how to proceed."}
         return {"error": f"The user did not run this command and replied: {decision}"}
+
+    def _ask_user(self, question: str, options: list[str]) -> dict:
+        """Block until the user answers an AskUserRequest; the ``ask_user``
+        tool's result."""
+        if not self.can_prompt:
+            return {"error": "No one can answer in this run. Proceed on your best assumption and say what you assumed."}
+        answered = threading.Event()
+        box: dict[str, Any] = {}
+
+        def _respond(decision: bool | str) -> None:
+            if not answered.is_set():
+                box["decision"] = decision
+                answered.set()
+
+        self.emitter.emit(AskUserRequest(question=question, options=list(options), respond=_respond))
+        while not answered.wait(0.1):
+            if self._turn_cancelled.is_set():
+                return {"error": "interrupted by the user"}
+
+        decision = box["decision"]
+        if not isinstance(decision, str) or not decision.strip():
+            return {"error": "The user dismissed the question. Proceed on your best assumption and say what you assumed."}
+        answer = decision.strip()
+        if answer.isdigit() and 1 <= int(answer) <= len(options):
+            return {"answer": options[int(answer) - 1], "option": int(answer)}
+        index = next((i for i, o in enumerate(options, start=1) if o.strip().lower() == answer.lower()), None)
+        return {"answer": answer, "option": index}
 
     async def _process_mcp_tool_call(self, ctx: RunContext[AgentDependencies], call_tool, name: str, args: dict):
         """Apply TOOL_DETACH_AFTER to MCP calls, which bypass

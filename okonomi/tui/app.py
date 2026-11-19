@@ -127,6 +127,7 @@ class ReplApp:
         self._exit = False
         self._approval_resolve: Callable[[object], None] | None = None
         self._approval_reason = ""
+        self._question: tuple[str, list[str]] | None = None
         # A picker requested by a slash command; the app exits so the outer
         # loop can run the (full-screen) modal, then re-enters.
         self._pending_modal: tuple | None = None
@@ -213,7 +214,7 @@ class ReplApp:
         if line_number or wrap_count:
             return [("", "   ")]  # align wrapped lines under the prompt glyph
         if self._approval_resolve is not None:
-            return [("class:prompt.approval", " approve> ")]
+            return [("class:prompt.approval", " answer> " if self._question is not None else " approve> ")]
         return [("class:prompt", " › ")]
 
     def _glyph(self) -> str:
@@ -232,6 +233,10 @@ class ReplApp:
         return segs
 
     def _approval_fragments(self):
+        if self._question is not None:
+            question, options = self._question
+            hint = "type a number or your own answer" if options else "type your answer"
+            return [("class:approval.q", f" {question} "), ("class:approval.hint", f"[{hint}, Ctrl+C to skip]")]
         return [
             ("class:approval.q", f" Run this command? ({self._approval_reason}) "),
             ("class:approval.hint", "[Enter] once · [s] session · [a] always · [n] deny · or type feedback"),
@@ -409,6 +414,7 @@ class ReplApp:
         if self._approval_resolve is not None:
             resolver = self._approval_resolve
             self._approval_resolve = None
+            self._question = None
             self._invalidate()
             self._safe_resolve(resolver, False)
             return
@@ -438,7 +444,24 @@ class ReplApp:
         # leaving a log line behind.
         self._invalidate()
 
+    def show_question(self, question: str, options: list[str], resolve: Callable[[object], None]) -> None:
+        self._unless_modal(lambda: self._show_question(question, options, resolve))
+
+    def _show_question(self, question: str, options: list[str], resolve: Callable[[object], None]) -> None:
+        self._approval_resolve = resolve
+        self._question = (question, options)
+        if options:
+            self.transcript.print_code("\n".join(f"{i}. {o}" for i, o in enumerate(options, start=1)), lang="text")
+        self._invalidate()
+
     def _resolve_approval(self, text: str) -> None:
+        if self._question is not None:
+            self._question = None
+            resolver = self._approval_resolve
+            self._approval_resolve = None
+            self._invalidate()
+            self._safe_resolve(resolver, text)
+            return
         stripped = text.strip()
         low = stripped.lower()
         if stripped == "" or low in ("y", "yes"):
